@@ -2,6 +2,7 @@ package conformance_test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/jacobwoliver/xet-go/chunker"
+	"github.com/jacobwoliver/xet-go/shard"
 	"github.com/jacobwoliver/xet-go/xethash"
 	"github.com/jacobwoliver/xet-go/xorb"
 )
@@ -31,6 +33,19 @@ type encodedXorb struct {
 type decodedXorb struct {
 	DataHex    string   `json:"data_hex"`
 	Boundaries []uint32 `json:"boundaries"`
+}
+
+type encodedShard struct {
+	BodyHex     string `json:"body_hex"`
+	FullBodyHex string `json:"full_body_hex"`
+	FileHash    string `json:"file_hash"`
+	XorbHash    string `json:"xorb_hash"`
+}
+
+type decodedShard struct {
+	Files        int  `json:"files"`
+	Xorbs        int  `json:"xorbs"`
+	Verification bool `json:"verification"`
 }
 
 type oracleCorpus struct {
@@ -134,6 +149,97 @@ func joinXorb(object *xorb.Object) []byte {
 		out = append(out, chunk.Data...)
 	}
 	return out
+}
+
+func TestRustDifferentialShard(t *testing.T) {
+	oracle := os.Getenv("XET_RUST_ORACLE")
+	if oracle == "" {
+		t.Skip("set XET_RUST_ORACLE to the binary produced by conformance/build-rust-oracle.sh")
+	}
+	rng := rand.New(rand.NewSource(119))
+	data := make([]byte, 2<<20)
+	_, _ = rng.Read(data)
+	inputPath := filepath.Join(t.TempDir(), "input.bin")
+	if err := os.WriteFile(inputPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command(oracle, "encode-shard", inputPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("Rust encode shard: %v\n%s", err, output)
+	}
+	var rust encodedShard
+	if err := json.Unmarshal(output, &rust); err != nil {
+		t.Fatal(err)
+	}
+	rustBody, err := hex.DecodeString(rust.BodyHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := shard.Decode(rustBody); err != nil {
+		t.Fatalf("Go decode of Rust shard: %v", err)
+	}
+	fullBody, err := hex.DecodeString(rust.FullBodyHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullShard, err := shard.Decode(fullBody)
+	if err != nil {
+		t.Fatalf("Go decode of full Rust shard: %v", err)
+	}
+	if fullShard.Footer == nil {
+		t.Fatal("full Rust shard footer was not decoded")
+	}
+
+	parts := chunker.Bytes(data)
+	chunkData := make([][]byte, len(parts))
+	nodes := make([]xethash.Node, len(parts))
+	hashes := make([]xethash.Hash, len(parts))
+	for i := range parts {
+		chunkData[i] = parts[i].Data
+		hashes[i] = xethash.Chunk(parts[i].Data)
+		nodes[i] = xethash.Node{Hash: hashes[i], Size: uint64(len(parts[i].Data))}
+	}
+	object, err := xorb.Encode(chunkData, xorb.None)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xorbInfo, err := shard.XorbFromObject(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	goBody, err := shard.EncodeUpload(shard.Shard{
+		Files: []shard.File{{
+			Hash: xethash.File(nodes),
+			Terms: []shard.Term{{
+				XorbHash: object.Hash, UnpackedBytes: uint32(len(data)), Start: 0, End: uint32(len(parts)),
+				Verification: xethash.Verification(hashes),
+			}},
+			SHA256: &sum,
+		}},
+		Xorbs: []shard.Xorb{xorbInfo},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(goBody, rustBody) {
+		t.Fatalf("upload shard differs byte-for-byte: Go %d bytes, Rust %d", len(goBody), len(rustBody))
+	}
+	shardPath := filepath.Join(t.TempDir(), "upload.mdb")
+	if err := os.WriteFile(shardPath, goBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err = exec.Command(oracle, "decode-shard", shardPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("Rust decode of Go shard: %v\n%s", err, output)
+	}
+	var decoded decodedShard
+	if err := json.Unmarshal(output, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Files != 1 || decoded.Xorbs != 1 || !decoded.Verification {
+		t.Fatalf("Rust decoded shard = %+v", decoded)
+	}
 }
 
 func TestRustDifferentialCorpus(t *testing.T) {
