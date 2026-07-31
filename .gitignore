@@ -1,0 +1,10 @@
+# The initial research/architecture plans are user-owned inputs and must never be committed.
+/XET_GO_MODULE_BOUNDARY.md
+/XET_PROTOCOL_GO_IMPLEMENTATION.md
+
+# Reproducibly downloaded conformance dependencies and build output.
+/.cache/
+/.oracle/
+/coverage.out
+/xet-go.test
+
