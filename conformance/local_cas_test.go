@@ -3,6 +3,7 @@ package conformance_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 
 	xet "github.com/jacobwoliver/xet-go"
 	"github.com/jacobwoliver/xet-go/xetcas"
+	"github.com/jacobwoliver/xet-go/xethash"
 	"github.com/jacobwoliver/xet-go/xorb"
 )
 
@@ -72,5 +74,53 @@ func TestOfficialRustLocalCASRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(partial.Bytes(), data[rangeValue.Start:rangeValue.End]) {
 		t.Fatal("official Rust CAS range round trip differs")
+	}
+
+	// The Rust CAS only indexes the protocol's sparse sample of chunk hashes.
+	// Generate a one-chunk file whose hash is in that sample, upload it once,
+	// then verify that a fresh Go client reconstructs it entirely from the
+	// footerless global-dedup shard returned by the Rust server.
+	dedupData := globalDedupEligibleData()
+	seed, err := client.Upload(ctx, bytes.NewReader(dedupData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dedupClient, err := xet.NewClient(protocol, xet.Options{
+		Compression:         xorb.None,
+		CompressionSet:      true,
+		UploadConcurrency:   3,
+		DownloadConcurrency: 3,
+		GlobalDedup:         true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deduplicated, err := dedupClient.Upload(ctx, bytes.NewReader(dedupData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deduplicated.File != seed.File || deduplicated.Report.Xorbs != 0 ||
+		deduplicated.Report.Dedup.GlobalDedupBytes != uint64(len(dedupData)) ||
+		deduplicated.Report.Dedup.NewBytes != 0 {
+		t.Fatalf("official Rust global-dedup result: %#v", deduplicated)
+	}
+	var dedupOutput bytes.Buffer
+	if _, err := dedupClient.Download(ctx, deduplicated.File, &dedupOutput); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(dedupOutput.Bytes(), dedupData) {
+		t.Fatal("official Rust CAS global-dedup reconstruction differs")
+	}
+}
+
+func globalDedupEligibleData() []byte {
+	const size = 16 << 10
+	data := make([]byte, size)
+	copy(data, "xet-go official Rust global dedup conformance")
+	for nonce := uint64(0); ; nonce++ {
+		binary.LittleEndian.PutUint64(data[len(data)-8:], nonce)
+		if xethash.Chunk(data).LastUint64()%1024 == 0 {
+			return data
+		}
 	}
 }

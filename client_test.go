@@ -3,6 +3,7 @@ package xet
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jacobwoliver/xet-go/shard"
 	"github.com/jacobwoliver/xet-go/xetcas"
@@ -28,6 +30,8 @@ type memoryProtocol struct {
 	fetchCalls    int
 	expireFetches int
 	corruptLength bool
+	globalShard   []byte
+	globalQueries int
 }
 
 func newMemoryProtocol() *memoryProtocol {
@@ -78,8 +82,14 @@ func (m *memoryProtocol) UploadShard(_ context.Context, body []byte, _ func(xetc
 	return nil
 }
 
-func (*memoryProtocol) QueryGlobalDedup(context.Context, string, xethash.Hash) ([]byte, bool, error) {
-	return nil, false, nil
+func (m *memoryProtocol) QueryGlobalDedup(_ context.Context, _ string, _ xethash.Hash) ([]byte, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.globalQueries++
+	if len(m.globalShard) == 0 {
+		return nil, false, nil
+	}
+	return append([]byte(nil), m.globalShard...), true, nil
 }
 
 func (m *memoryProtocol) QueryReconstruction(
@@ -288,6 +298,118 @@ func TestUploadBatchSessionDeduplicatesIdenticalFiles(t *testing.T) {
 	if len(protocol.metadata.Files) != 1 {
 		t.Fatalf("duplicate file IDs were written to shard: %d records", len(protocol.metadata.Files))
 	}
+}
+
+func TestGlobalDedupReusesExternalXorb(t *testing.T) {
+	protocol := newMemoryProtocol()
+	seedClient := newTestEngine(t, protocol)
+	data := deterministicData(800_000)
+	seed, err := seedClient.Upload(context.Background(), bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocol.mu.Lock()
+	globalShard, err := shard.EncodeUpload(*protocol.metadata)
+	if err == nil {
+		protocol.globalShard = globalShard
+	}
+	protocol.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dedupClient, err := NewClient(protocol, Options{
+		Compression:         xorb.None,
+		CompressionSet:      true,
+		UploadConcurrency:   2,
+		DownloadConcurrency: 2,
+		GlobalDedup:         true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := dedupClient.Upload(context.Background(), bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.File.Hash != seed.File.Hash || result.Report.Xorbs != 0 ||
+		result.Report.Dedup.GlobalDedupBytes != uint64(len(data)) || result.Report.Dedup.NewBytes != 0 {
+		t.Fatalf("global dedup result %#v", result)
+	}
+	var output bytes.Buffer
+	if _, err := dedupClient.Download(context.Background(), result.File, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output.Bytes(), data) {
+		t.Fatal("globally deduplicated reconstruction differs")
+	}
+}
+
+func TestGlobalDedupProtectedShard(t *testing.T) {
+	protocol := newMemoryProtocol()
+	seedClient := newTestEngine(t, protocol)
+	data := deterministicData(500_000)
+	if _, err := seedClient.Upload(context.Background(), bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	protocol.mu.Lock()
+	protected, err := makeProtectedGlobalShard(*protocol.metadata, xethash.Chunk([]byte("protection-key")))
+	if err == nil {
+		protocol.globalShard = protected
+	}
+	protocol.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewClient(protocol, Options{
+		Compression: xorb.None, CompressionSet: true,
+		UploadConcurrency: 2, DownloadConcurrency: 2, GlobalDedup: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.Upload(context.Background(), bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Xorbs != 0 || result.Report.Dedup.GlobalDedupBytes != uint64(len(data)) {
+		t.Fatalf("protected global dedup failed: %#v", result.Report)
+	}
+}
+
+func makeProtectedGlobalShard(metadata shard.Shard, key xethash.Hash) ([]byte, error) {
+	minimal := shard.Shard{Xorbs: metadata.Xorbs}
+	body, err := shard.EncodeUpload(minimal)
+	if err != nil {
+		return nil, err
+	}
+	position := shard.HeaderSize + shard.RecordSize // empty file section bookend
+	for _, xorbInfo := range minimal.Xorbs {
+		position += shard.RecordSize // xorb header
+		for _, chunk := range xorbInfo.Chunks {
+			protected := xethash.Protect(chunk.Hash, key)
+			copy(body[position:position+xethash.Size], protected[:])
+			position += shard.RecordSize
+		}
+	}
+	binary.LittleEndian.PutUint64(body[40:48], shard.FooterSize)
+	footerStart := len(body)
+	footer := make([]byte, shard.FooterSize)
+	values := []uint64{
+		1,
+		shard.HeaderSize,
+		shard.HeaderSize + shard.RecordSize,
+		uint64(footerStart), 0,
+		uint64(footerStart), 0,
+		uint64(footerStart), 0,
+	}
+	for i, value := range values {
+		binary.LittleEndian.PutUint64(footer[i*8:(i+1)*8], value)
+	}
+	copy(footer[72:104], key[:])
+	binary.LittleEndian.PutUint64(footer[104:112], uint64(time.Now().Unix()))
+	binary.LittleEndian.PutUint64(footer[112:120], uint64(time.Now().Add(time.Hour).Unix()))
+	binary.LittleEndian.PutUint64(footer[192:200], uint64(footerStart))
+	return append(body, footer...), nil
 }
 
 func TestEmptyFileUploadsWithoutXorb(t *testing.T) {

@@ -30,13 +30,20 @@ type pendingXorb struct {
 }
 
 type placement struct {
-	pending *pendingXorb
-	index   uint32
-	length  uint32
+	pending      *pendingXorb
+	externalHash xethash.Hash
+	index        uint32
+	length       uint32
 }
 
 func (p placement) xorbHash() (xethash.Hash, error) {
-	if p.pending == nil || !p.pending.finalized {
+	if p.pending == nil {
+		if !p.externalHash.IsZero() {
+			return p.externalHash, nil
+		}
+		return xethash.Hash{}, errors.New("xet: empty xorb placement")
+	}
+	if !p.pending.finalized {
 		return xethash.Hash{}, errors.New("xet: unresolved xorb placement")
 	}
 	return p.pending.hash, nil
@@ -50,6 +57,11 @@ type uploadedFile struct {
 
 type xorbUploadTask struct {
 	object *xorb.Object
+}
+
+type globalDedupIndex struct {
+	key       xethash.Hash
+	locations map[xethash.Hash]placement
 }
 
 // UploadBatch shares xorb packing and session deduplication across files. Add
@@ -66,6 +78,8 @@ type UploadBatch struct {
 	files      []uploadedFile
 	current    *pendingXorb
 	locations  map[xethash.Hash]placement
+	global     []globalDedupIndex
+	globalSeen map[xethash.Hash]struct{}
 	xorbs      []shard.Xorb
 	tasks      chan xorbUploadTask
 	workers    sync.WaitGroup
@@ -86,13 +100,14 @@ func (c *Client) NewUploadBatch(ctx context.Context) (*UploadBatch, error) {
 	}
 	batchContext, cancel := context.WithCancel(ctx)
 	b := &UploadBatch{
-		client:    c,
-		ctx:       batchContext,
-		cancel:    cancel,
-		current:   &pendingXorb{},
-		locations: make(map[xethash.Hash]placement),
-		tasks:     make(chan xorbUploadTask, c.options.UploadConcurrency),
-		report:    UploadReport{StartedAt: time.Now()},
+		client:     c,
+		ctx:        batchContext,
+		cancel:     cancel,
+		current:    &pendingXorb{},
+		locations:  make(map[xethash.Hash]placement),
+		globalSeen: make(map[xethash.Hash]struct{}),
+		tasks:      make(chan xorbUploadTask, c.options.UploadConcurrency),
+		report:     UploadReport{StartedAt: time.Now()},
 	}
 	for range c.options.UploadConcurrency {
 		b.workers.Add(1)
@@ -119,6 +134,7 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 	fileSerial := b.fileSerial
 	sha := sha256.New()
 	file := uploadedFile{}
+	nextGlobalQuery := 0
 	reader := io.TeeReader(source, sha)
 	err := chunker.SplitContext(b.ctx, reader, chunker.DefaultConfig, func(value chunker.Chunk) error {
 		if err := b.failure(); err != nil {
@@ -129,11 +145,30 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 		file.chunkNodes = append(file.chunkNodes, node)
 		b.report.Dedup.TotalChunks++
 		b.report.Dedup.TotalBytes += uint64(len(value.Data))
+		fileChunkIndex := len(file.chunkNodes) - 1
 		if existing, ok := b.locations[hash]; ok {
 			file.placements = append(file.placements, existing)
 			b.report.Dedup.SessionDedupChunks++
 			b.report.Dedup.SessionDedupBytes += uint64(len(value.Data))
+		} else if existing, ok := b.lookupGlobal(hash, uint32(len(value.Data))); ok {
+			file.placements = append(file.placements, existing)
+			b.report.Dedup.GlobalDedupChunks++
+			b.report.Dedup.GlobalDedupBytes += uint64(len(value.Data))
 		} else {
+			if b.client.options.GlobalDedup && fileChunkIndex >= nextGlobalQuery &&
+				(fileChunkIndex == 0 || hash.LastUint64()%1024 == 0) {
+				nextGlobalQuery = fileChunkIndex + 256
+				b.loadGlobalShard(hash)
+				if external, found := b.lookupGlobal(hash, uint32(len(value.Data))); found {
+					file.placements = append(file.placements, external)
+					b.report.Dedup.GlobalDedupChunks++
+					b.report.Dedup.GlobalDedupBytes += uint64(len(value.Data))
+					if b.client.options.Progress != nil {
+						b.client.options.Progress(Progress{Phase: ProgressChunking, Completed: uint64(value.End())})
+					}
+					return nil
+				}
+			}
 			placement, err := b.addNovelChunk(value.Data, fileSerial)
 			if err != nil {
 				return err
@@ -162,6 +197,89 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 	b.files = append(b.files, file)
 	b.report.Files = len(b.files)
 	return file.info, nil
+}
+
+func (b *UploadBatch) lookupGlobal(hash xethash.Hash, length uint32) (placement, bool) {
+	if !b.client.options.GlobalDedup {
+		return placement{}, false
+	}
+	for i := len(b.global) - 1; i >= 0; i-- {
+		index := &b.global[i]
+		keyed := hash
+		if !index.key.IsZero() {
+			keyed = xethash.Protect(hash, index.key)
+		}
+		if found, ok := index.locations[keyed]; ok && found.length == length {
+			return found, true
+		}
+	}
+	return placement{}, false
+}
+
+// loadGlobalShard deliberately treats lookup/cache failures as a dedup miss:
+// global dedup is an optimization and must never change upload correctness.
+func (b *UploadBatch) loadGlobalShard(queryHash xethash.Hash) {
+	if _, queried := b.globalSeen[queryHash]; queried {
+		return
+	}
+	b.globalSeen[queryHash] = struct{}{}
+	var data []byte
+	found := false
+	fromCache := false
+	if b.client.options.Cache != nil {
+		data, found, _ = b.client.options.Cache.GetShard(b.ctx, queryHash)
+		fromCache = found
+	}
+	if !found {
+		data, found, _ = b.client.protocol.QueryGlobalDedup(b.ctx, b.client.options.Prefix, queryHash)
+	}
+	if !found {
+		return
+	}
+	decoded, err := shard.Decode(data)
+	if err != nil {
+		if fromCache {
+			_ = b.client.options.Cache.DeleteShard(b.ctx, queryHash)
+		}
+		return
+	}
+	index := globalDedupIndex{locations: make(map[xethash.Hash]placement)}
+	var expiresAt time.Time
+	if decoded.Footer != nil {
+		index.key = decoded.Footer.ChunkProtectionKey
+		if decoded.Footer.KeyExpiresAtUnix != 0 && decoded.Footer.KeyExpiresAtUnix <= uint64(time.Now().Unix()) {
+			if fromCache {
+				_ = b.client.options.Cache.DeleteShard(b.ctx, queryHash)
+			}
+			return
+		}
+		if decoded.Footer.KeyExpiresAtUnix != 0 && decoded.Footer.KeyExpiresAtUnix <= uint64(^uint64(0)>>1) {
+			expiresAt = time.Unix(int64(decoded.Footer.KeyExpiresAtUnix), 0)
+		}
+	}
+	for _, xorbInfo := range decoded.Xorbs {
+		for chunkIndex, chunk := range xorbInfo.Chunks {
+			index.locations[chunk.Hash] = placement{
+				externalHash: xorbInfo.Hash,
+				index:        uint32(chunkIndex),
+				length:       chunk.Length,
+			}
+		}
+	}
+	keyedQuery := queryHash
+	if !index.key.IsZero() {
+		keyedQuery = xethash.Protect(queryHash, index.key)
+	}
+	if _, containsQuery := index.locations[keyedQuery]; !containsQuery {
+		if fromCache {
+			_ = b.client.options.Cache.DeleteShard(b.ctx, queryHash)
+		}
+		return
+	}
+	b.global = append(b.global, index)
+	if !fromCache && b.client.options.Cache != nil && !expiresAt.IsZero() {
+		_ = b.client.options.Cache.PutShard(b.ctx, queryHash, data, expiresAt)
+	}
 }
 
 // Abort cancels a batch and releases its workers without registering a shard.
