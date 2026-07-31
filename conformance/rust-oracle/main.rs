@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 use xet_core_structures::merklehash::{file_hash, xorb_hash};
+use xet_core_structures::xorb_object::{CompressionScheme, deserialize_chunks, serialize_chunk};
 use xet_data::deduplication::Chunker;
 
 #[derive(Serialize)]
@@ -33,6 +34,18 @@ struct BenchRecord {
     elapsed_ns: u128,
     bytes_per_second: f64,
     file_hash: String,
+}
+
+#[derive(Serialize)]
+struct EncodedXorbRecord {
+    body_hex: String,
+    chunks: usize,
+}
+
+#[derive(Serialize)]
+struct DecodedXorbRecord {
+    data_hex: String,
+    boundaries: Vec<u32>,
 }
 
 fn raw_hex(data: &[u8]) -> String {
@@ -75,7 +88,7 @@ fn calculate(data: &[u8]) -> CorpusRecord {
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: xet-go-rust-oracle <corpus|bench> <file> [iterations]");
+        eprintln!("usage: xet-go-rust-oracle <corpus|bench|encode-xorb|decode-xorb> <file> [argument]");
         return ExitCode::from(2);
     }
     let data = match fs::read(&args[2]) {
@@ -107,6 +120,33 @@ fn main() -> ExitCode {
                 .unwrap()
             );
         }
+        "encode-xorb" => {
+            let scheme: CompressionScheme = args.get(3).map(String::as_str).unwrap_or("auto").parse().unwrap();
+            let chunks = Chunker::default().next_block(&data, true);
+            let mut body = Vec::new();
+            for chunk in &chunks {
+                serialize_chunk(&chunk.data, &mut body, scheme).unwrap();
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&EncodedXorbRecord {
+                    body_hex: raw_hex(&body),
+                    chunks: chunks.len(),
+                })
+                .unwrap()
+            );
+        }
+        "decode-xorb" => {
+            let (decoded, boundaries) = deserialize_chunks(&mut std::io::Cursor::new(&data)).unwrap();
+            println!(
+                "{}",
+                serde_json::to_string(&DecodedXorbRecord {
+                    data_hex: raw_hex(&decoded),
+                    boundaries,
+                })
+                .unwrap()
+            );
+        }
         command => {
             eprintln!("unknown command {command:?}");
             return ExitCode::from(2);
@@ -114,4 +154,3 @@ fn main() -> ExitCode {
     }
     ExitCode::SUCCESS
 }
-
