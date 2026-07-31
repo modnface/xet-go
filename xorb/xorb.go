@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 
 	"github.com/jacobwoliver/xet-go/chunker"
 	"github.com/jacobwoliver/xet-go/xethash"
@@ -27,8 +29,18 @@ const (
 	None   Scheme = 0
 	LZ4    Scheme = 1
 	BG4LZ4 Scheme = 2
-	Auto   Scheme = 255 // encoder-only: try both compression schemes
+	Auto   Scheme = 99 // encoder-only: choose using Rust's BG4 predictor
 )
+
+// EncodeOptions controls production auto-compression grouping. FileBoundaries
+// contains sorted chunk indices where a new logical file begins (normally
+// starting with zero). Auto is re-evaluated every RetestInterval chunks within
+// each file. A zero interval selects the official default of 32.
+type EncodeOptions struct {
+	Scheme         Scheme
+	FileBoundaries []int
+	RetestInterval int
+}
 
 func (s Scheme) String() string {
 	switch s {
@@ -78,8 +90,70 @@ type Object struct {
 // Encode serializes an ordered set of chunks. It rejects inputs exceeding the
 // protocol xorb limits rather than silently changing object membership.
 func Encode(chunks [][]byte, scheme Scheme) (*Object, error) {
+	schemes := make([]Scheme, len(chunks))
+	for i := range chunks {
+		schemes[i] = scheme
+	}
+	return encode(chunks, schemes)
+}
+
+// EncodeProduction applies the official xet-core upload compression policy,
+// including per-file and periodic Auto retesting.
+func EncodeProduction(chunks [][]byte, options EncodeOptions) (*Object, error) {
+	if options.Scheme != None && options.Scheme != LZ4 && options.Scheme != BG4LZ4 && options.Scheme != Auto {
+		return nil, fmt.Errorf("xorb: unknown compression scheme %d", options.Scheme)
+	}
+	if options.Scheme != Auto {
+		return Encode(chunks, options.Scheme)
+	}
 	if len(chunks) == 0 {
 		return nil, errors.New("xorb: cannot encode an empty object")
+	}
+	boundaries := append([]int(nil), options.FileBoundaries...)
+	if len(boundaries) == 0 {
+		boundaries = []int{0}
+	}
+	if boundaries[0] != 0 {
+		return nil, errors.New("xorb: first file boundary must be zero")
+	}
+	for i, boundary := range boundaries {
+		if boundary < 0 || boundary >= len(chunks) || (i > 0 && boundary <= boundaries[i-1]) {
+			return nil, fmt.Errorf("xorb: invalid file boundary %d at index %d", boundary, i)
+		}
+	}
+	retest := options.RetestInterval
+	if retest == 0 {
+		retest = 32
+	}
+	if retest < 0 {
+		return nil, errors.New("xorb: retest interval must not be negative")
+	}
+	schemes := make([]Scheme, len(chunks))
+	for fileIndex, start := range boundaries {
+		end := len(chunks)
+		if fileIndex+1 < len(boundaries) {
+			end = boundaries[fileIndex+1]
+		}
+		for block := start; block < end; block += retest {
+			blockEnd := block + retest
+			if blockEnd > end {
+				blockEnd = end
+			}
+			selected := chooseCompression(chunks[block])
+			for i := block; i < blockEnd; i++ {
+				schemes[i] = selected
+			}
+		}
+	}
+	return encode(chunks, schemes)
+}
+
+func encode(chunks [][]byte, schemes []Scheme) (*Object, error) {
+	if len(chunks) == 0 {
+		return nil, errors.New("xorb: cannot encode an empty object")
+	}
+	if len(schemes) != len(chunks) {
+		return nil, errors.New("xorb: compression scheme count differs from chunk count")
 	}
 	if len(chunks) > MaxChunks {
 		return nil, fmt.Errorf("xorb: %d chunks exceeds maximum %d", len(chunks), MaxChunks)
@@ -97,7 +171,7 @@ func Encode(chunks [][]byte, scheme Scheme) (*Object, error) {
 			return nil, fmt.Errorf("xorb: raw size %d exceeds maximum %d", rawTotal, MaxRawSize)
 		}
 		start := body.Len()
-		used, payload, err := encodePayload(data, scheme)
+		used, payload, err := encodePayload(data, schemes[i])
 		if err != nil {
 			return nil, fmt.Errorf("xorb: chunk %d: %w", i, err)
 		}
@@ -198,22 +272,7 @@ func encodePayload(data []byte, requested Scheme) (Scheme, []byte, error) {
 		return None, append([]byte(nil), data...), nil
 	}
 	if requested == Auto {
-		lz4Data, err := compressLZ4(data)
-		if err != nil {
-			return 0, nil, err
-		}
-		bg4Data, err := compressLZ4(bg4Split(data))
-		if err != nil {
-			return 0, nil, err
-		}
-		used, best := LZ4, lz4Data
-		if len(bg4Data) < len(best) {
-			used, best = BG4LZ4, bg4Data
-		}
-		if len(best) >= len(data) {
-			return None, append([]byte(nil), data...), nil
-		}
-		return used, best, nil
+		return encodePayload(data, chooseCompression(data))
 	}
 	input := data
 	if requested == BG4LZ4 {
@@ -227,6 +286,52 @@ func encodePayload(data []byte, requested Scheme) (Scheme, []byte, error) {
 		return None, append([]byte(nil), data...), nil
 	}
 	return requested, compressed, nil
+}
+
+// chooseCompression is the scalar equivalent of xet-core's BG4Predictor. It
+// uses popcount histograms and the same maximum KL-divergence threshold.
+func chooseCompression(data []byte) Scheme {
+	var histograms [4][9]uint32
+	for i, value := range data {
+		histograms[i&3][bits.OnesCount8(value)]++
+	}
+	baseCounts := [9]uint32{1, 1, 1, 1, 1, 1, 1, 1, 1}
+	var totals [4]uint32
+	for i := range histograms {
+		for j, count := range histograms[i] {
+			baseCounts[j] += count
+			totals[i] += count
+		}
+	}
+	baseTotal := totals[0] + totals[1] + totals[2] + totals[3]
+	var maximum float64
+	if baseTotal != 0 {
+		for i := range histograms {
+			if totals[i] == 0 {
+				continue
+			}
+			divergence := 0.0
+			valid := true
+			for j, count := range histograms[i] {
+				if count == 0 {
+					// Rust evaluates 0*ln(0/q) as NaN and f64::max
+					// ignores that group. Preserve that behavior directly.
+					valid = false
+					break
+				}
+				p := float64(count) / float64(totals[i])
+				q := float64(baseCounts[j]) / float64(baseTotal)
+				divergence += p * math.Log(p/q)
+			}
+			if valid && divergence > maximum {
+				maximum = divergence
+			}
+		}
+	}
+	if maximum > 0.02 {
+		return BG4LZ4
+	}
+	return LZ4
 }
 
 func decodePayload(payload []byte, scheme Scheme, want int) ([]byte, error) {

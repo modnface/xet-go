@@ -75,6 +75,7 @@ func TestRustDifferentialXorb(t *testing.T) {
 		{name: "none", goID: xorb.None},
 		{name: "lz4", goID: xorb.LZ4},
 		{name: "bg4-lz4", goID: xorb.BG4LZ4},
+		{name: "auto", goID: xorb.Auto},
 	}
 	for inputIndex, data := range inputs {
 		for _, scheme := range schemes {
@@ -138,8 +139,27 @@ func compareXorb(t *testing.T, oracle string, data []byte, schemeName string, sc
 	if !bytes.Equal(rustData, data) {
 		t.Fatal("Rust decode of Go xorb differs")
 	}
+	if len(goEncoded.Chunks) != len(rustDecoded.Chunks) {
+		t.Fatalf("%s xorb chunk count differs", schemeName)
+	}
+	for i := range goEncoded.Chunks {
+		if goEncoded.Chunks[i].Scheme != rustDecoded.Chunks[i].Scheme {
+			t.Fatalf("%s xorb chunk %d selected scheme %s, Rust selected %s", schemeName, i,
+				goEncoded.Chunks[i].Scheme, rustDecoded.Chunks[i].Scheme)
+		}
+	}
+	// LZ4 permits multiple conforming compressed representations. The raw form
+	// is deterministic and must match byte-for-byte; compressed forms are
+	// compared by selected scheme and bidirectional decoding above.
 	if schemeID == xorb.None && !bytes.Equal(goEncoded.Body, rustBody) {
-		t.Fatal("uncompressed xorb encoding differs byte-for-byte")
+		first := 0
+		for first < len(goEncoded.Body) && first < len(rustBody) && goEncoded.Body[first] == rustBody[first] {
+			first++
+		}
+		goEnd := min(first+24, len(goEncoded.Body))
+		rustEnd := min(first+24, len(rustBody))
+		t.Fatalf("%s xorb encoding differs byte-for-byte at %d (Go len=%d bytes=%x; Rust len=%d bytes=%x)",
+			schemeName, first, len(goEncoded.Body), goEncoded.Body[first:goEnd], len(rustBody), rustBody[first:rustEnd])
 	}
 }
 

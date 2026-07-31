@@ -54,6 +54,42 @@ func TestSchemesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestEncodeProductionRetestsAndResetsAtFileBoundaries(t *testing.T) {
+	chunks := make([][]byte, 66)
+	for i := range chunks {
+		chunks[i] = bytes.Repeat([]byte{byte(i), byte(i >> 1), 0, 0xff}, 4096)
+	}
+	object, err := EncodeProduction(chunks, EncodeOptions{
+		Scheme:         Auto,
+		FileBoundaries: []int{0, 40},
+		RetestInterval: 32,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]Scheme, len(chunks))
+	for _, span := range [][2]int{{0, 32}, {32, 40}, {40, 66}} {
+		selected := chooseCompression(chunks[span[0]])
+		for i := span[0]; i < span[1]; i++ {
+			want[i] = selected
+		}
+	}
+	for i, chunk := range object.Chunks {
+		if chunk.Scheme != want[i] && chunk.Scheme != None {
+			t.Fatalf("chunk %d scheme=%s, want %s or none fallback", i, chunk.Scheme, want[i])
+		}
+	}
+}
+
+func TestEncodeProductionRejectsBadBoundaries(t *testing.T) {
+	chunks := [][]byte{[]byte("a"), []byte("b")}
+	for _, boundaries := range [][]int{{1}, {0, 0}, {0, 2}, {0, -1}} {
+		if _, err := EncodeProduction(chunks, EncodeOptions{Scheme: Auto, FileBoundaries: boundaries}); err == nil {
+			t.Fatalf("boundaries %v accepted", boundaries)
+		}
+	}
+}
+
 func TestBG4Remainders(t *testing.T) {
 	for n := 0; n < 32; n++ {
 		data := make([]byte, n)
