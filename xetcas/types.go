@@ -5,6 +5,7 @@
 package xetcas
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -208,6 +209,84 @@ type reconstructionV1 struct {
 	OffsetIntoFirstRange uint64                         `json:"offset_into_first_range"`
 	Terms                []ReconstructionTerm           `json:"terms"`
 	FetchInfo            map[xethash.Hash][]v1FetchInfo `json:"fetch_info"`
+}
+
+type batchReconstructionV1 struct {
+	Files     map[xethash.Hash][]ReconstructionTerm `json:"files"`
+	FetchInfo map[xethash.Hash][]v1FetchInfo        `json:"fetch_info"`
+}
+
+func (v batchReconstructionV1) normalize() (map[xethash.Hash]*Reconstruction, error) {
+	result := make(map[xethash.Hash]*Reconstruction, len(v.Files))
+	for fileID, terms := range v.Files {
+		reconstruction := &Reconstruction{
+			Terms: terms,
+			Xorbs: make(map[xethash.Hash][]MultiRangeFetch),
+		}
+		for _, term := range terms {
+			if _, exists := reconstruction.Xorbs[term.Hash]; exists {
+				continue
+			}
+			infos, ok := v.FetchInfo[term.Hash]
+			if !ok {
+				return nil, fmt.Errorf("xet CAS: batch file %s has no fetch data for xorb %s", fileID, term.Hash)
+			}
+			fetches := make([]MultiRangeFetch, 0, len(infos))
+			for _, info := range infos {
+				fetches = append(fetches, MultiRangeFetch{
+					URL:    info.URL,
+					Ranges: []XorbRangeDescriptor{{Chunks: info.Range, Bytes: info.URLRange}},
+				})
+			}
+			reconstruction.Xorbs[term.Hash] = fetches
+		}
+		if err := reconstruction.Validate(); err != nil {
+			return nil, fmt.Errorf("xet CAS: batch file %s: %w", fileID, err)
+		}
+		result[fileID] = reconstruction
+	}
+	return result, nil
+}
+
+type ChunkWindow struct {
+	DirtyByteRange [2]uint64 `json:"dirtyByteRange"`
+}
+
+// FileChunkHashesResponse is the v2 delta-upload response. HashRanges contains
+// either JSON null or an exact MerkleHashSubtree JSON object.
+type FileChunkHashesResponse struct {
+	TotalChunks     uint64            `json:"totalChunks"`
+	FileSize        uint64            `json:"fileSize"`
+	Windows         []ChunkWindow     `json:"windows"`
+	HashRanges      []json.RawMessage `json:"hashRanges"`
+	GapVerification []xethash.Hash    `json:"gapVerification"`
+}
+
+func (r *FileChunkHashesResponse) Validate() error {
+	if r == nil {
+		return errors.New("xet CAS: nil file chunk hash response")
+	}
+	if len(r.HashRanges) != len(r.Windows)+1 {
+		return fmt.Errorf("xet CAS: file chunk hash response has %d windows and %d hash ranges", len(r.Windows), len(r.HashRanges))
+	}
+	var previous uint64
+	for i, window := range r.Windows {
+		start, end := window.DirtyByteRange[0], window.DirtyByteRange[1]
+		if end <= start || end > r.FileSize || (i > 0 && start < previous) {
+			return fmt.Errorf("xet CAS: invalid dirty window %d [%d,%d)", i, start, end)
+		}
+		previous = end
+	}
+	for i, subtree := range r.HashRanges {
+		trimmed := string(subtree)
+		if trimmed == "" {
+			return fmt.Errorf("xet CAS: missing hash range %d", i)
+		}
+		if trimmed != "null" && !json.Valid(subtree) {
+			return fmt.Errorf("xet CAS: invalid hash range JSON at %d", i)
+		}
+	}
+	return nil
 }
 
 func (v reconstructionV1) normalize() *Reconstruction {

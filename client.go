@@ -54,6 +54,7 @@ type Options struct {
 	DownloadConcurrency       int
 	MaxDownloadMemory         uint64
 	GlobalDedup               bool
+	Cache                     Cache
 	Progress                  func(Progress)
 }
 

@@ -316,11 +316,103 @@ func (c *Client) httpError(resp *http.Response, method string, requestURL *url.U
 
 func endpointURL(endpoint *url.URL, route string) *url.URL {
 	u := cloneURL(endpoint)
-	u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.TrimLeft(route, "/")
+	pathPart, query, hasQuery := strings.Cut(route, "?")
+	u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.TrimLeft(pathPart, "/")
 	u.RawPath = ""
-	u.RawQuery = ""
+	if hasQuery {
+		u.RawQuery = query
+	} else {
+		u.RawQuery = ""
+	}
 	u.Fragment = ""
 	return u
+}
+
+// BatchQueryReconstruction queries several file recipes using the documented
+// POST route, then falls back to the legacy repeated-query GET used by the
+// pinned Rust client and local CAS. Missing file IDs are omitted from the map.
+func (c *Client) BatchQueryReconstruction(
+	ctx context.Context,
+	fileIDs []xethash.Hash,
+) (map[xethash.Hash]*Reconstruction, error) {
+	if len(fileIDs) == 0 {
+		return map[xethash.Hash]*Reconstruction{}, nil
+	}
+	if len(fileIDs) > 10_000 {
+		return nil, errors.New("xet CAS: batch reconstruction exceeds 10000 file limit")
+	}
+	type key struct {
+		Prefix string       `json:"prefix"`
+		Hash   xethash.Hash `json:"hash"`
+	}
+	unique := make(map[xethash.Hash]struct{}, len(fileIDs))
+	request := make([]key, 0, len(fileIDs))
+	for _, hash := range fileIDs {
+		if _, duplicate := unique[hash]; duplicate {
+			continue
+		}
+		unique[hash] = struct{}{}
+		request = append(request, key{Prefix: DefaultPrefix, Hash: hash})
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	response := &batchReconstructionV1{}
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+	_, err = c.casCall(ctx, AccessRead, http.MethodPost, "v1/reconstructions", headers, body,
+		c.jsonProcessor(response, c.maxResponseBytes))
+	if err != nil {
+		var httpErr *HTTPError
+		if !errors.As(err, &httpErr) || (httpErr.StatusCode != http.StatusNotFound &&
+			httpErr.StatusCode != http.StatusMethodNotAllowed && httpErr.StatusCode != http.StatusNotImplemented) {
+			return nil, err
+		}
+		query := url.Values{}
+		for _, item := range request {
+			query.Add("file_id", item.Hash.String())
+		}
+		response = &batchReconstructionV1{}
+		_, err = c.casCall(ctx, AccessRead, http.MethodGet, "v1/reconstructions?"+query.Encode(), nil, nil,
+			c.jsonProcessor(response, c.maxResponseBytes))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return response.normalize()
+}
+
+// QueryFileChunkHashes returns the current v2 sparse-upload window response.
+// HashRanges remain opaque JSON until passed to the delta/subtree layer.
+func (c *Client) QueryFileChunkHashes(
+	ctx context.Context,
+	fileID xethash.Hash,
+	dirty []FileRange,
+) (*FileChunkHashesResponse, error) {
+	if len(dirty) == 0 {
+		return nil, errors.New("xet CAS: file chunk hash query requires a dirty range")
+	}
+	values := make([]string, len(dirty))
+	for i, value := range dirty {
+		httpRange, err := value.HTTPRange()
+		if err != nil {
+			return nil, fmt.Errorf("xet CAS: dirty range %d: %w", i, err)
+		}
+		values[i] = httpRange.String()
+	}
+	headers := make(http.Header)
+	headers.Set(DirtyRangeHeader, "bytes="+strings.Join(values, ","))
+	response := &FileChunkHashesResponse{}
+	_, err := c.casCall(ctx, AccessRead, http.MethodGet, "v2/file-chunk-hashes/"+fileID.String(), headers, nil,
+		c.jsonProcessor(response, c.maxResponseBytes))
+	if err != nil {
+		return nil, err
+	}
+	if err := response.Validate(); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 func redactURL(u *url.URL) string {

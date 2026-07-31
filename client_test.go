@@ -334,6 +334,49 @@ func TestDownloadRefreshesExpiredSignedURLBeforeWriting(t *testing.T) {
 	}
 }
 
+func TestPersistentRangeCacheAvoidsSecondSignedFetch(t *testing.T) {
+	protocol := newMemoryProtocol()
+	cache, err := NewDiskCache(t.TempDir(), "memory-cas/test-scope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewClient(protocol, Options{
+		Compression:         xorb.None,
+		CompressionSet:      true,
+		UploadConcurrency:   2,
+		DownloadConcurrency: 2,
+		Cache:               cache,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := deterministicData(700_000)
+	upload, err := client.Upload(context.Background(), bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Download(context.Background(), upload.File, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	protocol.mu.Lock()
+	firstFetches := protocol.fetchCalls
+	protocol.mu.Unlock()
+	var output bytes.Buffer
+	report, err := client.Download(context.Background(), upload.File, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocol.mu.Lock()
+	secondFetches := protocol.fetchCalls
+	protocol.mu.Unlock()
+	if secondFetches != firstFetches || report.FetchedBytes != 0 || report.CacheHitRanges == 0 {
+		t.Fatalf("fetches %d->%d report=%#v", firstFetches, secondFetches, report)
+	}
+	if !bytes.Equal(output.Bytes(), data) {
+		t.Fatal("cached download differs")
+	}
+}
+
 func TestDownloadRejectsTermLengthMismatch(t *testing.T) {
 	protocol := newMemoryProtocol()
 	client := newTestEngine(t, protocol)

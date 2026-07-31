@@ -409,6 +409,78 @@ func TestObjectEndpoints(t *testing.T) {
 	}
 }
 
+func TestBatchReconstructionPostThenLegacyGetFallback(t *testing.T) {
+	first := xethash.Chunk([]byte("batch-first"))
+	second := xethash.Chunk([]byte("batch-second"))
+	var postCalls, getCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			postCalls.Add(1)
+			var keys []struct {
+				Prefix string       `json:"prefix"`
+				Hash   xethash.Hash `json:"hash"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&keys); err != nil {
+				t.Error(err)
+			}
+			if len(keys) != 2 || keys[0].Prefix != DefaultPrefix {
+				t.Errorf("keys=%#v", keys)
+			}
+			http.Error(w, "legacy only", http.StatusMethodNotAllowed)
+		case http.MethodGet:
+			getCalls.Add(1)
+			if got := r.URL.Query()["file_id"]; len(got) != 2 || got[0] != first.String() || got[1] != second.String() {
+				t.Errorf("file_id query=%v", got)
+			}
+			_ = json.NewEncoder(w).Encode(batchReconstructionV1{
+				Files:     map[xethash.Hash][]ReconstructionTerm{first: {}, second: {}},
+				FetchInfo: map[xethash.Hash][]v1FetchInfo{},
+			})
+		default:
+			t.Errorf("method=%s", r.Method)
+		}
+	}))
+	defer server.Close()
+	client := testClient(t, serverURL(t, server.URL), "", Options{})
+	result, err := client.BatchQueryReconstruction(context.Background(), []xethash.Hash{first, second, first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 2 || postCalls.Load() != 1 || getCalls.Load() != 1 {
+		t.Fatalf("result=%#v post=%d get=%d", result, postCalls.Load(), getCalls.Load())
+	}
+}
+
+func TestQueryFileChunkHashesHeaderAndValidation(t *testing.T) {
+	fileID := xethash.Chunk([]byte("delta-base"))
+	verification := xethash.Chunk([]byte("gap"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/file-chunk-hashes/"+fileID.String() {
+			t.Errorf("path=%s", r.URL.Path)
+		}
+		if got := r.Header.Get(DirtyRangeHeader); got != "bytes=10-19,30-39" {
+			t.Errorf("dirty header=%q", got)
+		}
+		_ = json.NewEncoder(w).Encode(FileChunkHashesResponse{
+			TotalChunks:     10,
+			FileSize:        100,
+			Windows:         []ChunkWindow{{DirtyByteRange: [2]uint64{8, 42}}},
+			HashRanges:      []json.RawMessage{json.RawMessage("null"), json.RawMessage("null")},
+			GapVerification: []xethash.Hash{verification},
+		})
+	}))
+	defer server.Close()
+	client := testClient(t, serverURL(t, server.URL), "", Options{})
+	result, err := client.QueryFileChunkHashes(context.Background(), fileID, []FileRange{{10, 20}, {30, 40}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FileSize != 100 || len(result.Windows) != 1 || result.GapVerification[0] != verification {
+		t.Fatalf("response=%#v", result)
+	}
+}
+
 func TestRedirectsAreNotFollowedAndErrorsAreRedacted(t *testing.T) {
 	targetCalls := atomic.Int32{}
 	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { targetCalls.Add(1) }))

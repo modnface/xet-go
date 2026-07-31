@@ -20,6 +20,8 @@ type DownloadReport struct {
 	LogicalBytes   uint64
 	FetchedBytes   uint64
 	FetchedRanges  int
+	CacheHitBytes  uint64
+	CacheHitRanges int
 	WholeFileHash  bool
 	SHA256Verified bool
 }
@@ -105,9 +107,12 @@ type decodedSegment struct {
 }
 
 type downloadJobResult struct {
-	segments map[segmentKey]decodedSegment
-	fetched  uint64
-	err      error
+	segments    map[segmentKey]decodedSegment
+	fetched     uint64
+	fetchRanges int
+	cacheHit    uint64
+	cacheRanges int
+	err         error
 }
 
 func (c *Client) executeReconstruction(
@@ -166,7 +171,9 @@ func (c *Client) executeReconstruction(
 			return report, result.err
 		}
 		report.FetchedBytes += result.fetched
-		report.FetchedRanges += len(jobs[jobIndex].ranges)
+		report.FetchedRanges += result.fetchRanges
+		report.CacheHitBytes += result.cacheHit
+		report.CacheHitRanges += result.cacheRanges
 		for key, segment := range result.segments {
 			lastUse, needed := lastUses[key]
 			if !needed {
@@ -306,18 +313,53 @@ func planDownloads(reconstruction *xetcas.Reconstruction) ([]*downloadJob, []*do
 }
 
 func (c *Client) fetchJob(ctx context.Context, job *downloadJob) downloadJobResult {
-	fetched, err := c.protocol.FetchRanges(ctx, job.url, job.ranges)
-	if err != nil {
-		return downloadJobResult{err: err}
+	var fetched []xetcas.FetchedRange
+	var cacheHitBytes uint64
+	cacheHitRanges := 0
+	allCached := c.options.Cache != nil
+	if allCached {
+		fetched = make([]xetcas.FetchedRange, 0, len(job.descriptors))
+		for _, descriptor := range job.descriptors {
+			data, found, _ := c.options.Cache.GetXorbRange(ctx, descriptor.hash,
+				descriptor.desc.Chunks.Start, descriptor.desc.Chunks.End)
+			if found {
+				object, decodeErr := xorb.Decode(data)
+				if decodeErr != nil || uint32(len(object.Chunks)) != descriptor.desc.Chunks.Len() {
+					_ = c.options.Cache.DeleteXorbRange(ctx, descriptor.hash,
+						descriptor.desc.Chunks.Start, descriptor.desc.Chunks.End)
+					found = false
+				}
+			}
+			if !found {
+				allCached = false
+				break
+			}
+			fetched = append(fetched, xetcas.FetchedRange{Range: descriptor.desc.Bytes, Data: data})
+			cacheHitBytes += uint64(len(data))
+			cacheHitRanges++
+		}
+	}
+	var networkFetched uint64
+	networkRanges := 0
+	if !allCached {
+		var err error
+		fetched, err = c.protocol.FetchRanges(ctx, job.url, job.ranges)
+		if err != nil {
+			return downloadJobResult{err: err}
+		}
+		cacheHitBytes = 0
+		cacheHitRanges = 0
+		for _, value := range fetched {
+			networkFetched += uint64(len(value.Data))
+		}
+		networkRanges = len(job.ranges)
 	}
 	byRange := make(map[xetcas.HTTPRange][]byte, len(fetched))
-	var fetchedBytes uint64
 	for _, value := range fetched {
 		if _, duplicate := byRange[value.Range]; duplicate {
 			return downloadJobResult{err: fmt.Errorf("xet: duplicate fetched range %s", value.Range)}
 		}
 		byRange[value.Range] = value.Data
-		fetchedBytes += uint64(len(value.Data))
 	}
 	segments := make(map[segmentKey]decodedSegment, len(job.descriptors))
 	for _, descriptor := range job.descriptors {
@@ -334,8 +376,18 @@ func (c *Client) fetchJob(ctx context.Context, job *downloadJob) downloadJobResu
 		}
 		object.Body = nil
 		segments[descriptor.key()] = decodedSegment{chunks: object.Chunks, rawSize: uint64(object.UncompressedSize)}
+		if !allCached && c.options.Cache != nil {
+			_ = c.options.Cache.PutXorbRange(ctx, descriptor.hash,
+				descriptor.desc.Chunks.Start, descriptor.desc.Chunks.End, body)
+		}
 	}
-	return downloadJobResult{segments: segments, fetched: fetchedBytes}
+	return downloadJobResult{
+		segments:    segments,
+		fetched:     networkFetched,
+		fetchRanges: networkRanges,
+		cacheHit:    cacheHitBytes,
+		cacheRanges: cacheHitRanges,
+	}
 }
 
 type croppingWriter struct {
