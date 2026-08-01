@@ -341,6 +341,30 @@ func TestDecodeResponseRejectsMissingBody(t *testing.T) {
 	}
 }
 
+func FuzzDecodeContentEncoding(f *testing.F) {
+	f.Add("identity", []byte("plain"), uint16(32))
+	f.Add("gzip", encodeResponse(f, []byte("gzip"), "gzip"), uint16(32))
+	f.Add("zstd", encodeResponse(f, []byte("zstd"), "zstd"), uint16(32))
+	f.Add("gzip, zstd", encodeResponse(f, []byte("stacked"), "gzip, zstd"), uint16(32))
+	f.Add("gzip", []byte("corrupt"), uint16(1))
+	f.Fuzz(func(t *testing.T, encoding string, data []byte, rawLimit uint16) {
+		if len(data) > 1<<20 {
+			return
+		}
+		limit := int64(rawLimit) + 1
+		response := &http.Response{
+			Header: http.Header{"Content-Encoding": []string{encoding}},
+			Body:   io.NopCloser(bytes.NewReader(data)),
+		}
+		reader, closeDecoder, err := decodeResponse(response, limit)
+		if err != nil {
+			return
+		}
+		_, _ = readLimited(reader, limit)
+		_ = closeDecoder()
+	})
+}
+
 func TestValidateSignedURLStillRejectsCredentials(t *testing.T) {
 	for _, raw := range []string{"http://user:pass@example.com/x", "ftp://example.com/x", "/relative", "http://example.com/x#fragment"} {
 		if err := validateSignedURL(raw); err == nil {
