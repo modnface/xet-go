@@ -270,6 +270,14 @@ func TestStaticAccessAndCacheContracts(t *testing.T) {
 	}
 	cache.invalidate(Access(99))
 
+	waiting := &accessCache{provider: provider, now: time.Now}
+	waiting.entries[AccessRead].refreshing = make(chan struct{})
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := waiting.get(canceled, AccessRead); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waiting cache ignored cancellation: %v", err)
+	}
+
 	want := errors.New("provider failed")
 	failed := &errorAccessProvider{err: want}
 	cache = &accessCache{provider: failed, now: time.Now}
