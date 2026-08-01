@@ -23,14 +23,39 @@ jobs:
         env:
           CGO_ENABLED: '0'
 
-  race:
+  quality:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.12'
+          cache: true
+      - run: go test -race ./...
+      - run: go vet ./...
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+      - run: ./conformance/check-coverage.sh
+      - run: XET_FUZZ_TIME=2s ./conformance/fuzz-smoke.sh
+      - run: ./conformance/cross-compile.sh
+
+  official-conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23.x'
           cache: true
-      - run: go test -race ./...
-      - run: go vet ./...
-
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .oracle/xet-core
+            .cache/xet-spec-reference-files
+          key: xet-official-${{ runner.os }}-${{ hashFiles('conformance/reference-manifest.json', 'conformance/rust-oracle/main.rs') }}
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      - run: ./conformance/run-official-conformance.sh
+      - run: XET_PERF_ITERATIONS=1 XET_PERF_SAMPLES=1 ./conformance/compare-performance.sh

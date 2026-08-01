@@ -117,7 +117,7 @@ func XorbFromObject(object *xorb.Object) (Xorb, error) {
 	if object == nil {
 		return Xorb{}, errors.New("shard: nil xorb object")
 	}
-	if len(object.Body) > int(^uint32(0)) {
+	if uint64(len(object.Body)) > uint64(^uint32(0)) {
 		return Xorb{}, errors.New("shard: serialized xorb length exceeds uint32")
 	}
 	result := Xorb{
