@@ -59,6 +59,10 @@ type xorbUploadTask struct {
 	object *xorb.Object
 }
 
+type xorbExistenceProtocol interface {
+	XorbExists(context.Context, string, xethash.Hash) (bool, error)
+}
+
 type globalDedupIndex struct {
 	key       xethash.Hash
 	locations map[xethash.Hash]placement
@@ -152,6 +156,7 @@ type UploadBatch struct {
 	finalized  bool
 	fileSerial uint64
 	files      []uploadedFile
+	composed   []shard.File
 	current    *pendingXorb
 	locations  map[xethash.Hash]placement
 	global     []globalDedupIndex
@@ -500,10 +505,38 @@ func (b *UploadBatch) uploadWorker() {
 		if b.ctx.Err() != nil {
 			continue
 		}
+		if b.client.options.UploadJournal != nil {
+			recorded, err := b.client.options.UploadJournal.HasXorb(b.ctx, task.object.Hash)
+			if err != nil {
+				b.setFailure(fmt.Errorf("xet: inspect upload journal: %w", err))
+				continue
+			}
+			if recorded {
+				if checker, ok := b.client.protocol.(xorbExistenceProtocol); ok {
+					exists, err := checker.XorbExists(b.ctx, b.client.options.Prefix, task.object.Hash)
+					if err != nil {
+						b.setFailure(err)
+						continue
+					}
+					if exists {
+						b.reportMu.Lock()
+						b.report.ResumedXorbs++
+						b.reportMu.Unlock()
+						continue
+					}
+				}
+			}
+		}
 		inserted, err := b.client.protocol.UploadXorb(b.ctx, b.client.options.Prefix, task.object.Hash, task.object.Body)
 		if err != nil {
 			b.setFailure(err)
 			continue
+		}
+		if b.client.options.UploadJournal != nil {
+			if err := b.client.options.UploadJournal.MarkXorb(b.ctx, task.object.Hash); err != nil {
+				b.setFailure(fmt.Errorf("xet: update upload journal: %w", err))
+				continue
+			}
 		}
 		b.reportMu.Lock()
 		b.report.Xorbs++
@@ -540,8 +573,8 @@ func (b *UploadBatch) Finalize() (UploadReport, error) {
 		return UploadReport{}, fmt.Errorf("%w: %v", ErrBatchFailed, err)
 	}
 
-	files := make([]shard.File, 0, len(b.files))
-	seenFiles := make(map[xethash.Hash]struct{}, len(b.files))
+	files := make([]shard.File, 0, len(b.files)+len(b.composed))
+	seenFiles := make(map[xethash.Hash]struct{}, len(b.files)+len(b.composed))
 	for i := range b.files {
 		if _, duplicate := seenFiles[b.files[i].info.Hash]; duplicate {
 			continue
@@ -550,6 +583,13 @@ func (b *UploadBatch) Finalize() (UploadReport, error) {
 		if err != nil {
 			b.cancel()
 			return UploadReport{}, err
+		}
+		seenFiles[file.Hash] = struct{}{}
+		files = append(files, file)
+	}
+	for _, file := range b.composed {
+		if _, duplicate := seenFiles[file.Hash]; duplicate {
+			continue
 		}
 		seenFiles[file.Hash] = struct{}{}
 		files = append(files, file)
@@ -569,6 +609,9 @@ func (b *UploadBatch) Finalize() (UploadReport, error) {
 	b.reportMu.Lock()
 	b.report.ShardBytes = uint64(len(shardBody))
 	b.report.ShardUploaded = true
+	if b.client.options.UploadJournal != nil {
+		b.report.JournalCleared = b.client.options.UploadJournal.Clear(b.ctx) == nil
+	}
 	b.report.CompletedAt = time.Now()
 	report := b.report
 	b.reportMu.Unlock()

@@ -55,6 +55,7 @@ type Options struct {
 	MaxDownloadMemory         uint64
 	MaxReconstructionWindow   uint64
 	GlobalDedup               bool
+	UploadJournal             UploadJournal
 	// DefragWindow is the number of recent reconstruction ranges used to
 	// estimate fragmentation. The zero value selects the Rust default of 128.
 	DefragWindow int
@@ -151,8 +152,10 @@ type UploadReport struct {
 	Xorbs               int
 	SerializedXorbBytes uint64
 	InsertedXorbs       int
+	ResumedXorbs        int
 	ShardBytes          uint64
 	ShardUploaded       bool
+	JournalCleared      bool
 	Dedup               DedupReport
 	StartedAt           time.Time
 	CompletedAt         time.Time

@@ -22,16 +22,19 @@ import (
 type memoryProtocol struct {
 	mu sync.Mutex
 
-	objects       map[xethash.Hash]*xorb.Object
-	metadata      *shard.Shard
-	fetched       map[string]map[xetcas.HTTPRange][]byte
-	uploadOrder   []string
-	queryCalls    int
-	fetchCalls    int
-	expireFetches int
-	corruptLength bool
-	globalShard   []byte
-	globalQueries int
+	objects          map[xethash.Hash]*xorb.Object
+	metadata         *shard.Shard
+	fetched          map[string]map[xetcas.HTTPRange][]byte
+	uploadOrder      []string
+	queryCalls       int
+	fetchCalls       int
+	expireFetches    int
+	corruptLength    bool
+	globalShard      []byte
+	globalQueries    int
+	fileChunks       *xetcas.FileChunkHashesResponse
+	fileChunkQueries int
+	shardFailures    int
 }
 
 func newMemoryProtocol() *memoryProtocol {
@@ -65,6 +68,13 @@ func (m *memoryProtocol) UploadXorb(
 	return !existed, nil
 }
 
+func (m *memoryProtocol) XorbExists(_ context.Context, _ string, hash xethash.Hash) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, exists := m.objects[hash]
+	return exists, nil
+}
+
 func (m *memoryProtocol) UploadShard(_ context.Context, body []byte, _ func(xetcas.ShardUploadEvent)) error {
 	metadata, err := shard.Decode(body)
 	if err != nil {
@@ -72,6 +82,10 @@ func (m *memoryProtocol) UploadShard(_ context.Context, body []byte, _ func(xetc
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.shardFailures != 0 {
+		m.shardFailures--
+		return errors.New("injected shard failure")
+	}
 	for _, value := range metadata.Xorbs {
 		if _, ok := m.objects[value.Hash]; !ok {
 			return fmt.Errorf("shard arrived before xorb %s", value.Hash)
@@ -90,6 +104,24 @@ func (m *memoryProtocol) QueryGlobalDedup(_ context.Context, _ string, _ xethash
 		return nil, false, nil
 	}
 	return append([]byte(nil), m.globalShard...), true, nil
+}
+
+func (m *memoryProtocol) QueryFileChunkHashes(
+	_ context.Context,
+	_ xethash.Hash,
+	_ []xetcas.FileRange,
+) (*xetcas.FileChunkHashesResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fileChunkQueries++
+	if m.fileChunks == nil {
+		return nil, errors.New("no file-chunk-hashes response configured")
+	}
+	response := *m.fileChunks
+	response.Windows = append([]xetcas.ChunkWindow(nil), response.Windows...)
+	response.HashRanges = append([]*xethash.MerkleHashSubtree(nil), response.HashRanges...)
+	response.GapVerification = append([]xethash.Hash(nil), response.GapVerification...)
+	return &response, nil
 }
 
 func (m *memoryProtocol) QueryReconstruction(
