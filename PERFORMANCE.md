@@ -1,178 +1,229 @@
 # Go versus official Rust performance
 
-This report compares the Go module with the official `huggingface/xet-core`
-implementation pinned at `7a267506b77b484688654c46079e3aec35394611`. Every
-sample is rejected unless Go and Rust produce the same identity, chunk count,
-and compression scheme; uncompressed xorbs must also have the same serialized
-length.
+This report records the 2026-08-01 ARM64 BLAKE3 investigation. It compares
+this module with official `huggingface/xet-core` commit
+`7a267506b77b484688654c46079e3aec35394611` and explains why the previous Go
+implementation was slower and produced far more context switches.
 
-## Result
+## Outcome
 
-The optimized Go implementation reaches 74.5–83.7% of official Rust throughput
-on the 63.5 MB reference CSV, up from the recorded 45.1–60.5% baseline. On the
-current Go 1.26.5 toolchain, the original byte-at-a-time chunker had regressed
-further; relative to that checked-out implementation, the retained changes are
-1.11–3.78x faster.
+The retained implementation replaces scalar data-leaf hashing on ARM64 with
+the NEON path in `goforge.dev/blake3sum` v1.0.0 and batches independent Xet
+leaf hashes behind a package-wide outer-worker budget. It remains CGO-free.
+Other architectures keep the prior `lukechampine.com/blake3` data-hash path,
+without outer batch workers. The module minimum is now Go 1.24.
 
-Host and sampling details:
+On the official 63.5 MB CSV, final Go is 1.02–4.20x official Rust for every
+hashing-inclusive xorb encode/decode case, and 1.54x for chunking plus the file
+hash. Owned chunking remains close at 0.94x. Merkle-only hashing is 0.64x but
+takes only about 0.11 ms per pass, so it is not an end-to-end bottleneck.
 
-- Date: 2026-08-01 UTC.
-- Host: Apple M4 Pro (`darwin/arm64`), 14 logical CPUs, 48 GiB memory.
-- Go: 1.26.5; Rust: 1.95.0.
+| Operation | Go before, MiB/s | Go final, MiB/s | Go speedup | Rust final, MiB/s | Final Go/Rust |
+|---|---:|---:|---:|---:|---:|
+| Owned chunking | 1,856.09 | 1,936.27 | 1.04x | 2,050.24 | 0.944x |
+| Leaf hash, prepared chunks | 1,613.18 | 15,008.86 | 9.30x | 2,380.07 | 6.306x |
+| Merkle/file hash, prepared nodes | 482,156.91 | 533,586.50 | 1.11x | 835,322.92 | 0.639x |
+| Chunk + file hash | 849.70 | 1,676.05 | 1.97x | 1,090.46 | 1.537x |
+| Encode prepared chunks, none | 1,485.78 | 8,329.66 | 5.61x | 2,110.58 | 3.947x |
+| Encode prepared chunks, LZ4 | 549.81 | 858.51 | 1.56x | 804.82 | 1.067x |
+| End-to-end encode, none | 819.05 | 1,548.65 | 1.89x | 1,024.04 | 1.512x |
+| End-to-end encode, LZ4 | 408.13 | 590.02 | 1.45x | 576.66 | 1.023x |
+| Decode, none | 1,473.19 | 8,810.23 | 5.98x | 2,095.80 | 4.204x |
+| Decode, LZ4 | 1,111.08 | 3,739.12 | 3.37x | 1,443.09 | 2.591x |
+
+Every sample produced 796 chunks and matching protocol identities. The
+uncompressed xorb also had the same serialized length. LZ4 streams may differ
+because multiple compressed representations conform to the format. Complete
+sample ranges are in `performance/arm64-blake3/end-to-end.tsv`.
+
+## Controlled method
+
+- Host: Apple M4 Pro, 10 performance and 4 efficiency cores, 48 GiB memory,
+  `darwin/arm64`, macOS 26.5.2.
+- Toolchains: Go 1.26.5 for measurements; Rust 1.95.0; Cargo 1.95.0; LLVM
+  22.1.2. Go 1.24.0 and 1.25.12 were also used as compatibility gates.
 - Input: official `Electric_Vehicle_Population_Data_20250917.csv`, 63,527,244
   bytes, SHA-256
   `f41255b252f776125f2b657136654e4d4d5d2ccf8ef4db0ec186bd1981b69734`.
-- Final sampling: median of seven alternating samples, three iterations per
-  sample. Go and Rust execution order alternates between samples. Input reads,
-  stage preparation, and JSON/string presentation are outside the timed loop.
+- Full comparison: median of seven alternating Go/Rust samples, three passes
+  per sample. Preparation is outside the timed region for prepared-stage
+  operations. The comparator rejects identity, chunk-count, scheme, and
+  required serialized-size mismatches.
+- BLAKE3 microbenchmarks: identical deterministic bytes, Xet data key, message
+  size, processed-byte count, caller count, warmup, and seven-sample
+  alternating order. These distinguish fixed-message, streaming, segmented,
+  owned-input, and symmetric caller-parallel cases.
+- Context-switch comparison: seven interleaved samples of the same 20-pass
+  chunk/file-hash workload, measured with `/usr/bin/time -l`. This processes
+  1,270,544,880 bytes per sample. Profiles recorded their own target JSON so
+  overhead could be checked against unprofiled runs; target throughput stayed
+  within a few percent.
 
-| End-to-end operation | Go before, MiB/s | Go final, MiB/s | Go speedup | Rust final, MiB/s | Final Go/Rust |
+The end-to-end comparison intentionally runs each implementation as shipped.
+The pinned Rust hasher is serial for this path; final Go batches independent
+Xet chunks. The symmetric microbench and the `GOMAXPROCS` matrix make the
+resource difference explicit instead of presenting it as a primitive
+single-core advantage.
+
+## Root cause
+
+The previous ARM64 dependency selected `guts/compress_noasm.go`. Go
+disassembly contained scalar `ADD`, `EOR`, and rotate operations and no vector
+compression. For writes above 1,024 bytes it also built goroutine eigentrees;
+`CompressEigentree` added another goroutine layer for groups above 16 KiB.
+Most Xet chunks therefore paid scheduler and transient-tree costs even though
+they were only tens of KiB.
+
+The official Rust `blake3` 1.8.3 build selected `blake3_hash_many_neon` on
+AArch64. Its disassembly contains vector load, transpose, add, and XOR
+instructions. The normal Rust hasher used `SerialJoin`, so it stayed on one OS
+thread for this workload.
+
+The evidence agrees across tools:
+
+- Baseline Go CPU pprof attributed about 52% to `pthread_cond_wait` and 21% to
+  signaling; only about 13% was the chunker. Block pprof attributed 94% to
+  `sync.WaitGroup.Wait`.
+- Baseline allocation pprof attributed 22.9% of allocated space to BLAKE3
+  eigentrees. A one-pass chunk/hash run allocated 86,136,816 bytes in 23,262
+  allocations; the input itself was 63,527,244 bytes.
+- Process inspection observed 13 Go OS threads versus one Rust thread. Samply,
+  Go execution traces, pprof, and Instruments all showed the same park/wakeup
+  pattern.
+- A baseline Instruments System Trace exported 314,942 scheduler-state rows.
+  The optimized trace exported 20,020, a 93.6% reduction.
+- Optimized CPU pprof moved useful work into ARM64 symbols including
+  `compressChunksNEON`; scheduler wait/signal samples fell from about 73% to
+  about 9.4%. Go disassembly contains NEON `VDUP`, `VLD1`, `VTRN`, vector add,
+  and vector XOR instructions.
+
+## Primitive-size result
+
+A single hash call does not explain the end-to-end win. The retained hasher is
+still slower than Rust for common 8–128 KiB messages, but it avoids the old
+nested scheduler behavior and becomes faster on a 1 MiB message. Independent
+chunk batching supplies the large end-to-end gain.
+
+| Message | Previous Go | Final Go | Rust final | Final Go/Rust |
+|---|---:|---:|---:|---:|
+| 8 KiB | 566.85 MiB/s | 670.41 MiB/s | 2,429.64 MiB/s | 0.276x |
+| 64 KiB | 1,319.86 MiB/s | 1,303.56 MiB/s | 2,453.40 MiB/s | 0.531x |
+| 128 KiB | 1,852.06 MiB/s | 1,588.71 MiB/s | 2,451.61 MiB/s | 0.648x |
+| 1 MiB | 4,706.36 MiB/s | 7,116.66 MiB/s | 2,454.02 MiB/s | 2.900x |
+
+The official CSV chunk distribution is 8,407 bytes minimum, 18,670 p10,
+37,216 p25, 78,993 median, and 131,072 p75/p90/maximum. Chunks below 32 KiB
+are 22.7% by count but only 5.7% by bytes. Segmenting the existing dependency
+into 1,024-byte writes avoids its eigentree: it improves an 8 KiB hash from
+about 567 to 906 MiB/s, but falls to about 900 MiB/s for 64 KiB and larger.
+The crossover is roughly 24–32 KiB, so segmentation alone cannot optimize the
+whole distribution.
+
+Batching is enabled when there are at least four chunks totaling 64 KiB, or at
+least two totaling 128 KiB. Below those thresholds `Chunks` calls the ordinary
+single-chunk path. A package-wide budget bounds additional outer workers across
+concurrent callers; the dependency may still use its own bounded work for a
+large individual message. Threshold measurements found 36–52% gains at 128
+KiB total, 22–31% gains for four or more chunks at 64 KiB total, and only a 2%
+gain for two 32 KiB chunks.
+
+## Context switches and core scaling
+
+The original report cited roughly 88,500 Go versus 451 Rust involuntary
+switches. Fresh controlled samples did not reproduce those exact counts, but
+did reproduce the same two-orders-of-magnitude problem: medians were 79,742
+Go versus 298 Rust. Final medians are 3,677 Go versus 202 Rust.
+
+| 20-pass chunk/hash | Go MiB/s | Rust MiB/s | Go involuntary | Rust involuntary | Go/Rust switches |
 |---|---:|---:|---:|---:|---:|
-| Chunk + file hash | 227.74 | 842.99 | 3.70x | 1,033.30 | 0.816x |
-| Xorb encode, none | 215.09 | 812.16 | 3.78x | 969.96 | 0.837x |
-| Xorb encode, LZ4 | 178.42 | 409.52 | 2.30x | 544.13 | 0.753x |
-| Xorb decode, none | 1,302.50 | 1,469.51 | 1.13x | 1,971.87 | 0.745x |
-| Xorb decode, LZ4 | 986.21 | 1,095.20 | 1.11x | 1,350.61 | 0.811x |
+| Baseline | 866.77 | 1,047.42 | 79,742 | 298 | 267.6x |
+| Final | 1,750.32 | 1,113.74 | 3,677 | 202 | 18.2x |
 
-All final operations produced matching protocol identities and 796 chunks. The
-none-encoded xorb had the same 63,533,612-byte layout. LZ4 byte streams can
-differ because the format permits multiple conforming encodings.
+For the same 1.183 GiB of input work, Go fell from about 67,390 to 3,108
+involuntary switches/GiB, a 95.4% reduction. Rust final is about 171/GiB. The
+remaining difference is the cost of useful cross-core batch execution: final
+Go completes the workload about 1.60x faster and uses parallel workers, while
+Rust remains serial. Setting `GOMAXPROCS=1` reduces Go to a median 586 switches
+but also to about 907 MiB/s.
 
-The earlier published baseline used Go 1.24.5 and measured 553.12, 483.29,
-324.61, 1,297.17, and 910.48 MiB/s for the operations above. The large Go
-1.25/1.26 regression was isolated to the old byte-at-a-time `Writer.Write`
-loop: three identical chunk/hash passes took about 371 ms on Go 1.24.5 and 844
-ms on Go 1.26.5. Bulk boundary scanning eliminates that code-generation
-sensitivity; the optimized builds measured about 246 and 241 ms respectively.
+The measured final Go scaling for the same workload was:
 
-## Stage breakdown
+| GOMAXPROCS | Median MiB/s | Median involuntary switches |
+|---:|---:|---:|
+| 1 | 906.7 | 586 |
+| 2 | 1,231.4 | 792 |
+| 4 | 1,482.0 | 1,231 |
+| 8 | 1,671.0 | 1,752 |
+| 10 | 1,712.5 | 2,065 |
+| 14 | 1,739.3 | 3,794 |
 
-The matched oracle also measures stages independently. Chunk inputs and hashes
-for later stages are prepared outside the timed interval.
+A proposed ten-worker library cap was tested separately. With the runtime
+still exposing 14 Ps it raised switches to roughly 8,000–9,400 because idle Ps
+stole runnable work, without a useful throughput gain. It was rejected. Caller
+stress with 1, 2, and 10 concurrent operations also showed no nested-parallel
+collapse: at 10 callers the retained encode/decode prototypes reached about
+10.3/11.0 GiB/s versus 6.2/6.3 GiB/s for the dependency-only batch.
 
-| Stage, reference CSV | Go MiB/s | Rust MiB/s | Go/Rust | What is timed |
-|---|---:|---:|---:|---|
-| Owned chunking | 1,864.75 | 1,931.75 | 0.965x | GearHash boundaries and owned chunk copies |
-| Leaf hashing | 1,573.21 | 2,282.18 | 0.689x | Keyed BLAKE3 and node output |
-| Merkle/file hash | 516,405.09 | 774,791.45 | 0.667x | Aggregate formatting, internal hashes, protection |
-| Chunk + file hash | 842.99 | 1,033.30 | 0.816x | Owned chunking, leaf hashes, aggregate |
-| Encode prepared chunks, none | 1,451.19 | 1,971.84 | 0.736x | Leaf hashes, metadata, ownership, serialization |
-| Encode prepared chunks, LZ4 | 542.05 | 763.53 | 0.710x | Leaf hashes, compression, metadata, serialization |
+## Alternatives considered
 
-Merkle aggregation is slower in relative terms but immaterial in absolute
-terms: three complete aggregate passes took 0.352 ms in Go versus 0.235 ms in
-Rust, less than 0.2% of the end-to-end chunk/hash interval. The significant
-remaining large-input costs are leaf BLAKE3 and xorb ownership/serialization.
+| Candidate | Evidence | Decision |
+|---|---|---|
+| Keep `lukechampine` direct | No dependency or toolchain change; baseline scalar ARM64 path and nested eigentrees | Rejected: source of the measured gap |
+| Segment existing writes + outer batch | About 8.9 GiB/s prepared leaf hashing, 1,504 MiB/s chunk/hash, allocation-light | Viable fallback, rejected because retained candidate was consistently faster end to end |
+| `github.com/zeebo/blake3` v0.2.4 | Mature Go 1.18 dependency; no ARM64 SIMD; about 954 MiB/s sequential and 9.5 GiB/s over the official chunk batch | Rejected: weaker ARM64 result |
+| `goforge.dev/blake3sum` v1.0.0 | Go 1.24, CGO-free ARM64 NEON; about 1,598 MiB/s sequential distribution and 14.5 GiB/s batched | Retained with explicit version pin, compatibility tests, and conformance gates |
+| CGO/Rust or C BLAKE3 | Mature SIMD implementations | Rejected: violates the module's CGO-free deployment contract |
+| New hand-written assembly/fork | Could target more message sizes | Rejected for complexity and long-term maintenance risk after a conforming dependency met the end-to-end goal |
 
-## Input size and entropy
+The retained dependency is newer and has a shorter release history than the
+other Go candidates. That risk is why the version is pinned, its own package
+tests and `govulncheck` are gates, and every Xet boundary size is compared with
+the official Rust oracle. The Go 1.24 requirement was accepted only after the
+dependency-free and older-toolchain alternatives were measured.
 
-The deterministic random fixtures use identical bytes in both implementations.
-Small cases use more iterations so the timed interval remains measurable.
+## Validation
 
-| Random input | Chunk + hash | Encode none | Encode LZ4 request | Decode none | Decode LZ4 request |
-|---|---:|---:|---:|---:|---:|
-| 8 KiB | 0.244x | 0.232x | 0.214x | 0.266x | 0.268x |
-| 1 MiB | 0.725x | 0.734x | 0.675x | 0.635x | 0.647x |
-| 16 MiB | 0.771x | 0.813x | 0.762x | 0.715x | 0.715x |
-| 63 MiB | 0.776x | 0.789x | 0.759x | 0.685x | 0.684x |
+The final code passed:
 
-The 8 KiB result is a fixed-cost case, not a sustainable byte rate: it contains
-one Xet chunk and Go's hasher/runtime allocation costs dominate. At 1 MiB and
-above, steady-state ratios are much more representative. Random data is not
-compressible, so an LZ4 request correctly falls back to uncompressed chunk
-storage in both implementations.
-
-Content changes chunk shape and compression cost substantially:
-
-| 16 MiB content | Chunk + hash | Encode none | Encode LZ4 | Decode none | Decode LZ4 |
-|---|---:|---:|---:|---:|---:|
-| Deterministic random | 0.771x | 0.813x | 0.762x | 0.715x | 0.715x |
-| All zero | 0.924x | 0.955x | 0.836x | 0.912x | 0.879x |
-| Repeated text | 0.926x | 0.957x | 0.830x | 0.916x | 0.907x |
-
-Repetitive inputs produce maximum-sized chunks, amortize hash setup, and are
-cheap to compress. For these workloads, Go is already within roughly 8–20% of
-Rust end to end.
-
-## Profile findings
-
-CPU, allocation, live-heap, GC, context-switch, instruction, and flame-graph
-profiles were captured from the same optimized binaries.
-
-- Owned chunking is no longer a primary gap. Direct in-memory scanning, bulk
-  copies, and skipping bytes that cannot influence a pre-minimum boundary move
-  it to 97% of Rust on the CSV and 91–100% on large matrix inputs. The skip
-  raises the isolated 8 KiB owned-chunk rate from 1.58 to 10.3 GiB/s.
-- The pinned Rust BLAKE3 backend uses AArch64 NEON. The pure-Go BLAKE3 dependency
-  uses generic ARM64 compression and creates goroutine eigentrees for large
-  writes. In a 20-pass random 63 MiB chunk/hash run, Go used 2.78 s user and
-  0.38 s system CPU over 1.59 s wall time and recorded 88,524 involuntary
-  context switches. Rust used 1.25 s user and 0.03 s system CPU over 1.29 s
-  wall time with 451 involuntary context switches. Samply and pprof attribute
-  most Go samples to runtime park/wakeup paths around those hash workers.
-- The final chunk/hash allocation profile is about 1.41 allocated bytes per
-  input byte: 1.00x is the required independently owned chunk data and about
-  0.36x is transient BLAKE3 eigentree storage. Live heap after 50 passes was
-  97 MB, dominated by the 63 MB input and the final owned chunks.
-- Exact xorb sizing removes geometric `bytes.Buffer` growth. Exact LZ4 decode
-  sizing removes `io.ReadAll` growth. Uncompressed chunk views now share the
-  containing object's owned body, preserving caller-input ownership while
-  eliminating a redundant full-data copy.
-- Over 50 random 63 MiB uncompressed decodes, the zero-copy view reduced
-  cumulative allocations from about 7.4 GiB to 3.3 GiB and improved wall time
-  5–6%. A paired 20-pass process peaked at 498 MB footprint in Go versus 1.53
-  GiB in Rust; allocator retention makes process peaks different from live
-  result size. Ten uncompressed encodes peaked at 407 MB in Go versus 806 MB in
-  Rust on the same input.
-- GC is not the limiting factor. The final 20-pass chunk/hash trace reported
-  0% GC time with sub-millisecond collections. Disabling GC was 4–5% slower in
-  repeated checks. There are no application file syscalls in the timed loop;
-  the input read and decode-body preparation occur before timing. macOS
-  `dtruss`, `fs_usage`, and `sc_usage` require elevated privileges and were
-  unavailable under System Integrity Protection, so system behavior was
-  grounded with `/usr/bin/time -l` counters and Samply context-switch markers.
-
-A bounded replacement for the dependency's per-hash goroutine tree was also
-tested. It removed about 90% of transient hash allocations and improved the 8
-KiB case 11–13%, but regressed CSV leaf hashing about 7.5% and uncompressed
-decode about 10%; it was rejected rather than trading away important
-dimensions.
-
-## Realistic remaining gap
-
-On this ARM64 host, a realistic current target for large inputs is 75–85% of
-Rust end-to-end, with 83–96% common for compressible or repetitive data. Random
-inputs expose a 64–81% range depending on whether hashing, ownership copies, or
-codec work dominates. Tiny single-chunk objects remain a fixed-cost weakness.
-
-Closing the next material gap requires a mature pure-Go ARM64 NEON BLAKE3
-backend that supports Go 1.23, or a carefully batched hashing API that improves
-both small and large cases. The investigated SIMD-capable alternative requires
-Go 1.24, and the CGO alternative would violate this module's CGO-free contract;
-neither was adopted. The remaining Merkle and GC costs are too small to justify
-additional complexity.
+- `go test ./...`, `go test -race ./...`, `go vet ./...`, and
+  `golangci-lint` 2.12.2 with Go 1.25.12;
+- the exact 95.0% repository coverage gate (98.9% in `xethash`), all 11 fuzz
+  smoke targets, and Linux/Windows/macOS cross-compiles for the configured
+  amd64, arm64, and 386 targets;
+- `go test ./...` on the minimum Go 1.24.0 and CI Go 1.25.12;
+- `go mod verify`, the upstream `goforge` BLAKE3 package tests, and
+  `govulncheck` v1.1.4 with no called vulnerabilities;
+- official Rust differential Merkle, xorb, complete-file, shard, corpus,
+  boundary-size, reference-fixture, and local-CAS round-trip suites.
 
 ## Reproduce
+
+Build and run the pinned end-to-end oracle:
 
 ```sh
 XET_PERF_ITERATIONS=3 XET_PERF_SAMPLES=7 \
   ./conformance/compare-performance.sh
 ```
 
-This writes the complete machine-readable report and concise table to
-`.cache/performance/latest.{json,md}`. CPU and memory profiles can be requested
-from the Go benchmark binary with `XET_PERF_CPU_PROFILE`,
-`XET_PERF_ALLOCS_PROFILE`, and `XET_PERF_HEAP_PROFILE`.
-
-Deterministic matrix inputs can be generated with:
+This writes `.cache/performance/latest.{json,md}`. Build the controlled BLAKE3
+oracle and harness with:
 
 ```sh
-go run ./conformance/cmd/perf-fixture \
-  -size 16777216 -pattern random -output .cache/performance/random-16m.bin
-./conformance/compare-performance.sh \
-  .cache/performance/random-16m.bin .cache/performance/random-16m
+RUST_BLAKE3="$(./conformance/build-rust-blake3-oracle.sh)"
+go build -trimpath -o .oracle/bin/xet-go-blake3-perf \
+  ./conformance/cmd/blake3-perf
+go build -trimpath -o .oracle/bin/xet-go-blake3-compare \
+  ./conformance/cmd/blake3-compare
+.oracle/bin/xet-go-blake3-compare \
+  -go .oracle/bin/xet-go-blake3-perf -rust "$RUST_BLAKE3" \
+  -scenario one_shot -size 131072 -iterations 2048 \
+  -workers 1 -samples 7
 ```
 
-`-pattern` accepts `random`, `zero`, or `repeat`. CI runs a one-sample semantic
-smoke check but does not enforce ratios because shared-runner performance is
-not stable.
+The Go end-to-end binary accepts `XET_PERF_CPU_PROFILE`,
+`XET_PERF_ALLOCS_PROFILE`, `XET_PERF_HEAP_PROFILE`,
+`XET_PERF_BLOCK_PROFILE`, `XET_PERF_MUTEX_PROFILE`,
+`XET_PERF_GOROUTINE_PROFILE`, and `XET_PERF_TRACE`. The tracked compact data
+and raw-artifact manifest are in `performance/arm64-blake3/`. CI runs a
+one-sample semantic performance smoke test but does not enforce ratios because
+shared-runner throughput is unstable.

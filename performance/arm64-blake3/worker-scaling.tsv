@@ -1,0 +1,7 @@
+gomaxprocs	median_mib_s	median_involuntary_context_switches	samples
+1	906.7	586	3
+2	1231.4	792	3
+4	1482.0	1231	3
+8	1671.0	1752	3
+10	1712.5	2065	3
+14	1739.3	3794	3
