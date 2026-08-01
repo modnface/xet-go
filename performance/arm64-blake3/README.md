@@ -12,12 +12,16 @@ and pinned xet-core commit `7a267506b77b484688654c46079e3aec35394611`.
   matched operation. Min/max ranges remain in the raw JSON.
 - `blake3-one-shot.tsv`: matched 256 MiB-per-sample fixed-message experiment.
 - `context-switches.tsv`: every fresh baseline and final 20-pass sample.
+- `context-resources.tsv`: CPU time, CPU utilization, peak RSS, normalized
+  switches, retired instructions, and cycles for those context samples.
 - `worker-scaling.tsv`: three-sample final `GOMAXPROCS` sweep.
 - `universal-goforge.tsv`: the rejected attempt to use goforge for every
   keyed BLAKE3 operation, including small-hash and subtree regressions.
 - `fork-unified.tsv`: the Luke-based unified-fork comparison against the
   retained split implementation, scheduler samples, and the rejected
   no-padding eigentree experiment.
+- `unified-fork-matrix.tsv`: seven-sample small/large, reused/new, segmented,
+  owned-buffer, and symmetric caller-parallel results for the unified fork.
 
 Large machine-specific captures are intentionally not committed. In the
 investigation worktree they are under:
@@ -34,6 +38,8 @@ investigation worktree they are under:
 - `.cache/performance-investigation/goforge-everywhere/`
 - `.cache/performance-investigation/fork-unified-profiles/`
 - `.cache/performance-investigation/fork-unified-recapture/`
+- `.cache/performance-investigation/final-resource-59952ae-v2/`
+- `.cache/performance-investigation/final-gomaxprocs-59952ae/`
 
 The profile directories contain pprof CPU/allocation/block profiles, Go
 execution traces, Samply profiles, Instruments Time Profiler and System Trace

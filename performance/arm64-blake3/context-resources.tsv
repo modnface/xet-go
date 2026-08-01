@@ -1,0 +1,15 @@
+# Baseline and retained-split rows use seven interleaved /usr/bin/time -l
+# samples. Unified-fork rows use nine. Every row is the same 20-pass,
+# 1,270,544,880-byte chunk/file-hash workload; columns are independent medians.
+state	implementation	real_s	user_s	sys_s	cpu_percent	max_rss_bytes	voluntary_switches	involuntary_switches_per_s	involuntary_switches_per_gib	instructions	cycles
+baseline	go	1.41	2.69	0.30	212.1	265175040	13	56554.6	67390.2	47254365017	10441306747
+baseline	rust	1.17	1.14	0.01	98.3	162463744	0	254.7	251.8	18068262688	4781566739
+retained_split	go	0.70	1.59	0.05	234.3	271810560	125	5252.9	3107.4	28637532163	6199224529
+retained_split	rust	1.10	1.07	0.01	98.2	200572928	0	183.6	170.7	18084278120	4800235999
+unified_fork	go	0.70	1.47	0.05	217.1	270729216	153	4604.3	2723.8	29409399898	5796914451
+unified_fork	rust	1.11	1.08	0.02	99.1	154435584	0	192.8	180.9	18068583264	4807558702
+
+# Independent medians from the same nine unified-fork samples.
+state	implementation	throughput_mib_s	allocated_bytes	allocations	gc_cycles	gc_pause_ns
+unified_fork	go	1750.127	1704848064	144273	17	1587788
+unified_fork	rust	1102.914	1277056240	16160	0	0

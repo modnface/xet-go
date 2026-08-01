@@ -1,23 +1,54 @@
 # Apple M4 Pro, darwin/arm64, Go 1.26.5, 2026-08-01.
 # split: xet-go commit 5e991e9 (Luke small/internal + GoForge data leaves).
-# fork: local Luke-based fork commit b11e7dd, integrated as the only BLAKE3 module.
-# Nine alternating fresh-process samples; each sample runs three iterations.
-operation	split_mib_s	fork_mib_s	fork_over_split	split_alloc_bytes	fork_alloc_bytes
-chunk_owned	1905.001	1902.387	0.9986	195691848	195691848
-leaf	13452.009	14253.453	1.0596	60454800	60453904
-merkle	465833.612	521903.526	1.1204	161880	161880
-chunk_hash	1663.086	1671.668	1.0052	256356912	256356720
-encode_chunks_none	7556.573	7946.669	1.0516	251424720	251422584
-encode_chunks_lz4	846.759	850.546	1.0045	347260024	347263248
-encode_none	1528.260	1542.336	1.0092	447239104	447244608
-encode_lz4	577.273	582.538	1.0091	543072992	543329264
-decode_none	8500.839	9044.345	1.0639	192976776	192974568
-decode_lz4	3662.121	3757.894	1.0262	313069224	313079920
+# fork: local Luke-based fork commit 59952ae, integrated as the only BLAKE3 module.
+# Nine alternating fresh-process samples; each pipeline sample runs three iterations.
+operation	split_mib_s	fork_mib_s	fork_over_split
+chunk_owned	1929.051	1934.910	1.0030
+leaf	15022.608	17100.120	1.1383
+merkle	525361.180	526757.410	1.0027
+chunk_hash	1664.687	1691.504	1.0161
+encode_chunks_none	8153.234	8766.940	1.0753
+encode_chunks_lz4	4853.236	4862.651	1.0019
+encode_none	1549.748	1566.406	1.0107
+encode_lz4	4585.235	4588.195	1.0006
+decode_none	8588.121	9120.097	1.0619
+decode_lz4	3695.864	3803.652	1.0292
 
-# Nine alternating /usr/bin/time -l samples, 20 passes per fresh process.
+# Controlled effect of NewSerial inside Xet's already-parallel batch. Same fork
+# otherwise; nine alternating /usr/bin/time -l samples, 20 passes per process.
 candidate	median_mib_s	median_involuntary_switches	median_max_rss	allocated_bytes	allocations	gc_cycles
-split	1720.251	4088	271319040	1708352744	238708	17
-fork	1724.032	3848	273547264	1708370488	238715	16
+nested_fork	1762.38	3559	271564800	1708373552	238727	17
+serial_batch	1772.07	3207	269336576	1704841872	144268	17
+
+# Direct retained-split versus final serial-batch fork under the same method.
+candidate	median_mib_s	median_involuntary_switches	median_max_rss	allocated_bytes	allocations	gc_cycles
+split	1705.591	3691	276791296	1708343584	238702	17
+fork	1728.992	3589	292601856	1704843296	144274	17
+
+# Three alternating 20-pass samples at each GOMAXPROCS value. All rows produced
+# one identical protocol identity. The fork keeps the win at every core count.
+gomaxprocs	candidate	median_mib_s	median_involuntary_switches	allocations
+1	split	906.934	338	143756
+1	fork	959.993	323	143754
+2	split	1241.618	514	219496
+2	fork	1292.948	508	143787
+4	split	1480.377	1165	237920
+4	fork	1523.188	1069	143865
+10	split	1718.379	2393	238368
+10	fork	1737.039	2301	144100
+14	split	1745.880	3433	238693
+14	fork	1759.994	3262	144265
+
+# Rejected global policy: force all public writes below 256 KiB serial. This
+# helped 64/128 KiB but materially regressed 1 MiB, so serial operation remains
+# explicit and is used only when Xet already owns the outer parallelism.
+message_size	nested_mib_s	global_serial_mib_s	global_serial_over_nested
+64	687.0	680.4	0.9904
+1024	968.5	968.5	1.0000
+8192	987.0	988.2	1.0012
+65536	1482.8	1765.6	1.1907
+131072	1731.2	1819.7	1.0511
+1048576	7684.0	7077.5	0.9211
 
 # Rejected experiment: avoid padding eigentrees to 16 KiB. It cut allocation
 # substantially but regressed representative full-pipeline medians.
