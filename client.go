@@ -54,8 +54,15 @@ type Options struct {
 	DownloadConcurrency       int
 	MaxDownloadMemory         uint64
 	GlobalDedup               bool
-	Cache                     Cache
-	Progress                  func(Progress)
+	// DefragWindow is the number of recent reconstruction ranges used to
+	// estimate fragmentation. The zero value selects the Rust default of 128.
+	DefragWindow int
+	// MinChunksPerRange and DefragHysteresis select the same rolling
+	// defragmentation thresholds as xet-core. Zero values select 8 and 0.5.
+	MinChunksPerRange float64
+	DefragHysteresis  float64
+	Cache             Cache
+	Progress          func(Progress)
 }
 
 // Client is the high-level, hosting-decoupled Xet transfer engine.
@@ -96,6 +103,19 @@ func NewClient(protocol Protocol, options Options) (*Client, error) {
 	if options.MaxDownloadMemory < xorb.MaxRawSize {
 		return nil, errors.New("xet: maximum download memory must permit at least one xorb")
 	}
+	if options.DefragWindow == 0 {
+		options.DefragWindow = 128
+	}
+	if options.MinChunksPerRange == 0 {
+		options.MinChunksPerRange = 8
+	}
+	if options.DefragHysteresis == 0 {
+		options.DefragHysteresis = 0.5
+	}
+	if options.DefragWindow < 1 || options.MinChunksPerRange < 1 ||
+		options.DefragHysteresis <= 0 || options.DefragHysteresis > 1 {
+		return nil, errors.New("xet: invalid defragmentation policy")
+	}
 	return &Client{protocol: protocol, options: options}, nil
 }
 
@@ -108,14 +128,16 @@ type FileInfo struct {
 
 // DedupReport accounts for chunks and bytes before protocol compression.
 type DedupReport struct {
-	TotalChunks        uint64
-	TotalBytes         uint64
-	NewChunks          uint64
-	NewBytes           uint64
-	SessionDedupChunks uint64
-	SessionDedupBytes  uint64
-	GlobalDedupChunks  uint64
-	GlobalDedupBytes   uint64
+	TotalChunks         uint64
+	TotalBytes          uint64
+	NewChunks           uint64
+	NewBytes            uint64
+	SessionDedupChunks  uint64
+	SessionDedupBytes   uint64
+	GlobalDedupChunks   uint64
+	GlobalDedupBytes    uint64
+	DefragSkippedChunks uint64
+	DefragSkippedBytes  uint64
 }
 
 // UploadReport describes the completed CAS transaction. ShardUploaded is true

@@ -64,6 +64,82 @@ type globalDedupIndex struct {
 	locations map[xethash.Hash]placement
 }
 
+type globalCandidate struct {
+	hash      xethash.Hash
+	data      []byte
+	placement placement
+}
+
+type fragmentationTracker struct {
+	window       int
+	minimum      float64
+	hysteresis   float64
+	lowThreshold bool
+	ranges       []int
+	start        int
+	total        int
+}
+
+func newFragmentationTracker(options Options) *fragmentationTracker {
+	return &fragmentationTracker{
+		window: options.DefragWindow, minimum: options.MinChunksPerRange,
+		hysteresis: options.DefragHysteresis, lowThreshold: true,
+		ranges: make([]int, 0, options.DefragWindow),
+	}
+}
+
+func (t *fragmentationTracker) allowDedup(chunks int) bool {
+	if len(t.ranges) < t.window {
+		return true
+	}
+	average := float64(t.total) / float64(len(t.ranges))
+	target := t.minimum
+	if t.lowThreshold {
+		target *= t.hysteresis
+	}
+	if average < target && float64(chunks) < average {
+		t.lowThreshold = false
+		return false
+	}
+	t.lowThreshold = true
+	return true
+}
+
+func (t *fragmentationTracker) addRange(chunks int) {
+	if len(t.ranges) < t.window {
+		t.ranges = append(t.ranges, chunks)
+		t.total += chunks
+		return
+	}
+	t.total -= t.ranges[t.start]
+	t.ranges[t.start] = chunks
+	t.total += chunks
+	t.start = (t.start + 1) % t.window
+}
+
+func (t *fragmentationTracker) extendRange(chunks int) {
+	if len(t.ranges) == 0 {
+		t.addRange(chunks)
+		return
+	}
+	last := len(t.ranges) - 1
+	if len(t.ranges) == t.window {
+		last = (t.start + len(t.ranges) - 1) % len(t.ranges)
+	}
+	t.ranges[last] += chunks
+	t.total += chunks
+}
+
+func placementsContinue(previous, next placement) bool {
+	if previous.index+1 != next.index {
+		return false
+	}
+	if previous.pending != nil || next.pending != nil {
+		return previous.pending != nil && previous.pending == next.pending
+	}
+	return !previous.externalHash.IsZero() && previous.externalHash == next.externalHash
+}
+
 // UploadBatch shares xorb packing and session deduplication across files. Add
 // returns deterministic metadata early, but files are not reconstructable
 // until Finalize succeeds. Add and Finalize are intentionally serialized.
@@ -135,6 +211,67 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 	sha := sha256.New()
 	file := uploadedFile{}
 	nextGlobalQuery := 0
+	tracker := newFragmentationTracker(b.client.options)
+	var candidates []globalCandidate
+	recordPlacement := func(value placement) {
+		if len(file.placements) != 0 && placementsContinue(file.placements[len(file.placements)-1], value) {
+			tracker.extendRange(1)
+		} else {
+			tracker.addRange(1)
+		}
+		file.placements = append(file.placements, value)
+	}
+	placeLocal := func(hash xethash.Hash, data []byte) error {
+		if existing, ok := b.locations[hash]; ok {
+			recordPlacement(existing)
+			b.report.Dedup.SessionDedupChunks++
+			b.report.Dedup.SessionDedupBytes += uint64(len(data))
+			return nil
+		}
+		value, err := b.addNovelChunk(data, fileSerial)
+		if err != nil {
+			return err
+		}
+		b.locations[hash] = value
+		recordPlacement(value)
+		b.report.Dedup.NewChunks++
+		b.report.Dedup.NewBytes += uint64(len(data))
+		return nil
+	}
+	flushCandidates := func() error {
+		if len(candidates) == 0 {
+			return nil
+		}
+		continues := len(file.placements) != 0 &&
+			placementsContinue(file.placements[len(file.placements)-1], candidates[0].placement)
+		if continues || tracker.allowDedup(len(candidates)) {
+			for _, candidate := range candidates {
+				recordPlacement(candidate.placement)
+				b.locations[candidate.hash] = candidate.placement
+				b.report.Dedup.GlobalDedupChunks++
+				b.report.Dedup.GlobalDedupBytes += uint64(len(candidate.data))
+			}
+		} else {
+			for _, candidate := range candidates {
+				b.report.Dedup.DefragSkippedChunks++
+				b.report.Dedup.DefragSkippedBytes += uint64(len(candidate.data))
+				if err := placeLocal(candidate.hash, candidate.data); err != nil {
+					return err
+				}
+			}
+		}
+		candidates = candidates[:0]
+		return nil
+	}
+	bufferGlobal := func(hash xethash.Hash, data []byte, value placement) error {
+		if len(candidates) != 0 && !placementsContinue(candidates[len(candidates)-1].placement, value) {
+			if err := flushCandidates(); err != nil {
+				return err
+			}
+		}
+		candidates = append(candidates, globalCandidate{hash: hash, data: data, placement: value})
+		return nil
+	}
 	reader := io.TeeReader(source, sha)
 	err := chunker.SplitContext(b.ctx, reader, chunker.DefaultConfig, func(value chunker.Chunk) error {
 		if err := b.failure(); err != nil {
@@ -147,42 +284,44 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 		b.report.Dedup.TotalBytes += uint64(len(value.Data))
 		fileChunkIndex := len(file.chunkNodes) - 1
 		if existing, ok := b.locations[hash]; ok {
-			file.placements = append(file.placements, existing)
+			if err := flushCandidates(); err != nil {
+				return err
+			}
+			recordPlacement(existing)
 			b.report.Dedup.SessionDedupChunks++
 			b.report.Dedup.SessionDedupBytes += uint64(len(value.Data))
 		} else if existing, ok := b.lookupGlobal(hash, uint32(len(value.Data))); ok {
-			file.placements = append(file.placements, existing)
-			b.report.Dedup.GlobalDedupChunks++
-			b.report.Dedup.GlobalDedupBytes += uint64(len(value.Data))
+			if err := bufferGlobal(hash, value.Data, existing); err != nil {
+				return err
+			}
 		} else {
 			if b.client.options.GlobalDedup && fileChunkIndex >= nextGlobalQuery &&
 				(fileChunkIndex == 0 || hash.LastUint64()%1024 == 0) {
 				nextGlobalQuery = fileChunkIndex + 256
 				b.loadGlobalShard(hash)
 				if external, found := b.lookupGlobal(hash, uint32(len(value.Data))); found {
-					file.placements = append(file.placements, external)
-					b.report.Dedup.GlobalDedupChunks++
-					b.report.Dedup.GlobalDedupBytes += uint64(len(value.Data))
-					if b.client.options.Progress != nil {
-						b.client.options.Progress(Progress{Phase: ProgressChunking, Completed: uint64(value.End())})
+					if err := bufferGlobal(hash, value.Data, external); err != nil {
+						return err
 					}
-					return nil
+					goto progress
 				}
 			}
-			placement, err := b.addNovelChunk(value.Data, fileSerial)
-			if err != nil {
+			if err := flushCandidates(); err != nil {
 				return err
 			}
-			b.locations[hash] = placement
-			file.placements = append(file.placements, placement)
-			b.report.Dedup.NewChunks++
-			b.report.Dedup.NewBytes += uint64(len(value.Data))
+			if err := placeLocal(hash, value.Data); err != nil {
+				return err
+			}
 		}
+	progress:
 		if b.client.options.Progress != nil {
 			b.client.options.Progress(Progress{Phase: ProgressChunking, Completed: uint64(value.End())})
 		}
 		return nil
 	})
+	if err == nil {
+		err = flushCandidates()
+	}
 	if err != nil {
 		b.setFailure(err)
 		b.finalized = true

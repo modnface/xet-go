@@ -376,6 +376,34 @@ func TestGlobalDedupProtectedShard(t *testing.T) {
 	}
 }
 
+func TestFragmentationTrackerMatchesRustThresholds(t *testing.T) {
+	tracker := newFragmentationTracker(Options{
+		DefragWindow: 3, MinChunksPerRange: 8, DefragHysteresis: 0.5,
+	})
+	// The estimator deliberately permits all deduplication until its rolling
+	// window is full.
+	for range 3 {
+		if !tracker.allowDedup(1) {
+			t.Fatal("dedup rejected before estimator window filled")
+		}
+		tracker.addRange(2)
+	}
+	// Average chunks/range is 2, below the low threshold (4). A one-chunk
+	// range is rejected and switches to the high threshold; a two-chunk range
+	// is accepted because Rust uses a strict less-than lookahead comparison.
+	if tracker.allowDedup(1) {
+		t.Fatal("fragmenting one-chunk range accepted")
+	}
+	if !tracker.allowDedup(2) {
+		t.Fatal("non-degrading two-chunk range rejected")
+	}
+	tracker.addRange(2)
+	tracker.extendRange(3)
+	if tracker.total != 9 {
+		t.Fatalf("rolling chunk total = %d, want 9", tracker.total)
+	}
+}
+
 func makeProtectedGlobalShard(metadata shard.Shard, key xethash.Hash) ([]byte, error) {
 	minimal := shard.Shard{Xorbs: metadata.Xorbs}
 	body, err := shard.EncodeUpload(minimal)
