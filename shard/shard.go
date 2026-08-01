@@ -447,7 +447,10 @@ func validate(value *Shard, upload bool) error {
 		if len(x.Chunks) == 0 {
 			return fmt.Errorf("shard: xorb %d has no chunks", i)
 		}
-		if x.SerializedBytes == 0 {
+		// Historical cache/reference shards leave this field zero. It remains
+		// mandatory on newly encoded upload shards because it authenticates the
+		// actual footerless xorb body sent to the CAS.
+		if upload && x.SerializedBytes == 0 {
 			return fmt.Errorf("shard: xorb %d has zero serialized size", i)
 		}
 		var end uint64

@@ -125,6 +125,27 @@ func TestCompleteV0Decode(t *testing.T) {
 	}
 }
 
+func TestOfficialLegacyTrailerDecode(t *testing.T) {
+	object, err := Encode([][]byte{[]byte("official reference trailer")}, None)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := append(append([]byte(nil), object.Body...), legacyTrailer[:]...)
+	decoded, err := Decode(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.LegacyTrailer || decoded.Footer != nil || decoded.FooterOffset != uint32(len(object.Body)) ||
+		decoded.Hash != object.Hash || !bytes.Equal(decoded.Body, legacy) {
+		t.Fatalf("legacy trailer metadata differs: %+v", decoded)
+	}
+	corrupt := append([]byte(nil), legacy...)
+	corrupt[len(corrupt)-4] = 1
+	if _, err := Decode(corrupt); err == nil {
+		t.Fatal("accepted malformed legacy trailer as chunk data")
+	}
+}
+
 func TestCompleteFooterRejectsCorruption(t *testing.T) {
 	object, err := Encode([][]byte{bytes.Repeat([]byte("footer"), 2_000)}, None)
 	if err != nil {

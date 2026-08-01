@@ -29,6 +29,7 @@ var (
 	footerMagic       = [7]byte{'X', 'E', 'T', 'B', 'L', 'O', 'B'}
 	footerHashesMagic = [7]byte{'X', 'B', 'L', 'B', 'H', 'S', 'H'}
 	footerBoundsMagic = [7]byte{'X', 'B', 'L', 'B', 'B', 'N', 'D'}
+	legacyTrailer     = [4]byte{'X', 'E', 'T', 'B'}
 )
 
 // Scheme is the compression transform stored in a chunk header.
@@ -110,6 +111,9 @@ type Object struct {
 	UncompressedSize uint32
 	FooterOffset     uint32
 	Footer           *Footer
+	// LegacyTrailer reports the historical "XETB" terminator carried by the
+	// official protocol reference xorb. New network objects do not emit it.
+	LegacyTrailer bool
 }
 
 // Encode serializes an ordered set of chunks. It rejects inputs exceeding the
@@ -311,17 +315,26 @@ func Decode(body []byte) (*Object, error) {
 	if len(body) == 0 {
 		return nil, &FormatError{Reason: "empty object"}
 	}
-	contentEnd, footer, err := splitFooter(body)
+	parseBody := body
+	legacy := len(body) >= len(legacyTrailer) && bytes.Equal(body[len(body)-len(legacyTrailer):], legacyTrailer[:])
+	if legacy {
+		parseBody = body[:len(body)-len(legacyTrailer)]
+		if len(parseBody) == 0 {
+			return nil, &FormatError{Reason: "legacy trailer has no content"}
+		}
+	}
+	contentEnd, footer, err := splitFooter(parseBody)
 	if err != nil {
 		return nil, err
 	}
-	object, err := decodeContent(body[:contentEnd])
+	object, err := decodeContent(parseBody[:contentEnd])
 	if err != nil {
 		return nil, err
 	}
 	object.Body = append([]byte(nil), body...)
 	object.FooterOffset = uint32(contentEnd)
 	object.Footer = footer
+	object.LegacyTrailer = legacy
 	if footer != nil {
 		if err := validateFooter(object, footer); err != nil {
 			return nil, err

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "repository": "https://huggingface.co/datasets/xet-team/xet-spec-reference-files",
+  "revision": "c4aa3a3f15b1395fff5ce934784bf6c8f2d62de8",
+  "files": [
+    {
+      "name": "Electric_Vehicle_Population_Data_20250917.csv",
+      "size": 63527244,
+      "sha256": "f41255b252f776125f2b657136654e4d4d5d2ccf8ef4db0ec186bd1981b69734"
+    },
+    {
+      "name": "Electric_Vehicle_Population_Data_20250917.csv.chunks",
+      "size": 56829,
+      "sha256": "b20bb4b910bab5d67a4082313cf83afea201747f02e0aedc4158a333ba61c684"
+    },
+    {
+      "name": "Electric_Vehicle_Population_Data_20250917.csv.xet-file-hash",
+      "size": 64,
+      "sha256": "f7bd0c85fc87d7e08758b7c7dfb39157ca1230873c9de1a1c1f7771c1e4f8ce9"
+    },
+    {
+      "name": "Electric_Vehicle_Population_Data_20250917.csv.xet-xorb-hash",
+      "size": 64,
+      "sha256": "46478cc570998776d68d00aadb53598e37517781dafb3c4edbb2cfc1158869c9"
+    },
+    {
+      "name": "eea25d6ee393ccae385820daed127b96ef0ea034dfb7cf6da3a950ce334b7632.xorb",
+      "size": 14737817,
+      "sha256": "e72f4e05b9c4b96f1c6b2213d93de00ab943585a2f7c049fd127ba72ec1ff413"
+    },
+    {
+      "name": "eea25d6ee393ccae385820daed127b96ef0ea034dfb7cf6da3a950ce334b7632.xorb.chunks",
+      "size": 56829,
+      "sha256": "b20bb4b910bab5d67a4082313cf83afea201747f02e0aedc4158a333ba61c684"
+    },
+    {
+      "name": "eea25d6ee393ccae385820daed127b96ef0ea034dfb7cf6da3a950ce334b7632.xorb.range-hash",
+      "size": 64,
+      "sha256": "419c1fe045d1d0b816b090133eeb6a43e650d595926f2a7b810167e736a79e21"
+    },
+    {
+      "name": "Electric_Vehicle_Population_Data_20250917.csv.shard",
+      "size": 38744,
+      "sha256": "1763f1d4b3580244fa44bba5ba51ee3c8850ef745cf9c5a9bc65c4215305d7c1"
+    },
+    {
+      "name": "Electric_Vehicle_Population_Data_20250917.csv.shard.verification",
+      "size": 38792,
+      "sha256": "473c4f43edf4c7d92c292f23f084d52c3c6f150246a9fd5915d47e34e8949f47"
+    },
+    {
+      "name": "Electric_Vehicle_Population_Data_20250917.csv.shard.verification-no-footer",
+      "size": 38592,
+      "sha256": "8e7f54b5ad285151e4857496abb6d9278936eff2620f98467b34b2b56379ab39"
+    },
+    {
+      "name": "Electric_Vehicle_Population_Data_20250917.csv.shard.dedupe",
+      "size": 38600,
+      "sha256": "dfbd42fd13c3d016a722ecf7ad28cc49fbc50558e8489f6deec7d0f8fb4e9b3f"
+    },
+    {
+      "name": "b10aa1dc71c61661de92280c41a188aabc47981739b785724a099945d8dc5ce4.chunk",
+      "size": 131072,
+      "sha256": "2f209f32ea5d8750b6568a4ee41d7c98d8006f63333cce6d175407c9f5da4e9e"
+    },
+    {
+      "name": "26255591fa803b6baf25d88c315b8a6f5153d5bcfdf18ec5ef526264e0ccc907.chunk",
+      "size": 106099,
+      "sha256": "804ccd1b46ef47559ef8dd68c4ff27601945d5c3f844c3e49ae2a6cbbdaa1c77"
+    },
+    {
+      "name": "099cb228194fe640e36a6c7d274ee5ed3a714ccd557a0951d9b6b43a7292b5d1.chunk",
+      "size": 61389,
+      "sha256": "d72d97f2af545ab5bd3ae6942980d8fe4b20d19481f476d94b3b1b6fb6ccb9ef"
+    }
+  ]
+}

@@ -109,6 +109,7 @@ func TestEncodeRejectsInvalidMetadata(t *testing.T) {
 		{"bad term range", func(s *Shard) { s.Files[0].Terms[0].End++ }},
 		{"bad chunk offset", func(s *Shard) { s.Xorbs[0].Chunks[1].Offset++ }},
 		{"bad xorb hash", func(s *Shard) { s.Xorbs[0].Hash = xethash.Chunk([]byte("wrong")) }},
+		{"zero upload serialized size", func(s *Shard) { s.Xorbs[0].SerializedBytes = 0 }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -118,6 +119,28 @@ func TestEncodeRejectsInvalidMetadata(t *testing.T) {
 				t.Fatal("invalid metadata accepted")
 			}
 		})
+	}
+}
+
+func TestDecodeAcceptsLegacyZeroSerializedSize(t *testing.T) {
+	value := sampleShard(t)
+	data, err := EncodeUpload(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One file header, term, verification, SHA-256 extension, and bookend
+	// precede the xorb header in this fixture.
+	xorbHeader := HeaderSize + 5*RecordSize
+	binary.LittleEndian.PutUint32(data[xorbHeader+44:xorbHeader+48], 0)
+	decoded, err := Decode(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Xorbs[0].SerializedBytes != 0 {
+		t.Fatalf("legacy serialized size = %d", decoded.Xorbs[0].SerializedBytes)
+	}
+	if _, err := EncodeUpload(*decoded); err == nil {
+		t.Fatal("legacy zero serialized size accepted for a new upload")
 	}
 }
 
