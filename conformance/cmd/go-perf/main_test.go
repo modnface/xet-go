@@ -2,10 +2,63 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestRun(t *testing.T) {
+	input := filepath.Join(t.TempDir(), "input.bin")
+	if err := os.WriteFile(input, bytes.Repeat([]byte("xet"), 10_000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XET_PERF_CPU_PROFILE", "")
+	t.Setenv("XET_PERF_ALLOCS_PROFILE", "")
+	t.Setenv("XET_PERF_HEAP_PROFILE", "")
+	var stdout bytes.Buffer
+	if err := run([]string{"perf", input, "chunk_hash", "1"}, &stdout); err != nil {
+		t.Fatal(err)
+	}
+	var record benchRecord
+	if err := json.Unmarshal(stdout.Bytes(), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Operation != "chunk_hash" || record.InputSize != 30_000 || record.Identity == "" {
+		t.Fatalf("unexpected record: %+v", record)
+	}
+}
+
+func TestRunRejectsInvalidInputs(t *testing.T) {
+	input := filepath.Join(t.TempDir(), "input.bin")
+	if err := os.WriteFile(input, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{name: "usage", args: nil},
+		{name: "missing input", args: []string{"perf", input + ".missing", "chunk_hash", "1"}},
+		{name: "invalid iterations", args: []string{"perf", input, "chunk_hash", "bad"}},
+		{name: "nonpositive iterations", args: []string{"perf", input, "chunk_hash", "0"}},
+		{name: "unknown operation", args: []string{"perf", input, "unknown", "1"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := run(test.args, &bytes.Buffer{}); err == nil {
+				t.Fatal("invalid input accepted")
+			}
+		})
+	}
+	if err := run([]string{"perf", input, "chunk_hash", "1"}, errorWriter{}); err == nil {
+		t.Fatal("output error was ignored")
+	}
+}
+
+type errorWriter struct{}
+
+func (errorWriter) Write([]byte) (int, error) { return 0, os.ErrInvalid }
 
 func TestBenchmarkOperationsPreserveIdentity(t *testing.T) {
 	data := bytes.Repeat([]byte("official-xet-performance-corpus"), 10_000)
@@ -50,11 +103,27 @@ func TestOptionalProfiles(t *testing.T) {
 	if _, err := startCPUProfile(filepath.Join(t.TempDir(), "missing", "cpu.pprof")); err == nil {
 		t.Fatal("CPU profile accepted a missing parent directory")
 	}
+	cpuPath := filepath.Join(t.TempDir(), "cpu.pprof")
+	stop, err = startCPUProfile(cpuPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := startCPUProfile(filepath.Join(t.TempDir(), "second.pprof")); err == nil {
+		stop()
+		t.Fatal("second concurrent CPU profile was accepted")
+	}
+	stop()
+	if info, err := os.Stat(cpuPath); err != nil || info.Size() == 0 {
+		t.Fatalf("CPU profile was not written: info=%v err=%v", info, err)
+	}
 	if err := writeProfile("", "allocs"); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeProfile(filepath.Join(t.TempDir(), "unknown.pprof"), "unknown"); err == nil {
 		t.Fatal("unknown runtime profile accepted")
+	}
+	if err := writeProfile(filepath.Join(t.TempDir(), "missing", "heap.pprof"), "heap"); err == nil || !strings.Contains(err.Error(), "create heap profile") {
+		t.Fatalf("profile accepted a missing parent directory: %v", err)
 	}
 	path := filepath.Join(t.TempDir(), "goroutine.pprof")
 	if err := writeProfile(path, "goroutine"); err != nil {

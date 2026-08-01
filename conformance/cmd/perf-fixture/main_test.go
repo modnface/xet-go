@@ -62,3 +62,36 @@ func TestWriteAtomicCreatesParentsAndMode(t *testing.T) {
 		t.Fatalf("mode = %o, want 644", info.Mode().Perm())
 	}
 }
+
+func TestRun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "fixture.bin")
+	if err := run([]string{"-size", "128", "-pattern", "repeat", "-output", path}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 128 || !bytes.HasPrefix(data, []byte("xet-go deterministic")) {
+		t.Fatalf("unexpected fixture: size=%d prefix=%q", len(data), data[:min(len(data), 20)])
+	}
+}
+
+func TestRunRejectsInvalidInputs(t *testing.T) {
+	for _, args := range [][]string{
+		nil,
+		{"-size", "bad"},
+		{"-size", "1", "-output", filepath.Join(t.TempDir(), "fixture.bin"), "-pattern", "unknown"},
+		{"-size", "1", "-output", filepath.Join(t.TempDir(), "parent"), "-pattern", "zero"},
+	} {
+		if len(args) > 0 && args[len(args)-1] == "zero" {
+			if err := os.WriteFile(args[3], []byte("not a directory"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			args[3] = filepath.Join(args[3], "fixture.bin")
+		}
+		if err := run(args); err == nil {
+			t.Fatalf("invalid arguments accepted: %q", args)
+		}
+	}
+}

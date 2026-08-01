@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -32,36 +33,44 @@ type benchRecord struct {
 }
 
 func main() {
-	if len(os.Args) != 5 || os.Args[1] != "perf" {
+	if err := run(os.Args[1:], os.Stdout); errors.Is(err, errUsage) {
 		fmt.Fprintln(os.Stderr, "usage: go-perf perf <file> <operation> <iterations>")
 		os.Exit(2)
-	}
-	data, err := os.ReadFile(os.Args[2])
-	if err != nil {
+	} else if err != nil {
 		fatal(err)
 	}
-	iterations, err := strconv.Atoi(os.Args[4])
+}
+
+var errUsage = errors.New("invalid command line")
+
+func run(args []string, stdout io.Writer) error {
+	if len(args) != 4 || args[0] != "perf" {
+		return errUsage
+	}
+	data, err := os.ReadFile(args[1])
+	if err != nil {
+		return err
+	}
+	iterations, err := strconv.Atoi(args[3])
 	if err != nil || iterations < 1 {
-		fatal(errors.New("iterations must be positive"))
+		return errors.New("iterations must be positive")
 	}
 	stopCPUProfile, err := startCPUProfile(os.Getenv("XET_PERF_CPU_PROFILE"))
 	if err != nil {
-		fatal(err)
+		return err
 	}
-	record, err := benchmark(data, os.Args[3], iterations)
+	record, err := benchmark(data, args[2], iterations)
 	stopCPUProfile()
 	if err != nil {
-		fatal(err)
+		return err
 	}
 	if err := writeProfile(os.Getenv("XET_PERF_ALLOCS_PROFILE"), "allocs"); err != nil {
-		fatal(err)
+		return err
 	}
 	if err := writeProfile(os.Getenv("XET_PERF_HEAP_PROFILE"), "heap"); err != nil {
-		fatal(err)
+		return err
 	}
-	if err := json.NewEncoder(os.Stdout).Encode(record); err != nil {
-		fatal(err)
-	}
+	return json.NewEncoder(stdout).Encode(record)
 }
 
 func startCPUProfile(path string) (func(), error) {

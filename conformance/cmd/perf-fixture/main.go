@@ -6,25 +6,34 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
 
 func main() {
-	size := flag.Int("size", 0, "fixture size in bytes")
-	pattern := flag.String("pattern", "random", "content pattern: zero, repeat, or random")
-	output := flag.String("output", "", "output file")
-	flag.Parse()
+	if err := run(os.Args[1:]); err != nil {
+		fatal(err)
+	}
+}
+
+func run(args []string) error {
+	flags := flag.NewFlagSet("perf-fixture", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	size := flags.Int("size", 0, "fixture size in bytes")
+	pattern := flags.String("pattern", "random", "content pattern: zero, repeat, or random")
+	output := flags.String("output", "", "output file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 	if *size <= 0 || *output == "" {
-		fatal(errors.New("positive -size and -output are required"))
+		return errors.New("positive -size and -output are required")
 	}
 	data, err := generate(*size, *pattern)
 	if err != nil {
-		fatal(err)
+		return err
 	}
-	if err := writeAtomic(*output, data); err != nil {
-		fatal(err)
-	}
+	return writeAtomic(*output, data)
 }
 
 func generate(size int, pattern string) ([]byte, error) {
