@@ -466,7 +466,7 @@ func TestQueryFileChunkHashesHeaderAndValidation(t *testing.T) {
 			TotalChunks:     10,
 			FileSize:        100,
 			Windows:         []ChunkWindow{{DirtyByteRange: [2]uint64{8, 42}}},
-			HashRanges:      []json.RawMessage{json.RawMessage("null"), json.RawMessage("null")},
+			HashRanges:      []*xethash.MerkleHashSubtree{nil, nil},
 			GapVerification: []xethash.Hash{verification},
 		})
 	}))

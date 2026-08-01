@@ -55,6 +55,67 @@ type oracleCorpus struct {
 	FileHash string        `json:"file_hash"`
 }
 
+type subtreeRecord struct {
+	Full      json.RawMessage `json:"full"`
+	Left      json.RawMessage `json:"left"`
+	Right     json.RawMessage `json:"right"`
+	Merged    json.RawMessage `json:"merged"`
+	FinalHash string          `json:"final_hash"`
+}
+
+func TestRustDifferentialMerkleSubtree(t *testing.T) {
+	oracle := os.Getenv("XET_RUST_ORACLE")
+	if oracle == "" {
+		t.Skip("set XET_RUST_ORACLE to the binary produced by conformance/build-rust-oracle.sh")
+	}
+	data := make([]byte, 8<<20)
+	rng := rand.New(rand.NewSource(0x53554254524545))
+	_, _ = rng.Read(data)
+	parts := chunker.Bytes(data)
+	split := len(parts) / 3
+	path := filepath.Join(t.TempDir(), "input.bin")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command(oracle, "subtree", path, fmt.Sprint(split)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("Rust subtree: %v\n%s", err, output)
+	}
+	var rust subtreeRecord
+	if err := json.Unmarshal(output, &rust); err != nil {
+		t.Fatal(err)
+	}
+	nodes := make([]xethash.Node, len(parts))
+	for i, part := range parts {
+		nodes[i] = xethash.Node{Hash: xethash.Chunk(part.Data), Size: uint64(len(part.Data))}
+	}
+	left := xethash.NewSubtree(true, nodes[:split], false)
+	right := xethash.NewSubtree(false, nodes[split:], true)
+	full := xethash.NewSubtree(true, nodes, true)
+	merged, err := xethash.MergeSubtrees(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	comparisons := []struct {
+		name   string
+		goTree *xethash.MerkleHashSubtree
+		rust   json.RawMessage
+	}{{"full", full, rust.Full}, {"left", left, rust.Left}, {"right", right, rust.Right}, {"merged", merged, rust.Merged}}
+	for _, comparison := range comparisons {
+		goJSON, err := json.Marshal(comparison.goTree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(goJSON, comparison.rust) {
+			t.Fatalf("%s subtree JSON differs\nGo:   %s\nRust: %s", comparison.name, goJSON, comparison.rust)
+		}
+	}
+	final, ok := merged.FinalHash()
+	if !ok || final.String() != rust.FinalHash {
+		t.Fatalf("subtree final hash %s,%v; Rust %s", final, ok, rust.FinalHash)
+	}
+}
+
 func TestRustDifferentialXorb(t *testing.T) {
 	oracle := os.Getenv("XET_RUST_ORACLE")
 	if oracle == "" {

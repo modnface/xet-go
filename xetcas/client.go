@@ -383,8 +383,8 @@ func (c *Client) BatchQueryReconstruction(
 	return response.normalize()
 }
 
-// QueryFileChunkHashes returns the current v2 sparse-upload window response.
-// HashRanges remain opaque JSON until passed to the delta/subtree layer.
+// QueryFileChunkHashes returns the current v2 sparse-upload window response,
+// including validated compact Merkle subtrees for unchanged gaps.
 func (c *Client) QueryFileChunkHashes(
 	ctx context.Context,
 	fileID xethash.Hash,

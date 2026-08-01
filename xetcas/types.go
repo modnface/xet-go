@@ -5,7 +5,6 @@
 package xetcas
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -252,14 +251,14 @@ type ChunkWindow struct {
 	DirtyByteRange [2]uint64 `json:"dirtyByteRange"`
 }
 
-// FileChunkHashesResponse is the v2 delta-upload response. HashRanges contains
-// either JSON null or an exact MerkleHashSubtree JSON object.
+// FileChunkHashesResponse is the v2 delta-upload response. A nil HashRanges
+// entry is an empty gap; non-nil entries use the exact Rust subtree JSON form.
 type FileChunkHashesResponse struct {
-	TotalChunks     uint64            `json:"totalChunks"`
-	FileSize        uint64            `json:"fileSize"`
-	Windows         []ChunkWindow     `json:"windows"`
-	HashRanges      []json.RawMessage `json:"hashRanges"`
-	GapVerification []xethash.Hash    `json:"gapVerification"`
+	TotalChunks     uint64                       `json:"totalChunks"`
+	FileSize        uint64                       `json:"fileSize"`
+	Windows         []ChunkWindow                `json:"windows"`
+	HashRanges      []*xethash.MerkleHashSubtree `json:"hashRanges"`
+	GapVerification []xethash.Hash               `json:"gapVerification"`
 }
 
 func (r *FileChunkHashesResponse) Validate() error {
@@ -276,15 +275,6 @@ func (r *FileChunkHashesResponse) Validate() error {
 			return fmt.Errorf("xet CAS: invalid dirty window %d [%d,%d)", i, start, end)
 		}
 		previous = end
-	}
-	for i, subtree := range r.HashRanges {
-		trimmed := string(subtree)
-		if trimmed == "" {
-			return fmt.Errorf("xet CAS: missing hash range %d", i)
-		}
-		if trimmed != "null" && !json.Valid(subtree) {
-			return fmt.Errorf("xet CAS: invalid hash range JSON at %d", i)
-		}
 	}
 	return nil
 }

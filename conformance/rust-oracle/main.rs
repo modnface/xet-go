@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use xet_core_structures::merklehash::{DataHash, file_hash, xorb_hash};
+use xet_core_structures::merklehash::{DataHash, MerkleHashSubtree, file_hash, xorb_hash};
 use xet_core_structures::metadata_shard::chunk_verification::range_hash_from_chunks;
 use xet_core_structures::metadata_shard::file_structs::{
     FileDataSequenceEntry, FileDataSequenceHeader, FileMetadataExt, FileVerificationEntry, MDBFileInfo,
@@ -78,6 +78,15 @@ struct DecodedShardRecord {
     verification: bool,
 }
 
+#[derive(Serialize)]
+struct SubtreeRecord {
+    full: MerkleHashSubtree,
+    left: MerkleHashSubtree,
+    right: MerkleHashSubtree,
+    merged: MerkleHashSubtree,
+    final_hash: String,
+}
+
 fn raw_hex(data: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(data.len() * 2);
@@ -118,7 +127,7 @@ fn calculate(data: &[u8]) -> CorpusRecord {
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: xet-go-rust-oracle <corpus|bench|encode-xorb|encode-xorb-complete|decode-xorb|encode-shard|decode-shard> <file> [argument]");
+        eprintln!("usage: xet-go-rust-oracle <corpus|bench|subtree|encode-xorb|encode-xorb-complete|decode-xorb|encode-shard|decode-shard> <file> [argument]");
         return ExitCode::from(2);
     }
     let data = match fs::read(&args[2]) {
@@ -146,6 +155,28 @@ fn main() -> ExitCode {
                     elapsed_ns: elapsed.as_nanos(),
                     bytes_per_second: data.len() as f64 * iterations as f64 / elapsed.as_secs_f64(),
                     file_hash: result.file_hash,
+                })
+                .unwrap()
+            );
+        }
+        "subtree" => {
+            let chunks = Chunker::default().next_block(&data, true);
+            let nodes: Vec<_> = chunks.iter().map(|chunk| (chunk.hash, chunk.data.len() as u64)).collect();
+            let split: usize = args.get(3).and_then(|value| value.parse().ok()).unwrap_or(nodes.len() / 2);
+            assert!(split <= nodes.len());
+            let full = MerkleHashSubtree::from_chunks(true, &nodes, true);
+            let left = MerkleHashSubtree::from_chunks(true, &nodes[..split], false);
+            let right = MerkleHashSubtree::from_chunks(false, &nodes[split..], true);
+            let merged = MerkleHashSubtree::merge(&[left.clone(), right.clone()]).unwrap();
+            let final_hash = merged.final_hash().unwrap().to_string();
+            println!(
+                "{}",
+                serde_json::to_string(&SubtreeRecord {
+                    full,
+                    left,
+                    right,
+                    merged,
+                    final_hash,
                 })
                 .unwrap()
             );
