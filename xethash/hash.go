@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"lukechampine.com/blake3"
 	"lukechampine.com/blake3/guts"
@@ -49,14 +51,15 @@ var (
 		0xa4, 0xcd, 0x26, 0xd5, 0xb5, 0xdb, 0x49, 0xe6,
 		0x41, 0x24, 0x98, 0x7f, 0x28, 0xfb, 0x94, 0xc3,
 	}
-	dataHashers = sync.Pool{
-		New: func() any { return blake3.New(Size, dataKey[:]) },
-	}
 	internalHashers = sync.Pool{
 		New: func() any { return blake3.New(Size, internalKey[:]) },
 	}
 	verificationHashers = sync.Pool{
 		New: func() any { return blake3.New(Size, verificationKey[:]) },
+	}
+	chunkBatchBudget struct {
+		sync.Mutex
+		active int
 	}
 )
 
@@ -194,7 +197,72 @@ func Chunk(data []byte) Hash {
 	if len(data) <= guts.ChunkSize {
 		return smallKeyedHash(dataKey, data)
 	}
-	return pooledHash(&dataHashers, data)
+	return pooledDataHash(data)
+}
+
+// Chunks computes Xet leaf hashes in input order. Large batches share a
+// package-wide caller-level worker budget so concurrent callers do not each
+// create a full outer worker pool.
+func Chunks(data [][]byte) []Hash {
+	out := make([]Hash, len(data))
+	if len(data) == 0 {
+		return out
+	}
+	var total uint64
+	for _, chunk := range data {
+		total += uint64(len(chunk))
+	}
+	if !chunkBatchEnabled || len(data) < 2 || total < 64<<10 || (len(data) < 4 && total < 128<<10) {
+		for i := range data {
+			out[i] = Chunk(data[i])
+		}
+		return out
+	}
+
+	workers := claimChunkBatchWorkers(min(len(data), runtime.GOMAXPROCS(0)))
+	defer releaseChunkBatchWorkers(workers)
+	var next atomic.Int64
+	hashNext := func() {
+		for {
+			i := int(next.Add(1)) - 1
+			if i >= len(data) {
+				return
+			}
+			if len(data[i]) <= guts.ChunkSize {
+				out[i] = smallKeyedHash(dataKey, data[i])
+			} else {
+				out[i] = pooledBatchHash(data[i])
+			}
+		}
+	}
+	var wait sync.WaitGroup
+	wait.Add(workers - 1)
+	for range workers - 1 {
+		go func() {
+			defer wait.Done()
+			hashNext()
+		}()
+	}
+	hashNext()
+	wait.Wait()
+	return out
+}
+
+func claimChunkBatchWorkers(want int) int {
+	chunkBatchBudget.Lock()
+	defer chunkBatchBudget.Unlock()
+	workers := 1
+	if available := runtime.GOMAXPROCS(0) - chunkBatchBudget.active - 1; available > 0 {
+		workers += min(want-1, available)
+	}
+	chunkBatchBudget.active += workers
+	return workers
+}
+
+func releaseChunkBatchWorkers(workers int) {
+	chunkBatchBudget.Lock()
+	chunkBatchBudget.active -= workers
+	chunkBatchBudget.Unlock()
 }
 
 // Internal computes the Xet internal-node hash of an already formatted node

@@ -201,6 +201,7 @@ func encode(chunks [][]byte, schemes []Scheme) (*Object, error) {
 	}
 	object := &Object{Chunks: make([]Chunk, 0, len(chunks))}
 	nodes := make([]xethash.Node, 0, len(chunks))
+	hashes := xethash.Chunks(chunks)
 	payloads := make([][]byte, len(chunks))
 	serializedTotal := 0
 	for i, data := range chunks {
@@ -215,7 +216,7 @@ func encode(chunks [][]byte, schemes []Scheme) (*Object, error) {
 		serializedTotal += HeaderSize + len(payload)
 		payloads[i] = payload
 
-		hash := xethash.Chunk(data)
+		hash := hashes[i]
 		var ownedData []byte
 		if used != None {
 			ownedData = append([]byte(nil), data...)
@@ -366,7 +367,6 @@ func decodeContent(body []byte) (*Object, error) {
 		return nil, &FormatError{Reason: "empty content section"}
 	}
 	object := &Object{Body: body, FooterOffset: uint32(len(body))}
-	nodes := make([]xethash.Node, 0, 1024)
 	for offset := 0; offset < len(body); {
 		if len(object.Chunks) == MaxChunks {
 			return nil, &FormatError{Offset: offset, Reason: "too many chunks"}
@@ -402,9 +402,7 @@ func decodeContent(body []byte) (*Object, error) {
 		if uint64(object.UncompressedSize)+uint64(len(data)) > MaxRawSize {
 			return nil, &FormatError{Offset: offset, Reason: "raw object size exceeds limit"}
 		}
-		hash := xethash.Chunk(data)
 		object.Chunks = append(object.Chunks, Chunk{
-			Hash:               hash,
 			Scheme:             scheme,
 			SerializedOffset:   uint32(offset),
 			SerializedLength:   uint32(HeaderSize + compressedLen),
@@ -413,8 +411,17 @@ func decodeContent(body []byte) (*Object, error) {
 			Data:               data,
 		})
 		object.UncompressedSize += uint32(len(data))
-		nodes = append(nodes, xethash.Node{Hash: hash, Size: uint64(len(data))})
 		offset = payloadEnd
+	}
+	hashInputs := make([][]byte, len(object.Chunks))
+	for i := range object.Chunks {
+		hashInputs[i] = object.Chunks[i].Data
+	}
+	hashes := xethash.Chunks(hashInputs)
+	nodes := make([]xethash.Node, len(object.Chunks))
+	for i := range object.Chunks {
+		object.Chunks[i].Hash = hashes[i]
+		nodes[i] = xethash.Node{Hash: hashes[i], Size: uint64(len(object.Chunks[i].Data))}
 	}
 	object.Hash = xethash.Xorb(nodes)
 	return object, nil

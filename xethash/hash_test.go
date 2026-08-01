@@ -3,6 +3,8 @@ package xethash
 import (
 	"encoding/json"
 	"errors"
+	"slices"
+	"sync"
 	"testing"
 
 	"lukechampine.com/blake3"
@@ -169,6 +171,72 @@ func TestChunkMatchesStreamingBLAKE3AtTreeBoundaries(t *testing.T) {
 	}
 }
 
+func TestChunksMatchesIndividualHashes(t *testing.T) {
+	sizes := []int{0, 1, 64, 1024, 1025, 8192, 32768, 65536, 131072}
+	inputs := make([][]byte, len(sizes))
+	for i, size := range sizes {
+		inputs[i] = make([]byte, size)
+		for j := range inputs[i] {
+			inputs[i][j] = byte(i*17 + j*131 + j>>8)
+		}
+	}
+	got := Chunks(inputs)
+	if len(got) != len(inputs) {
+		t.Fatalf("Chunks returned %d hashes, want %d", len(got), len(inputs))
+	}
+	for i := range inputs {
+		if want := Chunk(inputs[i]); got[i] != want {
+			t.Fatalf("chunk %d (size %d): Chunks = %s, Chunk = %s", i, len(inputs[i]), got[i], want)
+		}
+	}
+	if got := Chunks(nil); got == nil || len(got) != 0 {
+		t.Fatalf("Chunks(nil) = %#v, want non-nil empty slice", got)
+	}
+}
+
+func TestChunksConcurrent(t *testing.T) {
+	inputs := make([][]byte, 32)
+	for i := range inputs {
+		inputs[i] = make([]byte, 64<<10)
+		inputs[i][0] = byte(i)
+	}
+	want := Chunks(inputs)
+	var wait sync.WaitGroup
+	for range 8 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			got := Chunks(inputs)
+			if !slices.Equal(got, want) {
+				t.Errorf("concurrent Chunks result differs")
+			}
+		}()
+	}
+	wait.Wait()
+}
+
+func TestChunksSmallBatchFallback(t *testing.T) {
+	inputs := [][]byte{make([]byte, 8<<10), make([]byte, 8<<10)}
+	got := Chunks(inputs)
+	for i := range inputs {
+		if want := Chunk(inputs[i]); got[i] != want {
+			t.Fatalf("small chunk %d: Chunks = %s, Chunk = %s", i, got[i], want)
+		}
+	}
+}
+
+func TestInternalLargeInput(t *testing.T) {
+	data := make([]byte, 8<<10)
+	got := Internal(data)
+	h := blake3.New(Size, internalKey[:])
+	_, _ = h.Write(data)
+	var want Hash
+	copy(want[:], h.Sum(nil))
+	if got != want {
+		t.Fatalf("Internal = %s, streaming BLAKE3 = %s", got, want)
+	}
+}
+
 func FuzzHashTextRoundTrip(f *testing.F) {
 	f.Add(make([]byte, Size))
 	f.Add([]byte("01234567890123456789012345678901"))
@@ -196,6 +264,59 @@ func BenchmarkChunkHash64KiB(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = Chunk(data)
+	}
+}
+
+func BenchmarkChunkHashBatch64KiB(b *testing.B) {
+	chunks := make([][]byte, 1024)
+	for i := range chunks {
+		chunks[i] = make([]byte, 64<<10)
+	}
+	b.SetBytes(int64(len(chunks) * len(chunks[0])))
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = Chunks(chunks)
+	}
+}
+
+func BenchmarkChunksCrossover(b *testing.B) {
+	for _, test := range []struct {
+		name  string
+		count int
+		size  int
+	}{
+		{"2x32KiB", 2, 32 << 10},
+		{"4x16KiB", 4, 16 << 10},
+		{"8x8KiB", 8, 8 << 10},
+		{"2x64KiB", 2, 64 << 10},
+		{"4x32KiB", 4, 32 << 10},
+		{"16x8KiB", 16, 8 << 10},
+		{"2x128KiB", 2, 128 << 10},
+		{"4x64KiB", 4, 64 << 10},
+		{"8x32KiB", 8, 32 << 10},
+		{"32x8KiB", 32, 8 << 10},
+	} {
+		chunks := make([][]byte, test.count)
+		for i := range chunks {
+			chunks[i] = make([]byte, test.size)
+		}
+		b.Run(test.name+"/individual", func(b *testing.B) {
+			b.SetBytes(int64(test.count * test.size))
+			b.ReportAllocs()
+			for b.Loop() {
+				hashes := make([]Hash, len(chunks))
+				for i := range chunks {
+					hashes[i] = Chunk(chunks[i])
+				}
+			}
+		})
+		b.Run(test.name+"/batch", func(b *testing.B) {
+			b.SetBytes(int64(test.count * test.size))
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = Chunks(chunks)
+			}
+		})
 	}
 }
 

@@ -156,4 +156,63 @@ func TestOptionalExecutionTrace(t *testing.T) {
 	if _, err := startTrace(filepath.Join(t.TempDir(), "missing", "trace.out")); err == nil {
 		t.Fatal("execution trace accepted a missing parent directory")
 	}
+	first := filepath.Join(t.TempDir(), "first-trace.out")
+	stop, err = startTrace(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := startTrace(filepath.Join(t.TempDir(), "second-trace.out")); err == nil {
+		stop()
+		t.Fatal("second concurrent execution trace was accepted")
+	}
+	stop()
+}
+
+func TestRunWithOptionalProfiles(t *testing.T) {
+	input := filepath.Join(t.TempDir(), "input.bin")
+	if err := os.WriteFile(input, bytes.Repeat([]byte("profile"), 10_000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	paths := map[string]string{
+		"XET_PERF_CPU_PROFILE":       filepath.Join(dir, "cpu.pprof"),
+		"XET_PERF_ALLOCS_PROFILE":    filepath.Join(dir, "allocs.pprof"),
+		"XET_PERF_HEAP_PROFILE":      filepath.Join(dir, "heap.pprof"),
+		"XET_PERF_TRACE":             filepath.Join(dir, "trace.out"),
+		"XET_PERF_BLOCK_PROFILE":     filepath.Join(dir, "block.pprof"),
+		"XET_PERF_MUTEX_PROFILE":     filepath.Join(dir, "mutex.pprof"),
+		"XET_PERF_GOROUTINE_PROFILE": filepath.Join(dir, "goroutine.pprof"),
+	}
+	for name, path := range paths {
+		t.Setenv(name, path)
+	}
+	if err := run([]string{"perf", input, "chunk_hash", "1"}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range paths {
+		if info, err := os.Stat(path); err != nil || info.Size() == 0 {
+			t.Errorf("%s output missing: info=%v err=%v", name, info, err)
+		}
+	}
+}
+
+func TestRunProfileErrors(t *testing.T) {
+	input := filepath.Join(t.TempDir(), "input.bin")
+	if err := os.WriteFile(input, bytes.Repeat([]byte("error-profile"), 100), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, variable := range []string{"XET_PERF_CPU_PROFILE", "XET_PERF_TRACE", "XET_PERF_ALLOCS_PROFILE"} {
+		t.Run(variable, func(t *testing.T) {
+			for _, name := range []string{
+				"XET_PERF_CPU_PROFILE", "XET_PERF_ALLOCS_PROFILE", "XET_PERF_HEAP_PROFILE", "XET_PERF_TRACE",
+				"XET_PERF_BLOCK_PROFILE", "XET_PERF_MUTEX_PROFILE", "XET_PERF_GOROUTINE_PROFILE",
+			} {
+				t.Setenv(name, "")
+			}
+			t.Setenv(variable, filepath.Join(t.TempDir(), "missing", "profile"))
+			if err := run([]string{"perf", input, "chunk_hash", "1"}, &bytes.Buffer{}); err == nil {
+				t.Fatal("invalid profile destination succeeded")
+			}
+		})
+	}
 }

@@ -152,7 +152,9 @@ func writeProfile(path, name string) error {
 	if err != nil {
 		return fmt.Errorf("create %s profile: %w", name, err)
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 	if err := profile.WriteTo(file, 0); err != nil {
 		return fmt.Errorf("write %s profile: %w", name, err)
 	}
@@ -213,9 +215,14 @@ func benchmark(data []byte, operation string, iterations int) (benchRecord, erro
 			chunkCount = len(parts)
 			keepAlive = parts
 		case "leaf_hash":
+			chunks := make([][]byte, len(preparedParts))
+			for i := range preparedParts {
+				chunks[i] = preparedParts[i].Data
+			}
+			hashes := xethash.Chunks(chunks)
 			nodes := make([]xethash.Node, len(preparedParts))
 			for i, part := range preparedParts {
-				nodes[i] = xethash.Node{Hash: xethash.Chunk(part.Data), Size: uint64(len(part.Data))}
+				nodes[i] = xethash.Node{Hash: hashes[i], Size: uint64(len(part.Data))}
 			}
 			chunkCount = len(nodes)
 			keepAlive = nodes
@@ -224,9 +231,14 @@ func benchmark(data []byte, operation string, iterations int) (benchRecord, erro
 			keepAlive = preparedNodes
 		case "chunk_hash":
 			parts := chunker.Bytes(data)
+			chunks := make([][]byte, len(parts))
+			for i := range parts {
+				chunks[i] = parts[i].Data
+			}
+			hashes := xethash.Chunks(chunks)
 			nodes := make([]xethash.Node, len(parts))
 			for i, part := range parts {
-				nodes[i] = xethash.Node{Hash: xethash.Chunk(part.Data), Size: uint64(len(part.Data))}
+				nodes[i] = xethash.Node{Hash: hashes[i], Size: uint64(len(part.Data))}
 			}
 			identity = xethash.File(nodes)
 			chunkCount = len(parts)

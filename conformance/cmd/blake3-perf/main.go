@@ -132,13 +132,22 @@ func benchmark(scenario string, size, iterations, workers int) (record, error) {
 		bytesProcessed *= uint64(workers)
 	}
 	return record{
-		SchemaVersion: 1, Implementation: "go-lukechampine-blake3", Scenario: scenario,
+		SchemaVersion: 1, Implementation: implementationName(scenario), Scenario: scenario,
 		MessageSize: size, Iterations: iterations, Workers: workers, GOMAXPROCS: runtime.GOMAXPROCS(0),
 		ElapsedNS: uint64(elapsed.Nanoseconds()), BytesProcessed: bytesProcessed,
 		BytesPerSecond: float64(bytesProcessed) / elapsed.Seconds(), Digest: digest.String(),
 		AllocatedBytes: after.TotalAlloc - before.TotalAlloc, Allocations: after.Mallocs - before.Mallocs,
 		GCCycles: after.NumGC - before.NumGC, GCPauseNS: after.PauseTotalNs - before.PauseTotalNs,
 	}, nil
+}
+
+func implementationName(scenario string) string {
+	switch scenario {
+	case "stream_new", "stream_reuse", "stream_segmented", "caller_parallel_segmented":
+		return "go-lukechampine-blake3"
+	default:
+		return "go-xethash"
+	}
 }
 
 func validScenario(scenario string) bool {

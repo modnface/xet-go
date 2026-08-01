@@ -106,10 +106,10 @@ func run(args []string, stdout io.Writer) error {
 
 func compare(goBinary, rustBinary, scenario string, size, iterations, workers, sampleCount int) (report, error) {
 	if _, err := invoke(goBinary, scenario, size, iterations, workers); err != nil {
-		return report{}, fmt.Errorf("Go warmup: %w", err)
+		return report{}, fmt.Errorf("go warmup: %w", err)
 	}
 	if _, err := invoke(rustBinary, scenario, size, iterations, workers); err != nil {
-		return report{}, fmt.Errorf("Rust warmup: %w", err)
+		return report{}, fmt.Errorf("rust warmup: %w", err)
 	}
 	goRecords := make([]benchRecord, 0, sampleCount)
 	rustRecords := make([]benchRecord, 0, sampleCount)
@@ -167,7 +167,7 @@ func summarize(scenario string, size, iterations, workers int, goRecords, rustRe
 			}
 		}
 	}
-	if goRecords[0].Implementation != "go-lukechampine-blake3" || rustRecords[0].Implementation != "rust-blake3-1.8.3" {
+	if goRecords[0].Implementation != expectedGoImplementation(scenario) || rustRecords[0].Implementation != "rust-blake3-1.8.3" {
 		return report{}, errors.New("unexpected benchmark implementations")
 	}
 	goStats := calculateStatistics(goRecords)
@@ -177,6 +177,15 @@ func summarize(scenario string, size, iterations, workers int, goRecords, rustRe
 		MessageSize: size, Iterations: iterations, Workers: workers, Samples: len(goRecords), Digest: wantDigest,
 		Go: goStats, Rust: rustStats, GoRustRatio: goStats.MedianBytesPerSecond / rustStats.MedianBytesPerSecond,
 	}, nil
+}
+
+func expectedGoImplementation(scenario string) string {
+	switch scenario {
+	case "stream_new", "stream_reuse", "stream_segmented", "caller_parallel_segmented":
+		return "go-lukechampine-blake3"
+	default:
+		return "go-xethash"
+	}
 }
 
 func calculateStatistics(records []benchRecord) statistics {

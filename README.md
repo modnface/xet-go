@@ -19,9 +19,9 @@ source baseline.
 
 ## Requirements
 
-- Go 1.23 or newer to build the module.
+- Go 1.24 or newer to build the module.
 - A patched, supported Go release for production deployment. CI performs the
-  vulnerability gate with Go 1.25.12 while retaining Go 1.23 compatibility
+  vulnerability gate with Go 1.25.12 while retaining Go 1.24 compatibility
   tests.
 - An Xet CAS endpoint and access token for real transfers. The token may be
   empty for an unauthenticated local CAS.

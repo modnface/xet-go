@@ -51,6 +51,12 @@ func TestRunAndErrors(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || result.Digest == "" {
 		t.Fatalf("invalid output: result=%+v err=%v", result, err)
 	}
+	if got := implementationName("one_shot"); got != "go-xethash" {
+		t.Fatalf("one-shot implementation = %q", got)
+	}
+	if got := implementationName("stream_reuse"); got != "go-lukechampine-blake3" {
+		t.Fatalf("streaming implementation = %q", got)
+	}
 	for _, args := range [][]string{
 		nil,
 		{"perf", "unknown", "64", "1", "1"},
