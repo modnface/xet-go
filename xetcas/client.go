@@ -74,14 +74,16 @@ type RetryPolicy struct {
 // Options configures a Client. HTTPClient is shallow-copied and redirects are
 // disabled so bearer tokens and signed URL authority cannot cross origins.
 type Options struct {
-	HTTPClient       *http.Client
-	Retry            RetryPolicy
-	RefreshBefore    time.Duration
-	MaxResponseBytes int64
-	MaxErrorBytes    int64
-	SessionID        string
-	UserAgent        string
-	Now              func() time.Time
+	HTTPClient          *http.Client
+	Retry               RetryPolicy
+	UploadConcurrency   ConcurrencyPolicy
+	DownloadConcurrency ConcurrencyPolicy
+	RefreshBefore       time.Duration
+	MaxResponseBytes    int64
+	MaxErrorBytes       int64
+	SessionID           string
+	UserAgent           string
+	Now                 func() time.Time
 }
 
 // Client implements Xet CAS requests and signed object-storage retrieval.
@@ -96,6 +98,8 @@ type Client struct {
 	userAgent         string
 	reconstructionAPI atomic.Uint32
 	shardAPI          atomic.Uint32
+	uploadLimiter     *adaptiveLimiter
+	downloadLimiter   *adaptiveLimiter
 }
 
 func New(provider CASAccessProvider, options Options) (*Client, error) {
@@ -114,6 +118,14 @@ func New(provider CASAccessProvider, options Options) (*Client, error) {
 		return nil, errors.New("xet CAS: RefreshBefore must not be negative")
 	}
 	retry, err := normalizeRetry(options.Retry)
+	if err != nil {
+		return nil, err
+	}
+	uploadConcurrency, err := normalizeConcurrency(options.UploadConcurrency, defaultInitialUploadConcurrency)
+	if err != nil {
+		return nil, err
+	}
+	downloadConcurrency, err := normalizeConcurrency(options.DownloadConcurrency, defaultInitialDownloadConcurrency)
 	if err != nil {
 		return nil, err
 	}
@@ -147,6 +159,8 @@ func New(provider CASAccessProvider, options Options) (*Client, error) {
 		maxErrorBytes:    maxError,
 		sessionID:        options.SessionID,
 		userAgent:        options.UserAgent,
+		uploadLimiter:    newAdaptiveLimiter(uploadConcurrency),
+		downloadLimiter:  newAdaptiveLimiter(downloadConcurrency),
 	}, nil
 }
 
@@ -192,6 +206,18 @@ func (c *Client) casCall(
 	body []byte,
 	process responseProcessor,
 ) (any, error) {
+	return c.casCallLimited(ctx, mode, method, route, headers, body, process, nil)
+}
+
+func (c *Client) casCallLimited(
+	ctx context.Context,
+	mode Access,
+	method, route string,
+	headers http.Header,
+	body []byte,
+	process responseProcessor,
+	limiter *adaptiveLimiter,
+) (any, error) {
 	authRetried := false
 	var lastErr error
 	for attempt := 0; attempt < c.retry.MaxAttempts; attempt++ {
@@ -224,8 +250,16 @@ func (c *Client) casCall(
 			req.Header.Set("Accept-Encoding", "gzip, zstd")
 		}
 
+		var permit *concurrencyPermit
+		if limiter != nil {
+			permit, err = limiter.acquire(ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
 		resp, err := c.http.Do(req)
 		if err != nil {
+			permit.done(false, isRetryableNetworkError(err))
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
@@ -240,6 +274,7 @@ func (c *Client) casCall(
 		}
 
 		if resp.StatusCode == http.StatusUnauthorized && !authRetried {
+			permit.done(false, false)
 			drainAndClose(resp.Body, c.maxErrorBytes)
 			c.access.invalidate(mode)
 			authRetried = true
@@ -247,6 +282,7 @@ func (c *Client) casCall(
 			continue
 		}
 		if isTransientStatus(resp.StatusCode) {
+			permit.done(false, true)
 			retryAfter := resp.Header.Get("Retry-After")
 			lastErr = c.httpError(resp, method, requestURL)
 			if attempt+1 == c.retry.MaxAttempts {
@@ -258,6 +294,7 @@ func (c *Client) casCall(
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			permit.done(false, false)
 			return nil, c.httpError(resp, method, requestURL)
 		}
 		value, retry, err := process(resp)
@@ -265,6 +302,7 @@ func (c *Client) casCall(
 		if err == nil && closeErr != nil {
 			err = closeErr
 		}
+		permit.done(err == nil, false)
 		if err == nil {
 			return value, nil
 		}
@@ -631,7 +669,8 @@ func (c *Client) UploadXorb(ctx context.Context, prefix string, hash xethash.Has
 		WasInserted bool `json:"was_inserted"`
 	}{}
 	route := fmt.Sprintf("v1/xorbs/%s/%s", prefix, hash)
-	_, err := c.casCall(ctx, AccessWrite, http.MethodPost, route, headers, body, c.jsonProcessor(&response, c.maxErrorBytes))
+	_, err := c.casCallLimited(ctx, AccessWrite, http.MethodPost, route, headers, body,
+		c.jsonProcessor(&response, c.maxErrorBytes), c.uploadLimiter)
 	return response.WasInserted, err
 }
 
@@ -644,13 +683,15 @@ func (c *Client) UploadShard(ctx context.Context, body []byte, progress func(Sha
 		headers := make(http.Header)
 		headers.Set("Content-Type", "application/octet-stream")
 		if version == 2 {
-			_, err := c.casCall(ctx, AccessWrite, http.MethodPost, "v2/shards", headers, body, c.ndjsonProcessor(progress))
+			_, err := c.casCallLimited(ctx, AccessWrite, http.MethodPost, "v2/shards", headers, body,
+				c.ndjsonProcessor(progress), c.uploadLimiter)
 			return err
 		}
 		response := struct {
 			Result int `json:"result"`
 		}{Result: -1}
-		_, err := c.casCall(ctx, AccessWrite, http.MethodPost, "v1/shards", headers, body, c.jsonProcessor(&response, c.maxErrorBytes))
+		_, err := c.casCallLimited(ctx, AccessWrite, http.MethodPost, "v1/shards", headers, body,
+			c.jsonProcessor(&response, c.maxErrorBytes), c.uploadLimiter)
 		if err != nil {
 			return err
 		}

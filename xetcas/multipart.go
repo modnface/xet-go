@@ -57,8 +57,13 @@ func (c *Client) FetchRanges(ctx context.Context, rawURL string, ranges []HTTPRa
 		if c.userAgent != "" {
 			req.Header.Set("User-Agent", c.userAgent)
 		}
+		permit, err := c.downloadLimiter.acquire(ctx)
+		if err != nil {
+			return nil, err
+		}
 		resp, err := c.http.Do(req)
 		if err != nil {
+			permit.done(false, isRetryableNetworkError(err))
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
@@ -72,10 +77,12 @@ func (c *Client) FetchRanges(ctx context.Context, rawURL string, ranges []HTTPRa
 			continue
 		}
 		if resp.StatusCode == http.StatusForbidden {
+			permit.done(false, false)
 			drainAndClose(resp.Body, c.maxErrorBytes)
 			return nil, fmt.Errorf("%w: signed GET %s", ErrSignedURLExpired, redactURL(parsedURL))
 		}
 		if isTransientStatus(resp.StatusCode) {
+			permit.done(false, true)
 			retryAfter := resp.Header.Get("Retry-After")
 			lastErr = c.httpError(resp, http.MethodGet, parsedURL)
 			if attempt+1 == c.retry.MaxAttempts {
@@ -87,6 +94,7 @@ func (c *Client) FetchRanges(ctx context.Context, rawURL string, ranges []HTTPRa
 			continue
 		}
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+			permit.done(false, false)
 			return nil, c.httpError(resp, http.MethodGet, parsedURL)
 		}
 		result, err := c.decodeRangeResponse(resp, ranges, expected)
@@ -94,6 +102,7 @@ func (c *Client) FetchRanges(ctx context.Context, rawURL string, ranges []HTTPRa
 		if err == nil && closeErr != nil {
 			err = closeErr
 		}
+		permit.done(err == nil, false)
 		if err == nil {
 			return result, nil
 		}
