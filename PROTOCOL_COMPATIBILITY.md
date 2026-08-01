@@ -13,7 +13,9 @@
 | Topic | Behavior |
 |---|---|
 | Hash text | Four little-endian 64-bit limbs rendered as lowercase hexadecimal |
-| Network xorb footer | Never emitted; the universal decoder accepts footerless, current `XETBLOB`, and official-reference legacy `XETB` forms |
+| Chunking | Official 64 KiB GearHash target, 8 KiB minimum, 128 KiB maximum, and exact gear table |
+| Xorb compression | None, LZ4, and BG4-LZ4 decode; production Auto uses the official BG4 predictor and 32-chunk/file-boundary retest policy |
+| Network xorb footer | Never emitted; the universal decoder accepts footerless, current V0/V1 `XETBLOB`, and official-reference legacy `XETB` forms |
 | Upload shard footer | Omitted and header footer size set to zero |
 | Upload verification | One verification entry per reconstruction term |
 | Xorb namespace | `default` |
@@ -24,7 +26,30 @@
 | Xorb limits | At most 64 MiB raw input and 8,192 chunks, with serialized-size validation |
 | Global protection hash | Keyed BLAKE3, despite historical “HMAC” naming |
 | Legacy shard size | Zero serialized-xorb size is accepted on reads for official historical shards, but rejected on new upload encoding |
+| Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
+| CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
+| Credential refresh | Refresh 30 seconds before expiry, coalesce concurrent refresh, and retry exactly once after a 401 invalidation |
+| Signed URLs | No bearer token, session ID, cookie, redirect, query-bearing error, or cache persistence |
+| Retry | Replay-safe exponential retry, bounded attempts, HTTP-date/delta Retry-After, and context cancellation |
+| Transport concurrency | Separate adaptive upload/download limits; official starting points 2/4 and maximum 64; fixed mode supported |
+| Download verification | Complete files verify structure, term hashes, Xet identity, size, and optional SHA-256; ranges verify all available structure but not a whole-file identity |
+| Persistent state | Content-only checksummed range/shard cache and identity-only replay journal; credentials and signed URLs are excluded |
+| Runtime | Pure Go, CGO disabled, Go 1.23 language baseline |
+
+## Exactness boundary
+
+Canonical hashes, Merkle trees/subtrees, uncompressed network/complete V1
+xorbs, and footerless upload shards match official Rust byte-for-byte. LZ4 has
+more than one valid serialized representation, so compressed xorbs are
+required to select the same per-chunk scheme and decode bidirectionally with
+identical content, boundaries, lengths, and identities. The adaptive controller
+preserves the official limits and behavioral contract but uses Go-native AIMD rather than
+copying Rust's latency model. Both allowances are explicitly permitted by the
+module boundary because they do not alter the protocol.
 
 The core API contains no Hugging Face repository, revision, path, user token,
 commit, Git, or LFS concepts. It accepts only Xet CAS access and protocol
 identities.
+
+Compatibility is continuously checked by the requirement matrix in
+[CONFORMANCE.md](CONFORMANCE.md).

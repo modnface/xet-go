@@ -1,5 +1,15 @@
 # Conformance harness
 
+Run every official gate, including the reference corpus, Rust differential
+oracle, and official Rust local CAS, with one command:
+
+```sh
+rustup toolchain install 1.95.0 --profile minimal
+./conformance/run-official-conformance.sh
+```
+
+The individual components are documented below for focused investigation.
+
 Build the official Rust differential oracle from the exact pinned revision:
 
 ```sh
@@ -61,3 +71,14 @@ machine-readable report and a median-throughput table to
 arguments select another input and output directory. Every sample must produce
 the same identity and chunk count in both implementations, and the none-encoded
 xorb must have the same serialized length, before timings are reported.
+
+The local release gates are:
+
+```sh
+./conformance/check-coverage.sh   # 75% aggregate statement floor
+./conformance/fuzz-smoke.sh       # all 11 fuzz targets; XET_FUZZ_TIME overrides 2s
+./conformance/cross-compile.sh    # seven supported GOOS/GOARCH targets
+```
+
+See [../CONFORMANCE.md](../CONFORMANCE.md) for the requirement-to-test matrix
+and exactness boundary.

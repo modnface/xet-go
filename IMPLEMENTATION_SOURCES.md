@@ -24,9 +24,10 @@ references, and conformance oracles.
 | Xorb codec and compression | `xorb` | `xet_core_structures/src/xorb_object/` |
 | Shard codec and validation | `shard` | `xet_core_structures/src/metadata_shard/` |
 | CAS DTOs and HTTP behavior | `api`, `download-protocol`, `upload-protocol` | `xet_client/src/cas_client/`; `xet_client/src/cas_types/` |
+| Adaptive request concurrency | transfer behavior | `xet_client/src/cas_client/adaptive_concurrency/`; `xet_runtime/src/config/groups/client.rs` |
+| Sparse delta windows and compact subtrees | `hashing`, `upload-protocol` | `xet_client/src/cas_client/chunk_window_builder.rs`; `xet_core_structures/src/merklehash/merkle_hash_subtree.rs` |
 | Upload and reconstruction engine | `upload-protocol`, `download-protocol` | `xet_data/src/processing/`; `xet_data/src/file_reconstruction/` |
 | Session behavior | protocol data plane | `xet_pkg/src/xet_session/` |
 
 New protocol behavior must add its authoritative source here before it is
 implemented.
-
