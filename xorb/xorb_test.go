@@ -2,11 +2,13 @@ package xorb
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"math/rand"
 	"testing"
 
 	"github.com/jacobwoliver/xet-go/chunker"
+	"github.com/jacobwoliver/xet-go/xethash"
 )
 
 func TestHeaderEncoding(t *testing.T) {
@@ -51,6 +53,94 @@ func TestSchemesRoundTrip(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCompleteV1RoundTrip(t *testing.T) {
+	object, err := Encode([][]byte{
+		bytes.Repeat([]byte("xet-complete"), 1_000),
+		bytes.Repeat([]byte{0, 1, 2, 3}, 8_000),
+	}, LZ4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := [4]byte{1, 2, 3, 4}
+	complete, err := EncodeComplete(object, nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(complete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Footer == nil || decoded.Footer.Version != 1 || decoded.FooterOffset != uint32(len(object.Body)) ||
+		decoded.Footer.XorbHash != object.Hash || decoded.Footer.UniquenessNonce != nonce {
+		t.Fatalf("bad complete metadata: %#v", decoded)
+	}
+	if len(decoded.Footer.ChunkHashes) != len(object.Chunks) ||
+		len(decoded.Footer.UnpackedChunkOffsets) != len(object.Chunks) {
+		t.Fatalf("bad complete chunk metadata: %#v", decoded.Footer)
+	}
+	infoLength := binary.LittleEndian.Uint32(complete[len(complete)-4:])
+	if infoLength != uint32(footerV1BaseSize+40*len(object.Chunks)) {
+		t.Fatalf("info length %d", infoLength)
+	}
+}
+
+func TestCompleteV0Decode(t *testing.T) {
+	object, err := Encode([][]byte{[]byte("first"), bytes.Repeat([]byte("second"), 2_000)}, None)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := len(object.Chunks)
+	infoLength := footerV0BaseSize + 36*n
+	footer := make([]byte, infoLength)
+	copy(footer[:7], footerMagic[:])
+	footer[7] = 0
+	copy(footer[8:40], object.Hash[:])
+	binary.LittleEndian.PutUint32(footer[40:44], uint32(n))
+	position := 44
+	for _, chunk := range object.Chunks {
+		binary.LittleEndian.PutUint32(footer[position:position+4], chunk.SerializedOffset+chunk.SerializedLength)
+		position += 4
+	}
+	for _, chunk := range object.Chunks {
+		copy(footer[position:position+xethash.Size], chunk.Hash[:])
+		position += xethash.Size
+	}
+	copy(footer[position:position+4], []byte{9, 8, 7, 6})
+	complete := append(append(append([]byte(nil), object.Body...), footer...), make([]byte, 4)...)
+	binary.LittleEndian.PutUint32(complete[len(complete)-4:], uint32(infoLength))
+	decoded, err := Decode(complete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Footer == nil || decoded.Footer.Version != 0 || decoded.Footer.UniquenessNonce != [4]byte{9, 8, 7, 6} {
+		t.Fatalf("bad V0 footer: %#v", decoded.Footer)
+	}
+	for i, chunk := range decoded.Chunks {
+		if decoded.Footer.UnpackedChunkOffsets[i] != chunk.UncompressedOffset+chunk.UncompressedLength {
+			t.Fatalf("unpacked offset %d not reconstructed", i)
+		}
+	}
+}
+
+func TestCompleteFooterRejectsCorruption(t *testing.T) {
+	object, err := Encode([][]byte{bytes.Repeat([]byte("footer"), 2_000)}, None)
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete, err := EncodeComplete(object, [4]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	footerStart := len(object.Body)
+	for _, offset := range []int{footerStart + 8, footerStart + 40, footerStart + 47, footerStart + 52} {
+		corrupt := append([]byte(nil), complete...)
+		corrupt[offset] ^= 0xff
+		if _, err := Decode(corrupt); err == nil {
+			t.Fatalf("accepted complete footer corruption at %d", offset)
+		}
 	}
 }
 

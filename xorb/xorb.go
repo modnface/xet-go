@@ -1,8 +1,9 @@
-// Package xorb implements the strict footerless Xet network-xorb codec.
+// Package xorb implements strict Xet network and complete/cache xorb codecs.
 package xorb
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +21,14 @@ const (
 	DefaultTargetRaw = 63 << 20
 	MaxChunks        = 8192
 	maxUint24        = 1<<24 - 1
+	footerV0BaseSize = 60
+	footerV1BaseSize = 92
+)
+
+var (
+	footerMagic       = [7]byte{'X', 'E', 'T', 'B', 'L', 'O', 'B'}
+	footerHashesMagic = [7]byte{'X', 'B', 'L', 'B', 'H', 'S', 'H'}
+	footerBoundsMagic = [7]byte{'X', 'B', 'L', 'B', 'B', 'N', 'D'}
 )
 
 // Scheme is the compression transform stored in a chunk header.
@@ -79,12 +88,28 @@ type Chunk struct {
 	Data               []byte
 }
 
-// Object is a footerless network xorb. Body contains repeated chunk records.
+// Footer is metadata carried by complete/cache xorbs. Version 0 does not
+// serialize UnpackedChunkOffsets; the decoder reconstructs and validates them.
+type Footer struct {
+	Version                 uint8
+	XorbHash                xethash.Hash
+	ChunkHashes             []xethash.Hash
+	ChunkBoundaryOffsets    []uint32
+	UnpackedChunkOffsets    []uint32
+	UniquenessNonce         [4]byte
+	HashesOffsetFromEnd     uint32
+	BoundariesOffsetFromEnd uint32
+}
+
+// Object is a decoded xorb. Body contains the complete input. FooterOffset is
+// len(Body) for the footerless network form and the start of Footer otherwise.
 type Object struct {
 	Hash             xethash.Hash
 	Body             []byte
 	Chunks           []Chunk
 	UncompressedSize uint32
+	FooterOffset     uint32
+	Footer           *Footer
 }
 
 // Encode serializes an ordered set of chunks. It rejects inputs exceeding the
@@ -199,17 +224,117 @@ func encode(chunks [][]byte, schemes []Scheme) (*Object, error) {
 		nodes = append(nodes, xethash.Node{Hash: hash, Size: uint64(len(data))})
 	}
 	object.Body = body.Bytes()
+	object.FooterOffset = uint32(len(object.Body))
 	object.Hash = xethash.Xorb(nodes)
 	return object, nil
 }
 
-// Decode validates and decompresses a footerless network xorb. All declared
-// lengths are checked before allocation.
+// EncodeComplete appends the current V1 XETBLOB footer to an object. Network
+// uploads must continue to use Object.Body from Encode/EncodeProduction.
+func EncodeComplete(object *Object, nonce [4]byte) ([]byte, error) {
+	if object == nil {
+		return nil, errors.New("xorb: nil object")
+	}
+	contentEnd := int(object.FooterOffset)
+	if contentEnd == 0 && len(object.Body) != 0 && object.Footer == nil {
+		contentEnd = len(object.Body)
+	}
+	if contentEnd <= 0 || contentEnd > len(object.Body) {
+		return nil, errors.New("xorb: invalid content boundary")
+	}
+	decoded, err := decodeContent(object.Body[:contentEnd])
+	if err != nil {
+		return nil, fmt.Errorf("xorb: encode complete: %w", err)
+	}
+	n := len(decoded.Chunks)
+	if n > MaxChunks {
+		return nil, errors.New("xorb: complete footer chunk count exceeds limit")
+	}
+	infoLength := footerV1BaseSize + 40*n
+	out := make([]byte, contentEnd, contentEnd+infoLength+4)
+	copy(out, object.Body[:contentEnd])
+	footer := make([]byte, infoLength)
+	position := 0
+	copy(footer[position:position+7], footerMagic[:])
+	position += 7
+	footer[position] = 1
+	position++
+	copy(footer[position:position+xethash.Size], decoded.Hash[:])
+	position += xethash.Size
+	copy(footer[position:position+7], footerHashesMagic[:])
+	position += 7
+	footer[position] = 0
+	position++
+	binary.LittleEndian.PutUint32(footer[position:position+4], uint32(n))
+	position += 4
+	for _, chunk := range decoded.Chunks {
+		copy(footer[position:position+xethash.Size], chunk.Hash[:])
+		position += xethash.Size
+	}
+	copy(footer[position:position+7], footerBoundsMagic[:])
+	position += 7
+	footer[position] = 1
+	position++
+	binary.LittleEndian.PutUint32(footer[position:position+4], uint32(n))
+	position += 4
+	for _, chunk := range decoded.Chunks {
+		boundary := chunk.SerializedOffset + chunk.SerializedLength
+		binary.LittleEndian.PutUint32(footer[position:position+4], boundary)
+		position += 4
+	}
+	for _, chunk := range decoded.Chunks {
+		boundary := chunk.UncompressedOffset + chunk.UncompressedLength
+		binary.LittleEndian.PutUint32(footer[position:position+4], boundary)
+		position += 4
+	}
+	binary.LittleEndian.PutUint32(footer[position:position+4], uint32(n))
+	position += 4
+	hashesFromEnd := uint32(52 + 40*n)
+	boundsFromEnd := uint32(40 + 8*n)
+	binary.LittleEndian.PutUint32(footer[position:position+4], hashesFromEnd)
+	position += 4
+	binary.LittleEndian.PutUint32(footer[position:position+4], boundsFromEnd)
+	position += 4
+	copy(footer[position:position+4], nonce[:])
+	position += 16 // nonce followed by twelve reserved zero bytes
+	if position != infoLength {
+		return nil, errors.New("xorb: internal complete footer length mismatch")
+	}
+	out = append(out, footer...)
+	out = binary.LittleEndian.AppendUint32(out, uint32(infoLength))
+	return out, nil
+}
+
+// Decode validates and decompresses either a footerless network xorb or a V0
+// or V1 complete/cache xorb. All declared lengths are checked before allocation.
 func Decode(body []byte) (*Object, error) {
 	if len(body) == 0 {
 		return nil, &FormatError{Reason: "empty object"}
 	}
-	object := &Object{Body: append([]byte(nil), body...)}
+	contentEnd, footer, err := splitFooter(body)
+	if err != nil {
+		return nil, err
+	}
+	object, err := decodeContent(body[:contentEnd])
+	if err != nil {
+		return nil, err
+	}
+	object.Body = append([]byte(nil), body...)
+	object.FooterOffset = uint32(contentEnd)
+	object.Footer = footer
+	if footer != nil {
+		if err := validateFooter(object, footer); err != nil {
+			return nil, err
+		}
+	}
+	return object, nil
+}
+
+func decodeContent(body []byte) (*Object, error) {
+	if len(body) == 0 {
+		return nil, &FormatError{Reason: "empty content section"}
+	}
+	object := &Object{Body: append([]byte(nil), body...), FooterOffset: uint32(len(body))}
 	nodes := make([]xethash.Node, 0, 1024)
 	for offset := 0; offset < len(body); {
 		if len(object.Chunks) == MaxChunks {
@@ -262,6 +387,130 @@ func Decode(body []byte) (*Object, error) {
 	}
 	object.Hash = xethash.Xorb(nodes)
 	return object, nil
+}
+
+func splitFooter(body []byte) (int, *Footer, error) {
+	if len(body) < 4 {
+		return len(body), nil, nil
+	}
+	infoLength := int(binary.LittleEndian.Uint32(body[len(body)-4:]))
+	if infoLength > len(body)-4 || infoLength < 8 {
+		return len(body), nil, nil
+	}
+	start := len(body) - 4 - infoLength
+	if start < HeaderSize || !bytes.Equal(body[start:start+7], footerMagic[:]) {
+		return len(body), nil, nil
+	}
+	version := body[start+7]
+	if (version == 0 && (infoLength < footerV0BaseSize || (infoLength-footerV0BaseSize)%36 != 0)) ||
+		(version == 1 && (infoLength < footerV1BaseSize || (infoLength-footerV1BaseSize)%40 != 0)) {
+		return 0, nil, &FormatError{Offset: start, Reason: "invalid complete footer length"}
+	}
+	if version != 0 && version != 1 {
+		return 0, nil, &FormatError{Offset: start + 7, Reason: fmt.Sprintf("unsupported footer version %d", version)}
+	}
+	footer, err := parseFooter(body[start:len(body)-4], start)
+	if err != nil {
+		return 0, nil, err
+	}
+	return start, footer, nil
+}
+
+func parseFooter(data []byte, base int) (*Footer, error) {
+	version := data[7]
+	footer := &Footer{Version: version}
+	copy(footer.XorbHash[:], data[8:40])
+	if version == 0 {
+		n := int(binary.LittleEndian.Uint32(data[40:44]))
+		if n > MaxChunks || footerV0BaseSize+36*n != len(data) {
+			return nil, &FormatError{Offset: base + 40, Reason: "invalid V0 footer chunk count"}
+		}
+		position := 44
+		footer.ChunkBoundaryOffsets = make([]uint32, n)
+		for i := range footer.ChunkBoundaryOffsets {
+			footer.ChunkBoundaryOffsets[i] = binary.LittleEndian.Uint32(data[position : position+4])
+			position += 4
+		}
+		footer.ChunkHashes = make([]xethash.Hash, n)
+		for i := range footer.ChunkHashes {
+			copy(footer.ChunkHashes[i][:], data[position:position+xethash.Size])
+			position += xethash.Size
+		}
+		copy(footer.UniquenessNonce[:], data[position:position+4])
+		return footer, nil
+	}
+	if !bytes.Equal(data[40:47], footerHashesMagic[:]) || data[47] != 0 {
+		return nil, &FormatError{Offset: base + 40, Reason: "invalid hash footer section"}
+	}
+	n := int(binary.LittleEndian.Uint32(data[48:52]))
+	if n > MaxChunks || footerV1BaseSize+40*n != len(data) {
+		return nil, &FormatError{Offset: base + 48, Reason: "invalid V1 footer chunk count"}
+	}
+	position := 52
+	footer.ChunkHashes = make([]xethash.Hash, n)
+	for i := range footer.ChunkHashes {
+		copy(footer.ChunkHashes[i][:], data[position:position+xethash.Size])
+		position += xethash.Size
+	}
+	if !bytes.Equal(data[position:position+7], footerBoundsMagic[:]) || data[position+7] != 1 {
+		return nil, &FormatError{Offset: base + position, Reason: "invalid boundary footer section"}
+	}
+	position += 8
+	if count := int(binary.LittleEndian.Uint32(data[position : position+4])); count != n {
+		return nil, &FormatError{Offset: base + position, Reason: "inconsistent footer chunk counts"}
+	}
+	position += 4
+	footer.ChunkBoundaryOffsets = make([]uint32, n)
+	for i := range footer.ChunkBoundaryOffsets {
+		footer.ChunkBoundaryOffsets[i] = binary.LittleEndian.Uint32(data[position : position+4])
+		position += 4
+	}
+	footer.UnpackedChunkOffsets = make([]uint32, n)
+	for i := range footer.UnpackedChunkOffsets {
+		footer.UnpackedChunkOffsets[i] = binary.LittleEndian.Uint32(data[position : position+4])
+		position += 4
+	}
+	if count := int(binary.LittleEndian.Uint32(data[position : position+4])); count != n {
+		return nil, &FormatError{Offset: base + position, Reason: "inconsistent footer terminal chunk count"}
+	}
+	position += 4
+	footer.HashesOffsetFromEnd = binary.LittleEndian.Uint32(data[position : position+4])
+	position += 4
+	footer.BoundariesOffsetFromEnd = binary.LittleEndian.Uint32(data[position : position+4])
+	position += 4
+	if footer.HashesOffsetFromEnd != uint32(len(data)-40) ||
+		footer.BoundariesOffsetFromEnd != uint32(len(data)-(52+32*n)) {
+		return nil, &FormatError{Offset: base + position - 8, Reason: "invalid footer jump offset"}
+	}
+	copy(footer.UniquenessNonce[:], data[position:position+4])
+	return footer, nil
+}
+
+func validateFooter(object *Object, footer *Footer) error {
+	if footer.XorbHash != object.Hash {
+		return &FormatError{Offset: int(object.FooterOffset) + 8, Reason: "footer xorb hash mismatch"}
+	}
+	if len(footer.ChunkHashes) != len(object.Chunks) ||
+		len(footer.ChunkBoundaryOffsets) != len(object.Chunks) {
+		return &FormatError{Offset: int(object.FooterOffset), Reason: "footer chunk count differs from content"}
+	}
+	if footer.Version == 0 {
+		footer.UnpackedChunkOffsets = make([]uint32, len(object.Chunks))
+	}
+	for i, chunk := range object.Chunks {
+		if footer.ChunkHashes[i] != chunk.Hash {
+			return &FormatError{Offset: int(object.FooterOffset), Reason: fmt.Sprintf("footer chunk hash %d mismatch", i)}
+		}
+		if footer.ChunkBoundaryOffsets[i] != chunk.SerializedOffset+chunk.SerializedLength {
+			return &FormatError{Offset: int(object.FooterOffset), Reason: fmt.Sprintf("footer chunk boundary %d mismatch", i)}
+		}
+		unpacked := chunk.UncompressedOffset + chunk.UncompressedLength
+		if footer.Version == 1 && footer.UnpackedChunkOffsets[i] != unpacked {
+			return &FormatError{Offset: int(object.FooterOffset), Reason: fmt.Sprintf("footer unpacked boundary %d mismatch", i)}
+		}
+		footer.UnpackedChunkOffsets[i] = unpacked
+	}
+	return nil
 }
 
 func encodePayload(data []byte, requested Scheme) (Scheme, []byte, error) {

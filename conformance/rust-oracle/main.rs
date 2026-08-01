@@ -20,7 +20,10 @@ use xet_core_structures::metadata_shard::shard_in_memory::MDBInMemoryShard;
 use xet_core_structures::metadata_shard::streaming_shard::MDBMinimalShard;
 use xet_core_structures::metadata_shard::xorb_structs::{MDBXorbInfo, XorbChunkSequenceEntry, XorbChunkSequenceHeader};
 use xet_core_structures::metadata_shard::{MDBShardFileHeader, MDBShardInfo};
-use xet_core_structures::xorb_object::{CompressionScheme, deserialize_chunks, serialize_chunk};
+use xet_core_structures::xorb_object::{
+    CompressionScheme, deserialize_chunks, serialize_chunk,
+    xorb_format_test_utils::serialize_xorb_to_stream_reference,
+};
 use xet_data::deduplication::Chunker;
 
 #[derive(Serialize)]
@@ -115,7 +118,7 @@ fn calculate(data: &[u8]) -> CorpusRecord {
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: xet-go-rust-oracle <corpus|bench|encode-xorb|decode-xorb|encode-shard|decode-shard> <file> [argument]");
+        eprintln!("usage: xet-go-rust-oracle <corpus|bench|encode-xorb|encode-xorb-complete|decode-xorb|encode-shard|decode-shard> <file> [argument]");
         return ExitCode::from(2);
     }
     let data = match fs::read(&args[2]) {
@@ -158,6 +161,30 @@ fn main() -> ExitCode {
                 "{}",
                 serde_json::to_string(&EncodedXorbRecord {
                     body_hex: raw_hex(&body),
+                    chunks: chunks.len(),
+                })
+                .unwrap()
+            );
+        }
+        "encode-xorb-complete" => {
+            let scheme: CompressionScheme = args.get(3).map(String::as_str).unwrap_or("none").parse().unwrap();
+            let chunks = Chunker::default().next_block(&data, true);
+            let nodes: Vec<_> = chunks.iter().map(|chunk| (chunk.hash, chunk.data.len() as u64)).collect();
+            let hash = xorb_hash(&nodes);
+            let mut boundary = 0u32;
+            let chunk_boundaries: Vec<_> = chunks
+                .iter()
+                .map(|chunk| {
+                    boundary += chunk.data.len() as u32;
+                    (chunk.hash, boundary)
+                })
+                .collect();
+            let mut output = Cursor::new(Vec::new());
+            serialize_xorb_to_stream_reference(&mut output, &hash, &data, &chunk_boundaries, scheme).unwrap();
+            println!(
+                "{}",
+                serde_json::to_string(&EncodedXorbRecord {
+                    body_hex: raw_hex(&output.into_inner()),
                     chunks: chunks.len(),
                 })
                 .unwrap()

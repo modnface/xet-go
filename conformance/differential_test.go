@@ -85,6 +85,53 @@ func TestRustDifferentialXorb(t *testing.T) {
 	}
 }
 
+func TestRustDifferentialCompleteXorb(t *testing.T) {
+	oracle := os.Getenv("XET_RUST_ORACLE")
+	if oracle == "" {
+		t.Skip("set XET_RUST_ORACLE to the binary produced by conformance/build-rust-oracle.sh")
+	}
+	data := bytes.Repeat([]byte("official-complete-xorb-vector"), 10_000)
+	path := filepath.Join(t.TempDir(), "input.bin")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command(oracle, "encode-xorb-complete", path, "none").CombinedOutput()
+	if err != nil {
+		t.Fatalf("Rust complete encode: %v\n%s", err, output)
+	}
+	var rust encodedXorb
+	if err := json.Unmarshal(output, &rust); err != nil {
+		t.Fatal(err)
+	}
+	rustBody, err := hex.DecodeString(rust.BodyHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rustDecoded, err := xorb.Decode(rustBody)
+	if err != nil {
+		t.Fatalf("Go decode of Rust complete xorb: %v", err)
+	}
+	if rustDecoded.Footer == nil || !bytes.Equal(joinXorb(rustDecoded), data) {
+		t.Fatal("Go decode of Rust complete xorb differs")
+	}
+	parts := chunker.Bytes(data)
+	chunks := make([][]byte, len(parts))
+	for i := range parts {
+		chunks[i] = parts[i].Data
+	}
+	goObject, err := xorb.Encode(chunks, xorb.None)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goBody, err := xorb.EncodeComplete(goObject, [4]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(goBody, rustBody) {
+		t.Fatalf("complete xorb differs byte-for-byte: Go %d bytes, Rust %d", len(goBody), len(rustBody))
+	}
+}
+
 func compareXorb(t *testing.T, oracle string, data []byte, schemeName string, schemeID xorb.Scheme) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "input.bin")
