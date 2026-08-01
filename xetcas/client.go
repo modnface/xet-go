@@ -35,6 +35,8 @@ const (
 	defaultAccessLeadTime = 30 * time.Second
 )
 
+var errResponseTooLarge = errors.New("xet CAS: response too large")
+
 // HTTPError is a sanitized non-success CAS or object-storage response. URL
 // never includes credentials, query parameters, or fragments.
 type HTTPError struct {
@@ -44,6 +46,13 @@ type HTTPError struct {
 	RequestID  string
 	Body       string
 }
+
+// transportFailure preserves error classification through Unwrap without
+// rendering net/url.Error's potentially credential-bearing URL.
+type transportFailure struct{ cause error }
+
+func (*transportFailure) Error() string   { return "transport failure" }
+func (e *transportFailure) Unwrap() error { return e.cause }
 
 func (e *HTTPError) Error() string {
 	requestID := ""
@@ -80,6 +89,7 @@ type Client struct {
 	http              *http.Client
 	access            accessCache
 	retry             RetryPolicy
+	now               func() time.Time
 	maxResponseBytes  int64
 	maxErrorBytes     int64
 	sessionID         string
@@ -132,6 +142,7 @@ func New(provider CASAccessProvider, options Options) (*Client, error) {
 		http:             httpClient,
 		access:           accessCache{provider: provider, refreshBefore: refreshBefore, now: now},
 		retry:            retry,
+		now:              now,
 		maxResponseBytes: maxResponse,
 		maxErrorBytes:    maxError,
 		sessionID:        options.SessionID,
@@ -206,13 +217,19 @@ func (c *Client) casCall(
 		if c.userAgent != "" {
 			req.Header.Set("User-Agent", c.userAgent)
 		}
+		// Setting this explicitly disables net/http's partial transparent gzip
+		// behavior (which is skipped for Range requests) so every CAS response is
+		// decoded and bounded consistently by our processors.
+		if process != nil && method != http.MethodHead && req.Header.Get("Accept-Encoding") == "" {
+			req.Header.Set("Accept-Encoding", "gzip, zstd")
+		}
 
 		resp, err := c.http.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			lastErr = fmt.Errorf("xet CAS: %s %s: %w", method, redactURL(requestURL), err)
+			lastErr = fmt.Errorf("xet CAS: %s %s: %w", method, redactURL(requestURL), &transportFailure{cause: err})
 			if !isRetryableNetworkError(err) || attempt+1 == c.retry.MaxAttempts {
 				return nil, lastErr
 			}
@@ -263,7 +280,11 @@ func (c *Client) casCall(
 }
 
 func (c *Client) waitRetry(ctx context.Context, attempt int, retryAfter string) error {
-	delay, ok := parseRetryAfter(retryAfter, time.Now())
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	delay, ok := parseRetryAfter(retryAfter, now())
 	if !ok {
 		delay = c.retry.InitialBackoff
 		for i := 0; i < attempt && delay < c.retry.MaximumBackoff; i++ {
@@ -446,7 +467,7 @@ func readLimited(reader io.Reader, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(data)) > limit {
-		return nil, fmt.Errorf("xet CAS: response exceeds %d-byte limit", limit)
+		return nil, fmt.Errorf("%w: exceeds %d-byte limit", errResponseTooLarge, limit)
 	}
 	return data, nil
 }
@@ -491,9 +512,14 @@ func isRetryableNetworkError(err error) bool {
 
 func (c *Client) jsonProcessor(out any, limit int64) responseProcessor {
 	return func(resp *http.Response) (any, bool, error) {
-		body, err := readLimited(resp.Body, limit)
+		reader, closeDecoder, err := decodeResponse(resp, limit)
 		if err != nil {
-			return nil, true, fmt.Errorf("xet CAS: read response: %w", err)
+			return nil, false, err
+		}
+		defer func() { _ = closeDecoder() }()
+		body, err := readLimited(reader, limit)
+		if err != nil {
+			return nil, isRetryableNetworkError(err), fmt.Errorf("xet CAS: read response: %w", err)
 		}
 		if err := json.Unmarshal(body, out); err != nil {
 			return nil, false, fmt.Errorf("xet CAS: decode JSON: %w", err)
@@ -504,9 +530,14 @@ func (c *Client) jsonProcessor(out any, limit int64) responseProcessor {
 
 func (c *Client) bytesProcessor(limit int64) responseProcessor {
 	return func(resp *http.Response) (any, bool, error) {
-		body, err := readLimited(resp.Body, limit)
+		reader, closeDecoder, err := decodeResponse(resp, limit)
 		if err != nil {
-			return nil, true, fmt.Errorf("xet CAS: read response: %w", err)
+			return nil, false, err
+		}
+		defer func() { _ = closeDecoder() }()
+		body, err := readLimited(reader, limit)
+		if err != nil {
+			return nil, isRetryableNetworkError(err), fmt.Errorf("xet CAS: read response: %w", err)
 		}
 		return body, false, nil
 	}
@@ -651,9 +682,19 @@ func (c *Client) UploadShard(ctx context.Context, body []byte, progress func(Sha
 
 func (c *Client) ndjsonProcessor(progress func(ShardUploadEvent)) responseProcessor {
 	return func(resp *http.Response) (any, bool, error) {
-		reader := bufio.NewReaderSize(resp.Body, defaultMaxNDJSONLine+1)
+		decoded, closeDecoder, err := decodeResponse(resp, c.maxResponseBytes)
+		if err != nil {
+			return nil, false, err
+		}
+		defer func() { _ = closeDecoder() }()
+		reader := bufio.NewReaderSize(decoded, defaultMaxNDJSONLine+1)
+		var total int64
 		for {
 			line, readErr := reader.ReadSlice('\n')
+			total += int64(len(line))
+			if total > c.maxResponseBytes {
+				return nil, false, fmt.Errorf("%w: exceeds %d-byte limit", errResponseTooLarge, c.maxResponseBytes)
+			}
 			if errors.Is(readErr, bufio.ErrBufferFull) || len(line) > defaultMaxNDJSONLine+1 {
 				return nil, false, fmt.Errorf("xet CAS: shard progress frame exceeds %d-byte limit", defaultMaxNDJSONLine)
 			}
@@ -668,7 +709,7 @@ func (c *Client) ndjsonProcessor(progress func(ShardUploadEvent)) responseProces
 				if errors.Is(readErr, io.EOF) {
 					return nil, false, ErrMissingTerminal
 				}
-				return nil, true, fmt.Errorf("xet CAS: read shard progress stream: %w", readErr)
+				return nil, isRetryableNetworkError(readErr), fmt.Errorf("xet CAS: read shard progress stream: %w", readErr)
 			}
 			var event ShardUploadEvent
 			if err := json.Unmarshal(line, &event); err != nil {
@@ -702,7 +743,7 @@ func (c *Client) ndjsonProcessor(progress func(ShardUploadEvent)) responseProces
 			if errors.Is(readErr, io.EOF) {
 				return nil, false, ErrMissingTerminal
 			}
-			return nil, true, fmt.Errorf("xet CAS: read shard progress stream: %w", readErr)
+			return nil, isRetryableNetworkError(readErr), fmt.Errorf("xet CAS: read shard progress stream: %w", readErr)
 		}
 	}
 }

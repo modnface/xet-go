@@ -62,7 +62,7 @@ func (c *Client) FetchRanges(ctx context.Context, rawURL string, ranges []HTTPRa
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			lastErr = fmt.Errorf("xet CAS: signed GET %s: %w", redactURL(parsedURL), err)
+			lastErr = fmt.Errorf("xet CAS: signed GET %s: %w", redactURL(parsedURL), &transportFailure{cause: err})
 			if !isRetryableNetworkError(err) || attempt+1 == c.retry.MaxAttempts {
 				return nil, lastErr
 			}

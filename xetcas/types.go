@@ -309,6 +309,9 @@ func validateSignedURL(raw string) error {
 	if u.User != nil {
 		return errors.New("signed URL must not contain user information")
 	}
+	if u.Fragment != "" {
+		return errors.New("signed URL must not contain a fragment")
+	}
 	return nil
 }
 
