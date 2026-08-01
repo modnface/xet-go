@@ -11,14 +11,19 @@ use std::time::Instant;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use xet_core_structures::merklehash::{DataHash, MerkleHashSubtree, file_hash, xorb_hash};
+use xet_core_structures::merklehash::{
+    DataHash, MerkleHashSubtree, compute_data_hash, file_hash, xorb_hash,
+};
 use xet_core_structures::metadata_shard::chunk_verification::range_hash_from_chunks;
 use xet_core_structures::metadata_shard::file_structs::{
-    FileDataSequenceEntry, FileDataSequenceHeader, FileMetadataExt, FileVerificationEntry, MDBFileInfo,
+    FileDataSequenceEntry, FileDataSequenceHeader, FileMetadataExt, FileVerificationEntry,
+    MDBFileInfo,
 };
 use xet_core_structures::metadata_shard::shard_in_memory::MDBInMemoryShard;
 use xet_core_structures::metadata_shard::streaming_shard::MDBMinimalShard;
-use xet_core_structures::metadata_shard::xorb_structs::{MDBXorbInfo, XorbChunkSequenceEntry, XorbChunkSequenceHeader};
+use xet_core_structures::metadata_shard::xorb_structs::{
+    MDBXorbInfo, XorbChunkSequenceEntry, XorbChunkSequenceHeader,
+};
 use xet_core_structures::metadata_shard::{MDBShardFileHeader, MDBShardInfo};
 use xet_core_structures::xorb_object::{
     CompressionScheme, deserialize_chunks, serialize_chunk,
@@ -44,11 +49,17 @@ struct CorpusRecord {
 
 #[derive(Serialize)]
 struct BenchRecord {
-    size: usize,
+    schema_version: u32,
+    implementation: &'static str,
+    operation: String,
+    scheme: Option<String>,
+    input_size: usize,
     iterations: usize,
-    elapsed_ns: u128,
+    elapsed_ns: u64,
     bytes_per_second: f64,
-    file_hash: String,
+    identity: String,
+    serialized_size: usize,
+    chunks: usize,
 }
 
 #[derive(Serialize)]
@@ -124,10 +135,115 @@ fn calculate(data: &[u8]) -> CorpusRecord {
     }
 }
 
+fn encode_benchmark_xorb(data: &[u8], scheme: CompressionScheme) -> (Vec<u8>, String, usize) {
+    let chunks = Chunker::default().next_block(data, true);
+    let nodes: Vec<_> = chunks
+        .iter()
+        .map(|chunk| (chunk.hash, chunk.data.len() as u64))
+        .collect();
+    let mut body = Vec::new();
+    for chunk in &chunks {
+        serialize_chunk(&chunk.data, &mut body, scheme).unwrap();
+    }
+    (body, xorb_hash(&nodes).to_string(), chunks.len())
+}
+
+fn decode_benchmark_xorb(body: &[u8]) -> (String, usize) {
+    let (decoded, boundaries) = deserialize_chunks(&mut Cursor::new(body)).unwrap();
+    let nodes: Vec<_> = boundaries
+        .windows(2)
+        .map(|range| {
+            let start = range[0] as usize;
+            let end = range[1] as usize;
+            (
+                compute_data_hash(&decoded[start..end]),
+                (end - start) as u64,
+            )
+        })
+        .collect();
+    (xorb_hash(&nodes).to_string(), nodes.len())
+}
+
+fn benchmark(data: &[u8], operation: &str, iterations: usize) -> BenchRecord {
+    assert!(iterations > 0);
+    let mut identity = String::new();
+    let mut serialized_size = 0usize;
+    let mut chunks = 0usize;
+    let mut scheme_name = None;
+
+    let decode_body = match operation {
+        "xorb_decode_none" => {
+            scheme_name = Some("none".to_string());
+            Some(encode_benchmark_xorb(data, CompressionScheme::None).0)
+        }
+        "xorb_decode_lz4" => {
+            scheme_name = Some("lz4".to_string());
+            Some(encode_benchmark_xorb(data, CompressionScheme::LZ4).0)
+        }
+        _ => None,
+    };
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        match operation {
+            "chunk_hash" => {
+                let result = Chunker::default().next_block(data, true);
+                let nodes: Vec<_> = result
+                    .iter()
+                    .map(|chunk| (chunk.hash, chunk.data.len() as u64))
+                    .collect();
+                identity = file_hash(&nodes).to_string();
+                chunks = result.len();
+            }
+            "xorb_encode_none" => {
+                scheme_name = Some("none".to_string());
+                let result = encode_benchmark_xorb(data, CompressionScheme::None);
+                serialized_size = result.0.len();
+                identity = result.1;
+                chunks = result.2;
+                std::hint::black_box(result.0);
+            }
+            "xorb_encode_lz4" => {
+                scheme_name = Some("lz4".to_string());
+                let result = encode_benchmark_xorb(data, CompressionScheme::LZ4);
+                serialized_size = result.0.len();
+                identity = result.1;
+                chunks = result.2;
+                std::hint::black_box(result.0);
+            }
+            "xorb_decode_none" | "xorb_decode_lz4" => {
+                let body = decode_body.as_ref().unwrap();
+                let result = decode_benchmark_xorb(body);
+                serialized_size = body.len();
+                identity = result.0;
+                chunks = result.1;
+            }
+            _ => panic!("unknown benchmark operation {operation:?}"),
+        }
+        std::hint::black_box(&identity);
+    }
+    let elapsed = start.elapsed();
+    BenchRecord {
+        schema_version: 1,
+        implementation: "rust-xet-core",
+        operation: operation.to_string(),
+        scheme: scheme_name,
+        input_size: data.len(),
+        iterations,
+        elapsed_ns: elapsed.as_nanos().try_into().unwrap(),
+        bytes_per_second: data.len() as f64 * iterations as f64 / elapsed.as_secs_f64(),
+        identity,
+        serialized_size,
+        chunks,
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: xet-go-rust-oracle <corpus|bench|subtree|encode-xorb|encode-xorb-complete|decode-xorb|encode-shard|decode-shard> <file> [argument]");
+        eprintln!(
+            "usage: xet-go-rust-oracle <corpus|bench|perf|subtree|encode-xorb|encode-xorb-complete|decode-xorb|encode-shard|decode-shard> <file> [argument]"
+        );
         return ExitCode::from(2);
     }
     let data = match fs::read(&args[2]) {
@@ -141,28 +257,29 @@ fn main() -> ExitCode {
         "corpus" => println!("{}", serde_json::to_string(&calculate(&data)).unwrap()),
         "bench" => {
             let iterations: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(1);
-            let start = Instant::now();
-            let mut result = calculate(&data);
-            for _ in 1..iterations {
-                result = calculate(&data);
-            }
-            let elapsed = start.elapsed();
             println!(
                 "{}",
-                serde_json::to_string(&BenchRecord {
-                    size: data.len(),
-                    iterations,
-                    elapsed_ns: elapsed.as_nanos(),
-                    bytes_per_second: data.len() as f64 * iterations as f64 / elapsed.as_secs_f64(),
-                    file_hash: result.file_hash,
-                })
-                .unwrap()
+                serde_json::to_string(&benchmark(&data, "chunk_hash", iterations)).unwrap()
+            );
+        }
+        "perf" => {
+            let operation = args.get(3).map(String::as_str).unwrap_or("chunk_hash");
+            let iterations: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(1);
+            println!(
+                "{}",
+                serde_json::to_string(&benchmark(&data, operation, iterations)).unwrap()
             );
         }
         "subtree" => {
             let chunks = Chunker::default().next_block(&data, true);
-            let nodes: Vec<_> = chunks.iter().map(|chunk| (chunk.hash, chunk.data.len() as u64)).collect();
-            let split: usize = args.get(3).and_then(|value| value.parse().ok()).unwrap_or(nodes.len() / 2);
+            let nodes: Vec<_> = chunks
+                .iter()
+                .map(|chunk| (chunk.hash, chunk.data.len() as u64))
+                .collect();
+            let split: usize = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(nodes.len() / 2);
             assert!(split <= nodes.len());
             let full = MerkleHashSubtree::from_chunks(true, &nodes, true);
             let left = MerkleHashSubtree::from_chunks(true, &nodes[..split], false);
@@ -182,7 +299,12 @@ fn main() -> ExitCode {
             );
         }
         "encode-xorb" => {
-            let scheme: CompressionScheme = args.get(3).map(String::as_str).unwrap_or("auto").parse().unwrap();
+            let scheme: CompressionScheme = args
+                .get(3)
+                .map(String::as_str)
+                .unwrap_or("auto")
+                .parse()
+                .unwrap();
             let chunks = Chunker::default().next_block(&data, true);
             let mut body = Vec::new();
             for chunk in &chunks {
@@ -198,9 +320,17 @@ fn main() -> ExitCode {
             );
         }
         "encode-xorb-complete" => {
-            let scheme: CompressionScheme = args.get(3).map(String::as_str).unwrap_or("none").parse().unwrap();
+            let scheme: CompressionScheme = args
+                .get(3)
+                .map(String::as_str)
+                .unwrap_or("none")
+                .parse()
+                .unwrap();
             let chunks = Chunker::default().next_block(&data, true);
-            let nodes: Vec<_> = chunks.iter().map(|chunk| (chunk.hash, chunk.data.len() as u64)).collect();
+            let nodes: Vec<_> = chunks
+                .iter()
+                .map(|chunk| (chunk.hash, chunk.data.len() as u64))
+                .collect();
             let hash = xorb_hash(&nodes);
             let mut boundary = 0u32;
             let chunk_boundaries: Vec<_> = chunks
@@ -211,7 +341,14 @@ fn main() -> ExitCode {
                 })
                 .collect();
             let mut output = Cursor::new(Vec::new());
-            serialize_xorb_to_stream_reference(&mut output, &hash, &data, &chunk_boundaries, scheme).unwrap();
+            serialize_xorb_to_stream_reference(
+                &mut output,
+                &hash,
+                &data,
+                &chunk_boundaries,
+                scheme,
+            )
+            .unwrap();
             println!(
                 "{}",
                 serde_json::to_string(&EncodedXorbRecord {
@@ -222,7 +359,8 @@ fn main() -> ExitCode {
             );
         }
         "decode-xorb" => {
-            let (decoded, boundaries) = deserialize_chunks(&mut std::io::Cursor::new(&data)).unwrap();
+            let (decoded, boundaries) =
+                deserialize_chunks(&mut std::io::Cursor::new(&data)).unwrap();
             println!(
                 "{}",
                 serde_json::to_string(&DecodedXorbRecord {
@@ -234,14 +372,18 @@ fn main() -> ExitCode {
         }
         "encode-shard" => {
             let chunks = Chunker::default().next_block(&data, true);
-            let nodes: Vec<_> = chunks.iter().map(|c| (c.hash, c.data.len() as u64)).collect();
+            let nodes: Vec<_> = chunks
+                .iter()
+                .map(|c| (c.hash, c.data.len() as u64))
+                .collect();
             let xorb_hash_value = xorb_hash(&nodes);
             let file_hash_value = file_hash(&nodes);
             let mut serialized_xorb = Vec::new();
             let mut xorb_chunks = Vec::new();
             let mut raw_offset = 0u32;
             for chunk in &chunks {
-                serialize_chunk(&chunk.data, &mut serialized_xorb, CompressionScheme::None).unwrap();
+                serialize_chunk(&chunk.data, &mut serialized_xorb, CompressionScheme::None)
+                    .unwrap();
                 xorb_chunks.push(XorbChunkSequenceEntry::new(
                     chunk.hash,
                     chunk.data.len() as u32,
@@ -249,13 +391,19 @@ fn main() -> ExitCode {
                 ));
                 raw_offset += chunk.data.len() as u32;
             }
-            let mut xorb_header = XorbChunkSequenceHeader::new(xorb_hash_value, chunks.len(), data.len() as u32);
+            let mut xorb_header =
+                XorbChunkSequenceHeader::new(xorb_hash_value, chunks.len(), data.len() as u32);
             xorb_header.num_bytes_on_disk = serialized_xorb.len() as u32;
             let xorb_info = MDBXorbInfo {
                 metadata: xorb_header,
                 chunks: xorb_chunks,
             };
-            let segment = FileDataSequenceEntry::new(xorb_hash_value, data.len() as u32, 0u32, chunks.len() as u32);
+            let segment = FileDataSequenceEntry::new(
+                xorb_hash_value,
+                data.len() as u32,
+                0u32,
+                chunks.len() as u32,
+            );
             let chunk_hashes: Vec<_> = chunks.iter().map(|c| c.hash).collect();
             let verification = FileVerificationEntry::new(range_hash_from_chunks(&chunk_hashes));
             let sha_raw: [u8; 32] = Sha256::digest(&data).into();

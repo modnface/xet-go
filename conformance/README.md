@@ -45,3 +45,19 @@ Then, from this repository:
 ```sh
 XET_LOCAL_CAS_ENDPOINT=http://127.0.0.1:18080 go test ./conformance -run TestOfficialRustLocalCASRoundTrip -v
 ```
+
+For matched performance measurements, run:
+
+```sh
+./conformance/compare-performance.sh
+```
+
+This builds optimized Go executables and the pinned optimized Rust oracle, then
+alternates five timed samples for chunking+hashing and forced none/LZ4 xorb
+encoding and decoding over the official 63.5 MB corpus. It writes a detailed
+machine-readable report and a median-throughput table to
+`.cache/performance/latest.{json,md}`. `XET_PERF_ITERATIONS` and
+`XET_PERF_SAMPLES` control repetition; the first and second positional
+arguments select another input and output directory. Every sample must produce
+the same identity and chunk count in both implementations, and the none-encoded
+xorb must have the same serialized length, before timings are reported.
