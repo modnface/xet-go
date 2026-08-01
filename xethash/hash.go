@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
+	"strconv"
+	"sync"
 
 	"lukechampine.com/blake3"
+	"lukechampine.com/blake3/guts"
 )
 
 const (
@@ -46,6 +48,15 @@ var (
 		0x12, 0x7f, 0xf9, 0x13, 0xe7, 0xa5, 0xc3, 0xf3,
 		0xa4, 0xcd, 0x26, 0xd5, 0xb5, 0xdb, 0x49, 0xe6,
 		0x41, 0x24, 0x98, 0x7f, 0x28, 0xfb, 0x94, 0xc3,
+	}
+	dataHashers = sync.Pool{
+		New: func() any { return blake3.New(Size, dataKey[:]) },
+	}
+	internalHashers = sync.Pool{
+		New: func() any { return blake3.New(Size, internalKey[:]) },
+	}
+	verificationHashers = sync.Pool{
+		New: func() any { return blake3.New(Size, verificationKey[:]) },
 	}
 )
 
@@ -147,36 +158,69 @@ func (h *Hash) UnmarshalJSON(data []byte) error {
 // uses this value for Merkle natural cuts and deduplication sampling.
 func (h Hash) LastUint64() uint64 { return binary.LittleEndian.Uint64(h[24:]) }
 
-func keyedHash(key [Size]byte, parts ...[]byte) Hash {
-	h := blake3.New(Size, key[:])
-	for _, part := range parts {
-		_, _ = h.Write(part)
+func smallKeyedHash(key [Size]byte, data []byte) Hash {
+	keyWords := blake3KeyWords(key)
+	node := guts.CompressChunk(data, &keyWords, 0, guts.FlagKeyedHash)
+	return rootNodeHash(node)
+}
+
+func blake3KeyWords(key [Size]byte) (words [8]uint32) {
+	for i := range words {
+		words[i] = binary.LittleEndian.Uint32(key[i*4:])
 	}
+	return words
+}
+
+func rootNodeHash(node guts.Node) Hash {
+	node.Flags |= guts.FlagRoot
+	block := guts.WordsToBytes(guts.CompressNode(node))
 	var out Hash
-	copy(out[:], h.Sum(nil))
+	copy(out[:], block[:Size])
+	return out
+}
+
+func pooledHash(pool *sync.Pool, data []byte) Hash {
+	h := pool.Get().(*blake3.Hasher)
+	_, _ = h.Write(data)
+	var out Hash
+	h.Sum(out[:0])
+	h.Reset()
+	pool.Put(h)
 	return out
 }
 
 // Chunk computes the Xet leaf hash of uncompressed chunk bytes.
-func Chunk(data []byte) Hash { return keyedHash(dataKey, data) }
+func Chunk(data []byte) Hash {
+	if len(data) <= guts.ChunkSize {
+		return smallKeyedHash(dataKey, data)
+	}
+	return pooledHash(&dataHashers, data)
+}
 
 // Internal computes the Xet internal-node hash of an already formatted node
 // message.
-func Internal(message []byte) Hash { return keyedHash(internalKey, message) }
+func Internal(message []byte) Hash {
+	if len(message) <= guts.ChunkSize {
+		return smallKeyedHash(internalKey, message)
+	}
+	return pooledHash(&internalHashers, message)
+}
 
 // Protect computes Xet's historically named HMAC operation. It is keyed
 // BLAKE3 over the raw hash bytes, not RFC HMAC.
-func Protect(hash Hash, key Hash) Hash { return keyedHash([Size]byte(key), hash[:]) }
+func Protect(hash Hash, key Hash) Hash { return smallKeyedHash([Size]byte(key), hash[:]) }
 
 // Verification computes the hash for an ordered reconstruction-term chunk
 // range.
 func Verification(hashes []Hash) Hash {
-	h := blake3.New(Size, verificationKey[:])
+	h := verificationHashers.Get().(*blake3.Hasher)
 	for i := range hashes {
 		_, _ = h.Write(hashes[i][:])
 	}
 	var out Hash
-	copy(out[:], h.Sum(nil))
+	h.Sum(out[:0])
+	h.Reset()
+	verificationHashers.Put(h)
 	return out
 }
 
@@ -202,18 +246,32 @@ func nextMergeCut(nodes []Node) int {
 	return end
 }
 
-func merge(nodes []Node) Node {
-	var b strings.Builder
-	b.Grow(len(nodes) * 88)
+func merge(nodes []Node, storage *[9 * 88]byte) Node {
+	// A merge contains at most nine lines, and each line is at most 88 bytes:
+	// 64 hash digits, " : ", 20 size digits, and a newline. Keep the message
+	// local and serialize directly rather than allocating intermediate strings.
+	message := storage[:0]
 	var size uint64
 	for _, n := range nodes {
-		b.WriteString(n.Hash.String())
-		b.WriteString(" : ")
-		fmt.Fprint(&b, n.Size)
-		b.WriteByte('\n')
+		message = appendHashText(message, n.Hash)
+		message = append(message, ' ', ':', ' ')
+		message = strconv.AppendUint(message, n.Size, 10)
+		message = append(message, '\n')
 		size += n.Size
 	}
-	return Node{Hash: Internal([]byte(b.String())), Size: size}
+	return Node{Hash: Internal(message), Size: size}
+}
+
+const lowerHex = "0123456789abcdef"
+
+func appendHashText(dst []byte, h Hash) []byte {
+	for limb := 0; limb < 4; limb++ {
+		for byteIndex := 7; byteIndex >= 0; byteIndex-- {
+			value := h[limb*8+byteIndex]
+			dst = append(dst, lowerHex[value>>4], lowerHex[value&0x0f])
+		}
+	}
+	return dst
 }
 
 // Aggregate computes Xet's variable-arity Merkle root. Empty input maps to
@@ -222,12 +280,16 @@ func Aggregate(nodes []Node) Hash {
 	if len(nodes) == 0 {
 		return Zero
 	}
+	if len(nodes) == 1 {
+		return nodes[0].Hash
+	}
 	level := append([]Node(nil), nodes...)
+	var mergeStorage [9 * 88]byte
 	for len(level) > 1 {
 		next := make([]Node, 0, (len(level)+1)/2)
 		for pos := 0; pos < len(level); {
 			cut := pos + nextMergeCut(level[pos:])
-			next = append(next, merge(level[pos:cut]))
+			next = append(next, merge(level[pos:cut], &mergeStorage))
 			pos = cut
 		}
 		level = next

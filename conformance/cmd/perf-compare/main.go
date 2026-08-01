@@ -25,7 +25,12 @@ import (
 const rustRevision = "7a267506b77b484688654c46079e3aec35394611"
 
 var operations = []string{
+	"chunk_owned",
+	"leaf_hash",
+	"merkle_hash",
 	"chunk_hash",
+	"xorb_encode_chunks_none",
+	"xorb_encode_chunks_lz4",
 	"xorb_encode_none",
 	"xorb_encode_lz4",
 	"xorb_decode_none",
@@ -220,7 +225,7 @@ func summarize(operation string, inputSize, iterations int, goRecords, rustRecor
 		firstGo.Scheme != firstRust.Scheme || firstGo.Implementation != "go-xet" || firstRust.Implementation != "rust-xet-core" {
 		return comparison{}, fmt.Errorf("Go/Rust %s semantics differ: Go=%+v Rust=%+v", operation, firstGo, firstRust)
 	}
-	if operation == "xorb_encode_none" && firstGo.SerializedSize != firstRust.SerializedSize {
+	if (operation == "xorb_encode_none" || operation == "xorb_encode_chunks_none") && firstGo.SerializedSize != firstRust.SerializedSize {
 		return comparison{}, fmt.Errorf("uncompressed xorb bytes differ in size: Go=%d Rust=%d", firstGo.SerializedSize, firstRust.SerializedSize)
 	}
 	for _, records := range [][]benchRecord{goRecords, rustRecords} {

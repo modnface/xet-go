@@ -63,14 +63,22 @@ For matched performance measurements, run:
 ```
 
 This builds optimized Go executables and the pinned optimized Rust oracle, then
-alternates five timed samples for chunking+hashing and forced none/LZ4 xorb
-encoding and decoding over the official 63.5 MB corpus. It writes a detailed
+alternates five timed samples for owned chunking, leaf hashing, Merkle hashing,
+combined chunking+hashing, prepared-chunk and end-to-end none/LZ4 xorb encoding,
+and none/LZ4 decoding over the official 63.5 MB corpus. It writes a detailed
 machine-readable report and a median-throughput table to
 `.cache/performance/latest.{json,md}`. `XET_PERF_ITERATIONS` and
 `XET_PERF_SAMPLES` control repetition; the first and second positional
 arguments select another input and output directory. Every sample must produce
 the same identity and chunk count in both implementations, and the none-encoded
 xorb must have the same serialized length, before timings are reported.
+
+The Go benchmark supports optional pprof output through
+`XET_PERF_CPU_PROFILE`, `XET_PERF_ALLOCS_PROFILE`, and
+`XET_PERF_HEAP_PROFILE`. Deterministic size/entropy fixtures can be generated
+with `go run ./conformance/cmd/perf-fixture`; its `-pattern` flag accepts
+`random`, `zero`, and `repeat`. See [../PERFORMANCE.md](../PERFORMANCE.md) for
+the recorded matrix, profile analysis, and realistic remaining gap.
 
 The local release gates are:
 

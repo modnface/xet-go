@@ -78,7 +78,9 @@ func (e *FormatError) Error() string {
 	return fmt.Sprintf("xorb: malformed data at offset %d: %s", e.Offset, e.Reason)
 }
 
-// Chunk describes one serialized and logical range in an Object.
+// Chunk describes one serialized and logical range in an Object. Data is owned
+// by the containing Object; for an uncompressed chunk it may share storage
+// with Object.Body.
 type Chunk struct {
 	Hash               xethash.Hash
 	Scheme             Scheme
@@ -187,9 +189,6 @@ func encode(chunks [][]byte, schemes []Scheme) (*Object, error) {
 	if len(chunks) > MaxChunks {
 		return nil, fmt.Errorf("xorb: %d chunks exceeds maximum %d", len(chunks), MaxChunks)
 	}
-	object := &Object{Chunks: make([]Chunk, 0, len(chunks))}
-	nodes := make([]xethash.Node, 0, len(chunks))
-	var body bytes.Buffer
 	var rawTotal uint64
 	for i, data := range chunks {
 		if len(data) == 0 || len(data) > chunker.MaxSize {
@@ -199,7 +198,12 @@ func encode(chunks [][]byte, schemes []Scheme) (*Object, error) {
 		if rawTotal > MaxRawSize {
 			return nil, fmt.Errorf("xorb: raw size %d exceeds maximum %d", rawTotal, MaxRawSize)
 		}
-		start := body.Len()
+	}
+	object := &Object{Chunks: make([]Chunk, 0, len(chunks))}
+	nodes := make([]xethash.Node, 0, len(chunks))
+	payloads := make([][]byte, len(chunks))
+	serializedTotal := 0
+	for i, data := range chunks {
 		used, payload, err := encodePayload(data, schemes[i])
 		if err != nil {
 			return nil, fmt.Errorf("xorb: chunk %d: %w", i, err)
@@ -207,14 +211,15 @@ func encode(chunks [][]byte, schemes []Scheme) (*Object, error) {
 		if len(payload) > maxUint24 {
 			return nil, fmt.Errorf("xorb: chunk %d serialized payload too large", i)
 		}
-		header := [HeaderSize]byte{0}
-		putUint24(header[1:4], uint32(len(payload)))
-		header[4] = byte(used)
-		putUint24(header[5:8], uint32(len(data)))
-		body.Write(header[:])
-		body.Write(payload)
+		start := serializedTotal
+		serializedTotal += HeaderSize + len(payload)
+		payloads[i] = payload
 
 		hash := xethash.Chunk(data)
+		var ownedData []byte
+		if used != None {
+			ownedData = append([]byte(nil), data...)
+		}
 		object.Chunks = append(object.Chunks, Chunk{
 			Hash:               hash,
 			Scheme:             used,
@@ -222,12 +227,24 @@ func encode(chunks [][]byte, schemes []Scheme) (*Object, error) {
 			SerializedLength:   uint32(HeaderSize + len(payload)),
 			UncompressedOffset: object.UncompressedSize,
 			UncompressedLength: uint32(len(data)),
-			Data:               append([]byte(nil), data...),
+			Data:               ownedData,
 		})
 		object.UncompressedSize += uint32(len(data))
 		nodes = append(nodes, xethash.Node{Hash: hash, Size: uint64(len(data))})
 	}
-	object.Body = body.Bytes()
+	body := make([]byte, serializedTotal)
+	for i, chunk := range object.Chunks {
+		start := int(chunk.SerializedOffset)
+		header := body[start : start+HeaderSize]
+		putUint24(header[1:4], uint32(len(payloads[i])))
+		header[4] = byte(chunk.Scheme)
+		putUint24(header[5:8], chunk.UncompressedLength)
+		copy(body[start+HeaderSize:], payloads[i])
+		if chunk.Scheme == None {
+			object.Chunks[i].Data = body[start+HeaderSize : start+HeaderSize+len(payloads[i])]
+		}
+	}
+	object.Body = body
 	object.FooterOffset = uint32(len(object.Body))
 	object.Hash = xethash.Xorb(nodes)
 	return object, nil
@@ -315,10 +332,11 @@ func Decode(body []byte) (*Object, error) {
 	if len(body) == 0 {
 		return nil, &FormatError{Reason: "empty object"}
 	}
-	parseBody := body
-	legacy := len(body) >= len(legacyTrailer) && bytes.Equal(body[len(body)-len(legacyTrailer):], legacyTrailer[:])
+	ownedBody := append([]byte(nil), body...)
+	parseBody := ownedBody
+	legacy := len(ownedBody) >= len(legacyTrailer) && bytes.Equal(ownedBody[len(ownedBody)-len(legacyTrailer):], legacyTrailer[:])
 	if legacy {
-		parseBody = body[:len(body)-len(legacyTrailer)]
+		parseBody = ownedBody[:len(ownedBody)-len(legacyTrailer)]
 		if len(parseBody) == 0 {
 			return nil, &FormatError{Reason: "legacy trailer has no content"}
 		}
@@ -331,7 +349,7 @@ func Decode(body []byte) (*Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	object.Body = append([]byte(nil), body...)
+	object.Body = ownedBody
 	object.FooterOffset = uint32(contentEnd)
 	object.Footer = footer
 	object.LegacyTrailer = legacy
@@ -347,7 +365,7 @@ func decodeContent(body []byte) (*Object, error) {
 	if len(body) == 0 {
 		return nil, &FormatError{Reason: "empty content section"}
 	}
-	object := &Object{Body: append([]byte(nil), body...), FooterOffset: uint32(len(body))}
+	object := &Object{Body: body, FooterOffset: uint32(len(body))}
 	nodes := make([]xethash.Node, 0, 1024)
 	for offset := 0; offset < len(body); {
 		if len(object.Chunks) == MaxChunks {
@@ -531,7 +549,7 @@ func encodePayload(data []byte, requested Scheme) (Scheme, []byte, error) {
 		return 0, nil, fmt.Errorf("unknown compression scheme %d", requested)
 	}
 	if requested == None {
-		return None, append([]byte(nil), data...), nil
+		return None, data, nil
 	}
 	if requested == Auto {
 		return encodePayload(data, chooseCompression(data))
@@ -545,7 +563,7 @@ func encodePayload(data []byte, requested Scheme) (Scheme, []byte, error) {
 		return 0, nil, err
 	}
 	if len(compressed) >= len(data) {
-		return None, append([]byte(nil), data...), nil
+		return None, data, nil
 	}
 	return requested, compressed, nil
 }
@@ -601,18 +619,35 @@ func decodePayload(payload []byte, scheme Scheme, want int) ([]byte, error) {
 		if len(payload) != want {
 			return nil, fmt.Errorf("uncompressed payload length %d, want %d", len(payload), want)
 		}
-		return append([]byte(nil), payload...), nil
+		return payload, nil
 	}
 	if scheme != LZ4 && scheme != BG4LZ4 {
 		return nil, fmt.Errorf("unknown compression scheme %d", scheme)
 	}
 	r := lz4.NewReader(bytes.NewReader(payload))
-	data, err := io.ReadAll(io.LimitReader(r, int64(want)+1))
+	data := make([]byte, want)
+	n, err := io.ReadFull(r, data)
 	if err != nil {
 		return nil, fmt.Errorf("invalid LZ4 frame: %w", err)
 	}
-	if len(data) != want {
-		return nil, fmt.Errorf("decompressed length %d, want %d", len(data), want)
+	var extra [1]byte
+	for emptyReads := 0; ; emptyReads++ {
+		extraN, readErr := r.Read(extra[:])
+		if extraN != 0 {
+			return nil, fmt.Errorf("decompressed length exceeds %d", want)
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return nil, fmt.Errorf("invalid LZ4 frame: %w", readErr)
+		}
+		if emptyReads == 99 {
+			return nil, fmt.Errorf("invalid LZ4 frame: %w", io.ErrNoProgress)
+		}
+	}
+	if n != want {
+		return nil, fmt.Errorf("decompressed length %d, want %d", n, want)
 	}
 	if scheme == BG4LZ4 {
 		data = bg4Regroup(data)

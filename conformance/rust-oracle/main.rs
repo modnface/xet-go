@@ -135,7 +135,7 @@ fn calculate(data: &[u8]) -> CorpusRecord {
     }
 }
 
-fn encode_benchmark_xorb(data: &[u8], scheme: CompressionScheme) -> (Vec<u8>, String, usize) {
+fn encode_benchmark_xorb(data: &[u8], scheme: CompressionScheme) -> (Vec<u8>, DataHash, usize) {
     let chunks = Chunker::default().next_block(data, true);
     let nodes: Vec<_> = chunks
         .iter()
@@ -145,10 +145,47 @@ fn encode_benchmark_xorb(data: &[u8], scheme: CompressionScheme) -> (Vec<u8>, St
     for chunk in &chunks {
         serialize_chunk(&chunk.data, &mut body, scheme).unwrap();
     }
-    (body, xorb_hash(&nodes).to_string(), chunks.len())
+    (body, xorb_hash(&nodes), chunks.len())
 }
 
-fn decode_benchmark_xorb(body: &[u8]) -> (String, usize) {
+fn encode_benchmark_chunks(
+    chunks: &[Vec<u8>],
+    scheme: CompressionScheme,
+) -> (Vec<u8>, DataHash, usize) {
+    let nodes: Vec<_> = chunks
+        .iter()
+        .map(|chunk| (compute_data_hash(chunk), chunk.len() as u64))
+        .collect();
+    let mut body = Vec::new();
+    for chunk in chunks {
+        serialize_chunk(chunk, &mut body, scheme).unwrap();
+    }
+    (body, xorb_hash(&nodes), chunks.len())
+}
+
+fn chunk_owned(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut chunker = Chunker::default();
+    let mut chunks = Vec::with_capacity(data.len() / (64 << 10) + 1);
+    let mut position = 0;
+    while position < data.len() {
+        let relative_end = chunker
+            .next_boundary(&data[position..])
+            .unwrap_or(data.len() - position);
+        let end = position + relative_end;
+        chunks.push(data[position..end].to_vec());
+        position = end;
+    }
+    chunks
+}
+
+fn hash_chunks(chunks: &[Vec<u8>]) -> Vec<(DataHash, u64)> {
+    chunks
+        .iter()
+        .map(|chunk| (compute_data_hash(chunk), chunk.len() as u64))
+        .collect()
+}
+
+fn decode_benchmark_xorb(body: &[u8]) -> (DataHash, usize) {
     let (decoded, boundaries) = deserialize_chunks(&mut Cursor::new(body)).unwrap();
     let nodes: Vec<_> = boundaries
         .windows(2)
@@ -161,42 +198,70 @@ fn decode_benchmark_xorb(body: &[u8]) -> (String, usize) {
             )
         })
         .collect();
-    (xorb_hash(&nodes).to_string(), nodes.len())
+    (xorb_hash(&nodes), nodes.len())
 }
 
 fn benchmark(data: &[u8], operation: &str, iterations: usize) -> BenchRecord {
     assert!(iterations > 0);
-    let mut identity = String::new();
+    let mut identity = DataHash::default();
     let mut serialized_size = 0usize;
     let mut chunks = 0usize;
-    let mut scheme_name = None;
+    let scheme_name = match operation {
+        "xorb_encode_none" | "xorb_encode_chunks_none" | "xorb_decode_none" => {
+            Some("none".to_string())
+        }
+        "xorb_encode_lz4" | "xorb_encode_chunks_lz4" | "xorb_decode_lz4" => Some("lz4".to_string()),
+        _ => None,
+    };
+
+    let prepared_chunks = match operation {
+        "chunk_owned"
+        | "leaf_hash"
+        | "merkle_hash"
+        | "xorb_encode_chunks_none"
+        | "xorb_encode_chunks_lz4" => Some(chunk_owned(data)),
+        _ => None,
+    };
+    let prepared_nodes = prepared_chunks.as_ref().map(|chunks| hash_chunks(chunks));
+    if let Some(nodes) = prepared_nodes.as_ref() {
+        identity = file_hash(nodes);
+        chunks = nodes.len();
+    }
 
     let decode_body = match operation {
-        "xorb_decode_none" => {
-            scheme_name = Some("none".to_string());
-            Some(encode_benchmark_xorb(data, CompressionScheme::None).0)
-        }
-        "xorb_decode_lz4" => {
-            scheme_name = Some("lz4".to_string());
-            Some(encode_benchmark_xorb(data, CompressionScheme::LZ4).0)
-        }
+        "xorb_decode_none" => Some(encode_benchmark_xorb(data, CompressionScheme::None).0),
+        "xorb_decode_lz4" => Some(encode_benchmark_xorb(data, CompressionScheme::LZ4).0),
         _ => None,
     };
 
     let start = Instant::now();
     for _ in 0..iterations {
         match operation {
+            "chunk_owned" => {
+                let result = chunk_owned(data);
+                chunks = result.len();
+                std::hint::black_box(result);
+            }
+            "leaf_hash" => {
+                let result = hash_chunks(prepared_chunks.as_ref().unwrap());
+                chunks = result.len();
+                std::hint::black_box(result);
+            }
+            "merkle_hash" => {
+                let nodes = prepared_nodes.as_ref().unwrap();
+                identity = file_hash(nodes);
+                chunks = nodes.len();
+            }
             "chunk_hash" => {
                 let result = Chunker::default().next_block(data, true);
                 let nodes: Vec<_> = result
                     .iter()
                     .map(|chunk| (chunk.hash, chunk.data.len() as u64))
                     .collect();
-                identity = file_hash(&nodes).to_string();
+                identity = file_hash(&nodes);
                 chunks = result.len();
             }
             "xorb_encode_none" => {
-                scheme_name = Some("none".to_string());
                 let result = encode_benchmark_xorb(data, CompressionScheme::None);
                 serialized_size = result.0.len();
                 identity = result.1;
@@ -204,8 +269,19 @@ fn benchmark(data: &[u8], operation: &str, iterations: usize) -> BenchRecord {
                 std::hint::black_box(result.0);
             }
             "xorb_encode_lz4" => {
-                scheme_name = Some("lz4".to_string());
                 let result = encode_benchmark_xorb(data, CompressionScheme::LZ4);
+                serialized_size = result.0.len();
+                identity = result.1;
+                chunks = result.2;
+                std::hint::black_box(result.0);
+            }
+            "xorb_encode_chunks_none" | "xorb_encode_chunks_lz4" => {
+                let scheme = if operation == "xorb_encode_chunks_none" {
+                    CompressionScheme::None
+                } else {
+                    CompressionScheme::LZ4
+                };
+                let result = encode_benchmark_chunks(prepared_chunks.as_ref().unwrap(), scheme);
                 serialized_size = result.0.len();
                 identity = result.1;
                 chunks = result.2;
@@ -232,7 +308,7 @@ fn benchmark(data: &[u8], operation: &str, iterations: usize) -> BenchRecord {
         iterations,
         elapsed_ns: elapsed.as_nanos().try_into().unwrap(),
         bytes_per_second: data.len() as f64 * iterations as f64 / elapsed.as_secs_f64(),
-        identity,
+        identity: identity.to_string(),
         serialized_size,
         chunks,
     }

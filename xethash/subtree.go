@@ -256,9 +256,10 @@ func splitAndPromote(nodes []Node, atStart, atEnd bool) (int, []Node, int) {
 	}
 	mergeable := nodes[stableStart:stableEnd]
 	promoted := make([]Node, 0, (len(mergeable)+1)/2)
+	var mergeStorage [9 * 88]byte
 	for position := 0; position < len(mergeable); {
 		cut := position + nextMergeCut(mergeable[position:])
-		promoted = append(promoted, merge(mergeable[position:cut]))
+		promoted = append(promoted, merge(mergeable[position:cut], &mergeStorage))
 		position = cut
 	}
 	return stableStart, promoted, len(nodes) - stableEnd

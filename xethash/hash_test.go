@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+
+	"lukechampine.com/blake3"
 )
 
 func TestHashCanonicalText(t *testing.T) {
@@ -145,6 +147,25 @@ func TestVerificationOrderMatters(t *testing.T) {
 	b := Chunk([]byte("b"))
 	if Verification([]Hash{a, b}) == Verification([]Hash{b, a}) {
 		t.Fatal("verification hash ignored chunk order")
+	}
+}
+
+func TestChunkMatchesStreamingBLAKE3AtTreeBoundaries(t *testing.T) {
+	for _, size := range []int{
+		0, 1, 63, 64, 65, 1023, 1024, 1025, 2047, 2048,
+		8191, 8192, 65535, 65536, 131071, 131072, 131073,
+	} {
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte(i*131 + i>>8)
+		}
+		hasher := blake3.New(Size, dataKey[:])
+		_, _ = hasher.Write(data)
+		var want Hash
+		copy(want[:], hasher.Sum(nil))
+		if got := Chunk(data); got != want {
+			t.Fatalf("size %d: Chunk = %s, streaming BLAKE3 = %s", size, got, want)
+		}
 	}
 }
 
