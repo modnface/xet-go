@@ -138,24 +138,53 @@ func (w *Writer) Write(data []byte) (int, error) {
 	if w.err != nil {
 		return 0, w.err
 	}
-	for i, value := range data {
-		if i&0x3fff == 0 {
-			if err := w.ctx.Err(); err != nil {
-				w.err = err
-				return i, err
-			}
+	const contextCheckInterval = 16 << 10
+	for consumed := 0; consumed < len(data); {
+		if err := w.ctx.Err(); err != nil {
+			w.err = err
+			return consumed, err
 		}
-		w.state = (w.state << 1) + gearTable[value]
-		w.chunkBuf = append(w.chunkBuf, value)
-		if len(w.chunkBuf) == w.cfg.MaxSize ||
-			(len(w.chunkBuf) >= w.cfg.MinSize && w.state&w.mask == 0) {
-			if err := w.emitChunk(); err != nil {
-				w.err = err
-				return i + 1, err
+		checkpoint := consumed + min(contextCheckInterval, len(data)-consumed)
+		for consumed < checkpoint {
+			n, state, boundary := scanBoundary(
+				data[consumed:checkpoint], w.state, len(w.chunkBuf),
+				w.cfg.MinSize, w.cfg.MaxSize, w.mask,
+			)
+			w.state = state
+			w.chunkBuf = append(w.chunkBuf, data[consumed:consumed+n]...)
+			consumed += n
+			if boundary {
+				if err := w.emitChunk(); err != nil {
+					w.err = err
+					return consumed, err
+				}
 			}
 		}
 	}
 	return len(data), nil
+}
+
+func scanBoundary(data []byte, state uint64, size, minimum, maximum int, mask uint64) (int, uint64, bool) {
+	limit := min(len(data), maximum-size)
+	start := 0
+	// A boundary is impossible before minimum. GearHash's 64-bit shift
+	// recurrence only depends on the preceding 64 bytes, so earlier bytes can
+	// be skipped while retaining 65 bytes before the first eligible boundary.
+	// If the current write ends in the skipped region, keeping state unchanged
+	// is safe: it will have shifted out before a boundary can be considered.
+	const hashWindowSize = 64
+	if size+hashWindowSize < minimum {
+		start = min(minimum-size-hashWindowSize-1, limit)
+	}
+	for relative, value := range data[start:limit] {
+		i := start + relative
+		state = (state << 1) + gearTable[value]
+		currentSize := size + i + 1
+		if currentSize == maximum || (currentSize >= minimum && state&mask == 0) {
+			return i + 1, state, true
+		}
+	}
+	return limit, state, false
 }
 
 func (w *Writer) Close() error {
@@ -189,23 +218,24 @@ func (w *Writer) emitChunk() error {
 // Bytes chunks an in-memory value and returns independently owned chunks.
 func Bytes(data []byte) []Chunk {
 	chunks := make([]Chunk, 0, len(data)/TargetSize+1)
-	r := bytesReader(data)
-	_ = Split(&r, func(c Chunk) error {
-		chunks = append(chunks, c)
-		return nil
-	})
-	return chunks
-}
-
-type bytesReader []byte
-
-func (r *bytesReader) Read(p []byte) (int, error) {
-	if len(*r) == 0 {
-		return 0, io.EOF
+	start := 0
+	state := uint64(0)
+	for start < len(data) {
+		size := 0
+		for {
+			n, nextState, boundary := scanBoundary(data[start+size:], state, size, MinSize, MaxSize, Mask)
+			size += n
+			state = nextState
+			if boundary || start+size == len(data) {
+				owned := append([]byte(nil), data[start:start+size]...)
+				chunks = append(chunks, Chunk{Offset: int64(start), Data: owned})
+				start += size
+				state = 0
+				break
+			}
+		}
 	}
-	n := copy(p, *r)
-	*r = (*r)[n:]
-	return n, nil
+	return chunks
 }
 
 func normalize(cfg Config) (Config, uint64, error) {

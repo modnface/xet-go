@@ -56,6 +56,42 @@ func TestSchemesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDecodeOwnsInputWithUncompressedViews(t *testing.T) {
+	encoded, err := Encode([][]byte{[]byte("owned decoded payload")}, None)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := append([]byte(nil), encoded.Body...)
+	decoded, err := Decode(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBody := append([]byte(nil), decoded.Body...)
+	wantData := append([]byte(nil), decoded.Chunks[0].Data...)
+	for i := range input {
+		input[i] ^= 0xff
+	}
+	if !bytes.Equal(decoded.Body, wantBody) || !bytes.Equal(decoded.Chunks[0].Data, wantData) {
+		t.Fatal("decoded object changed when caller input was mutated")
+	}
+}
+
+func TestEncodeOwnsInputWithUncompressedViews(t *testing.T) {
+	input := []byte("owned encoded payload")
+	encoded, err := Encode([][]byte{input}, None)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBody := append([]byte(nil), encoded.Body...)
+	wantData := append([]byte(nil), encoded.Chunks[0].Data...)
+	for i := range input {
+		input[i] ^= 0xff
+	}
+	if !bytes.Equal(encoded.Body, wantBody) || !bytes.Equal(encoded.Chunks[0].Data, wantData) {
+		t.Fatal("encoded object changed when caller input was mutated")
+	}
+}
+
 func TestCompleteV1RoundTrip(t *testing.T) {
 	object, err := Encode([][]byte{
 		bytes.Repeat([]byte("xet-complete"), 1_000),
