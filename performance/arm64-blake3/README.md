@@ -4,6 +4,10 @@ These compact artifacts back `PERFORMANCE.md`. They were captured on
 2026-08-01 from the official 63,527,244-byte CSV using Go 1.26.5, Rust 1.95.0,
 and pinned xet-core commit `7a267506b77b484688654c46079e3aec35394611`.
 
+- `environment.txt`: sanitized host, toolchain, build, dependency, and fixture
+  metadata (no machine serial or hardware UUID).
+- `PROFILING.md`: exact reproducible profile commands, artifact map, profiler
+  separation, and native-tool limitations.
 - `end-to-end.tsv`: seven-sample median before/final/Rust comparison for every
   matched operation. Min/max ranges remain in the raw JSON.
 - `blake3-one-shot.tsv`: matched 256 MiB-per-sample fixed-message experiment.
@@ -29,6 +33,7 @@ investigation worktree they are under:
 - `.cache/performance-investigation/disassembly/`
 - `.cache/performance-investigation/goforge-everywhere/`
 - `.cache/performance-investigation/fork-unified-profiles/`
+- `.cache/performance-investigation/fork-unified-recapture/`
 
 The profile directories contain pprof CPU/allocation/block profiles, Go
 execution traces, Samply profiles, Instruments Time Profiler and System Trace

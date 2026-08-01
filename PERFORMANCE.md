@@ -294,3 +294,8 @@ The Go end-to-end binary accepts `XET_PERF_CPU_PROFILE`,
 and raw-artifact manifest are in `performance/arm64-blake3/`. CI runs a
 one-sample semantic performance smoke test but does not enforce ratios because
 shared-runner throughput is unstable.
+
+The exact pprof, execution-trace, `/usr/bin/time -l`, Samply, Instruments,
+native process-inspection, and disassembly commands are in
+`performance/arm64-blake3/PROFILING.md`. A sanitized machine and toolchain
+snapshot is in `performance/arm64-blake3/environment.txt`.

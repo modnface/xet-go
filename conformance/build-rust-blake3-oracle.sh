@@ -3,7 +3,8 @@ set -euo pipefail
 
 readonly REFERENCE_COMMIT=7a267506b77b484688654c46079e3aec35394611
 readonly RUST_TOOLCHAIN=1.95.0
-readonly ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly ROOT_DIR
 readonly ORACLE_ROOT="${ROOT_DIR}/.oracle"
 readonly XET_CORE_DIR="${ORACLE_ROOT}/xet-core"
 
@@ -15,8 +16,11 @@ git -C "${XET_CORE_DIR}" fetch origin "${REFERENCE_COMMIT}"
 git -C "${XET_CORE_DIR}" checkout --detach "${REFERENCE_COMMIT}"
 
 mkdir -p "${XET_CORE_DIR}/xet_core_structures/examples"
-cp "${ROOT_DIR}/conformance/rust-oracle/blake3_perf.rs" \
-  "${XET_CORE_DIR}/xet_core_structures/examples/xet_go_rust_blake3_oracle.rs"
+readonly ORACLE_SOURCE="${ROOT_DIR}/conformance/rust-oracle/blake3_perf.rs"
+readonly ORACLE_DESTINATION="${XET_CORE_DIR}/xet_core_structures/examples/xet_go_rust_blake3_oracle.rs"
+if ! cmp -s "${ORACLE_SOURCE}" "${ORACLE_DESTINATION}"; then
+  cp "${ORACLE_SOURCE}" "${ORACLE_DESTINATION}"
+fi
 cargo "+${RUST_TOOLCHAIN}" build \
   --manifest-path "${XET_CORE_DIR}/Cargo.toml" \
   --locked \
