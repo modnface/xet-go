@@ -1,0 +1,13 @@
+benchmark	current_ns_op	universal_goforge_ns_op	slowdown	current_bytes_op	universal_bytes_op	current_allocs_op	universal_allocs_op
+chunk_32_bytes	97.2	157.4	1.619	0	0	0	0
+chunk_64_bytes	97.52	158.9	1.629	0	0	0	0
+chunk_256_bytes	285.6	504.6	1.767	0	0	0	0
+chunk_792_bytes	840.0	1559	1.856	0	0	0	0
+chunk_1024_bytes	1026	1906	1.858	0	0	0	0
+protect_32_bytes	99.85	228.5	2.288	0	32	0	1
+verification_1_hash	106.9	156.8	1.467	32	0	1	0
+verification_16_hashes	629.4	1038	1.649	32	0	1	0
+verification_1024_hashes	38997	68350	1.753	32	0	1	0
+merkle_1024_chunks	144629	228424	1.579	67536	67724	7	8
+file_1_chunk	105.7	229.2	2.169	0	32	0	1
+subtree_merge_1000000_chunks	24055040	38168670	1.587	56435374	58717046	30081	35156

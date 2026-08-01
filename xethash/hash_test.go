@@ -3,6 +3,7 @@ package xethash
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
@@ -328,5 +329,44 @@ func BenchmarkMerkle1024Chunks(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = File(nodes)
+	}
+}
+
+func BenchmarkSmallKeyedHashes(b *testing.B) {
+	for _, size := range []int{32, 64, 256, 792, 1024} {
+		data := make([]byte, size)
+		b.Run(fmt.Sprintf("chunk-%d", size), func(b *testing.B) {
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = Chunk(data)
+			}
+		})
+		b.Run(fmt.Sprintf("internal-%d", size), func(b *testing.B) {
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = Internal(data)
+			}
+		})
+	}
+	b.Run("protect", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = Protect(Hash{1}, Hash{2})
+		}
+	})
+}
+
+func BenchmarkVerificationHashes(b *testing.B) {
+	for _, count := range []int{1, 16, 1024} {
+		hashes := make([]Hash, count)
+		b.Run(fmt.Sprintf("hashes-%d", count), func(b *testing.B) {
+			b.SetBytes(int64(count * Size))
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = Verification(hashes)
+			}
+		})
 	}
 }

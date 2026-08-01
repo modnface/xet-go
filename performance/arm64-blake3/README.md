@@ -9,6 +9,8 @@ and pinned xet-core commit `7a267506b77b484688654c46079e3aec35394611`.
 - `blake3-one-shot.tsv`: matched 256 MiB-per-sample fixed-message experiment.
 - `context-switches.tsv`: every fresh baseline and final 20-pass sample.
 - `worker-scaling.tsv`: three-sample final `GOMAXPROCS` sweep.
+- `universal-goforge.tsv`: the rejected attempt to use goforge for every
+  keyed BLAKE3 operation, including small-hash and subtree regressions.
 
 Large machine-specific captures are intentionally not committed. In the
 investigation worktree they are under:
@@ -22,6 +24,7 @@ investigation worktree they are under:
 - `.cache/performance-investigation/profiles-baseline/`
 - `.cache/performance-investigation/profiles-optimized/`
 - `.cache/performance-investigation/disassembly/`
+- `.cache/performance-investigation/goforge-everywhere/`
 
 The profile directories contain pprof CPU/allocation/block profiles, Go
 execution traces, Samply profiles, Instruments Time Profiler and System Trace

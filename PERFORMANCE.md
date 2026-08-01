@@ -181,6 +181,40 @@ tests and `govulncheck` are gates, and every Xet boundary size is compared with
 the official Rust oracle. The Go 1.24 requirement was accepted only after the
 dependency-free and older-toolchain alternatives were measured.
 
+### Why both Go BLAKE3 dependencies remain
+
+A follow-up prototype replaced every `lukechampine.com/blake3` use with
+`goforge.dev/blake3sum` and enabled goforge's architecture dispatch on every
+platform. The code compiled, focused protocol tests passed, and the matched
+end-to-end comparator produced identical Xet identities. Hashing-inclusive
+xorb Go/Rust ratios remained within normal run-to-run variation.
+
+It was not retained because it failed the "as fast" requirement for small
+keyed operations. The goforge public API requires `Hasher.Write` plus
+`Hasher.Sum` for a keyed one-shot hash; its lower-level keyed compression
+kernel is not exported. The existing implementation can call
+`lukechampine/blake3/guts` directly for messages up to 1,024 bytes. On this
+ARM64 host, representative median latency changed as follows:
+
+| Operation | Current | Universal goforge | Regression |
+|---|---:|---:|---:|
+| Keyed 32-byte chunk | 97.2 ns | 157.4 ns | 1.62x |
+| Keyed 792-byte internal node | 840 ns | 1,559 ns | 1.86x |
+| File protection hash | 99.9 ns | 228.5 ns | 2.29x |
+| Verification over 1,024 hashes | 39.0 us | 68.4 us | 1.75x |
+| Merkle root over 1,024 chunks | 144.6 us | 228.4 us | 1.58x |
+| Compact-subtree merge over one million chunks | 24.1 ms | 38.2 ms | 1.59x |
+
+Pooling the goforge hasher and output buffer eliminated nearly all new
+allocations but did not remove the latency gap. Parallelizing independent
+Merkle groups made an ordinary 796-leaf file hash faster, but could not help
+the sequential compact-subtree path and added substantial allocation and
+scheduler complexity. The experiment was therefore rejected. Goforge remains
+the ARM64 data-leaf backend where NEON and batching provide the measured gain;
+lukechampine remains the zero-allocation small keyed, internal, protection, and
+verification backend. Detailed samples are in
+`performance/arm64-blake3/universal-goforge.tsv`.
+
 ## Validation
 
 The final code passed:
