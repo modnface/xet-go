@@ -173,7 +173,7 @@ collapse: at 10 callers the retained encode/decode prototypes reached about
 | `github.com/zeebo/blake3` v0.2.4 | Mature Go 1.18 dependency; no ARM64 SIMD; about 954 MiB/s sequential and 9.5 GiB/s over the official chunk batch | Rejected: weaker ARM64 result |
 | `goforge.dev/blake3sum` v1.0.0 | Go 1.24, CGO-free ARM64 NEON; about 1,598 MiB/s sequential distribution and 14.5 GiB/s batched | Retained with explicit version pin, compatibility tests, and conformance gates |
 | CGO/Rust or C BLAKE3 | Mature SIMD implementations | Rejected: violates the module's CGO-free deployment contract |
-| New hand-written assembly/fork | Could target more message sizes | Rejected for complexity and long-term maintenance risk after a conforming dependency met the end-to-end goal |
+| Luke-based unified fork | Existing AVX2/AVX-512 and zero-allocation small path plus attributed GoForge ARM64 NEON | Locally validated; publication and final integration pending |
 
 The retained dependency is newer and has a shorter release history than the
 other Go candidates. That risk is why the version is pinned, its own package
@@ -214,6 +214,39 @@ the ARM64 data-leaf backend where NEON and batching provide the measured gain;
 lukechampine remains the zero-allocation small keyed, internal, protection, and
 verification backend. Detailed samples are in
 `performance/arm64-blake3/universal-goforge.tsv`.
+
+### Unified Luke-based fork prototype
+
+A local fork starting from `lukechampine.com/blake3` v1.4.1 combines its
+existing portable, AVX2, and AVX-512 paths with the attributed GoForge ARM64
+NEON four-chunk kernel. The fork keeps the original MIT license, includes the
+GoForge MIT license and a third-party notice, and exposes a zero-allocation
+keyed one-shot API so Xet no longer imports the internal `guts` package. With
+the prototype integrated, Xet imports one BLAKE3 module and no longer needs
+architecture-tagged data-hash files.
+
+The ARM64 dispatcher deliberately retains the portable scalar kernel for a
+single compression node. Although the imported single-node NEON kernel is
+bit-exact, it was slower for the small keyed operations that dominate Merkle,
+protection, and verification work on this Apple M4 Pro. NEON is selected for
+four independent full chunks, where it produces the measured gain. The AMD64
+AVX2/AVX-512 sources are byte-for-byte unchanged from upstream Luke; 386 and
+unsupported SIMD cases retain the portable implementation.
+
+Nine alternating fresh-process comparisons against the retained split
+implementation found the fork within 0.14% on owned chunking and 0.4% to 12.0%
+faster on every other pipeline median. Median involuntary context switches
+fell from 4,088 to 3,848 while throughput was unchanged. Allocations were
+effectively equal. The fork also passed its upstream and differential SIMD
+tests, race detector, vet, Go 1.22/1.24 compatibility checks, and cross-builds;
+the integrated Xet prototype passed the full conformance, coverage, fuzz,
+race, vet, and cross-platform gates.
+
+An attempted follow-up removed the fork's 16 KiB eigentree padding allocation.
+It substantially reduced allocated bytes, but representative pipeline medians
+regressed by 1.3% to 8.9%, so that change was reverted. The complete comparison
+and rejected-optimization samples are in
+`performance/arm64-blake3/fork-unified.tsv`.
 
 ## Validation
 

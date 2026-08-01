@@ -11,6 +11,9 @@ and pinned xet-core commit `7a267506b77b484688654c46079e3aec35394611`.
 - `worker-scaling.tsv`: three-sample final `GOMAXPROCS` sweep.
 - `universal-goforge.tsv`: the rejected attempt to use goforge for every
   keyed BLAKE3 operation, including small-hash and subtree regressions.
+- `fork-unified.tsv`: the Luke-based unified-fork comparison against the
+  retained split implementation, scheduler samples, and the rejected
+  no-padding eigentree experiment.
 
 Large machine-specific captures are intentionally not committed. In the
 investigation worktree they are under:
@@ -25,6 +28,7 @@ investigation worktree they are under:
 - `.cache/performance-investigation/profiles-optimized/`
 - `.cache/performance-investigation/disassembly/`
 - `.cache/performance-investigation/goforge-everywhere/`
+- `.cache/performance-investigation/fork-unified-profiles/`
 
 The profile directories contain pprof CPU/allocation/block profiles, Go
 execution traces, Samply profiles, Instruments Time Profiler and System Trace
