@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"sort"
 
+	"github.com/jacobwoliver/xet-go/chunker"
 	"github.com/jacobwoliver/xet-go/xetcas"
 	"github.com/jacobwoliver/xet-go/xethash"
 	"github.com/jacobwoliver/xet-go/xorb"
@@ -31,6 +33,9 @@ type DownloadReport struct {
 func (c *Client) Download(ctx context.Context, file FileInfo, dst io.Writer) (DownloadReport, error) {
 	if dst == nil {
 		return DownloadReport{}, errors.New("xet: nil download writer")
+	}
+	if file.Size > c.options.MaxReconstructionWindow {
+		return c.downloadWindowed(ctx, file, dst)
 	}
 	return c.download(ctx, file, nil, dst)
 }
@@ -59,6 +64,16 @@ func (c *Client) download(
 	requested *xetcas.FileRange,
 	dst io.Writer,
 ) (DownloadReport, error) {
+	return c.downloadWithProgressBase(ctx, file, requested, dst, 0)
+}
+
+func (c *Client) downloadWithProgressBase(
+	ctx context.Context,
+	file FileInfo,
+	requested *xetcas.FileRange,
+	dst io.Writer,
+	progressBase uint64,
+) (DownloadReport, error) {
 	if ctx == nil {
 		return DownloadReport{}, errors.New("xet: nil download context")
 	}
@@ -68,7 +83,7 @@ func (c *Client) download(
 			return DownloadReport{}, err
 		}
 		tracked := &countingWriter{dst: dst}
-		report, err := c.executeReconstruction(ctx, file, requested, reconstruction, tracked)
+		report, err := c.executeReconstruction(ctx, file, requested, reconstruction, tracked, progressBase)
 		if errors.Is(err, xetcas.ErrSignedURLExpired) && signedAttempt == 0 && tracked.written == 0 {
 			continue
 		}
@@ -121,6 +136,7 @@ func (c *Client) executeReconstruction(
 	requested *xetcas.FileRange,
 	reconstruction *xetcas.Reconstruction,
 	dst io.Writer,
+	progressBase uint64,
 ) (DownloadReport, error) {
 	if err := reconstruction.Validate(); err != nil {
 		return DownloadReport{}, err
@@ -225,7 +241,10 @@ func (c *Client) executeReconstruction(
 			}
 			nextTerm++
 			if c.options.Progress != nil {
-				c.options.Progress(Progress{Phase: ProgressDownloading, File: file.Hash, Completed: writer.written})
+				c.options.Progress(Progress{
+					Phase: ProgressDownloading, File: file.Hash,
+					Completed: progressBase + writer.written, Total: file.Size,
+				})
 			}
 		}
 	}
@@ -254,6 +273,90 @@ func (c *Client) executeReconstruction(
 		}
 	}
 	return report, nil
+}
+
+func (c *Client) downloadWindowed(ctx context.Context, file FileInfo, dst io.Writer) (DownloadReport, error) {
+	verifier, err := newVerifyingWriter(ctx, dst)
+	if err != nil {
+		return DownloadReport{}, err
+	}
+	var report DownloadReport
+	for start := uint64(0); start < file.Size; {
+		end := start + min(c.options.MaxReconstructionWindow, file.Size-start)
+		requested := xetcas.FileRange{Start: start, End: end}
+		partial, err := c.downloadWithProgressBase(ctx, FileInfo{Hash: file.Hash}, &requested, verifier, start)
+		report.LogicalBytes += partial.LogicalBytes
+		report.FetchedBytes += partial.FetchedBytes
+		report.FetchedRanges += partial.FetchedRanges
+		report.CacheHitBytes += partial.CacheHitBytes
+		report.CacheHitRanges += partial.CacheHitRanges
+		if err != nil {
+			return report, err
+		}
+		start = end
+	}
+	if err := verifier.Close(); err != nil {
+		return report, err
+	}
+	if verifier.written != file.Size {
+		return report, fmt.Errorf("xet: reconstructed %d bytes, expected %d", verifier.written, file.Size)
+	}
+	if root := xethash.File(verifier.nodes); root != file.Hash {
+		return report, fmt.Errorf("xet: reconstructed file hash %s, want %s", root, file.Hash)
+	}
+	report.WholeFileHash = true
+	if file.SHA256 != ([sha256.Size]byte{}) {
+		var computed [sha256.Size]byte
+		copy(computed[:], verifier.sha.Sum(nil))
+		if computed != file.SHA256 {
+			return report, errors.New("xet: reconstructed SHA-256 mismatch")
+		}
+		report.SHA256Verified = true
+	}
+	return report, nil
+}
+
+type verifyingWriter struct {
+	dst      io.Writer
+	sha      hash.Hash
+	splitter *chunker.Writer
+	nodes    []xethash.Node
+	written  uint64
+}
+
+func newVerifyingWriter(ctx context.Context, dst io.Writer) (*verifyingWriter, error) {
+	w := &verifyingWriter{dst: dst, sha: sha256.New()}
+	splitter, err := chunker.NewWriter(ctx, chunker.DefaultConfig, func(value chunker.Chunk) error {
+		w.nodes = append(w.nodes, xethash.Node{Hash: xethash.Chunk(value.Data), Size: uint64(len(value.Data))})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	w.splitter = splitter
+	return w, nil
+}
+
+func (w *verifyingWriter) Write(data []byte) (int, error) {
+	n, err := w.dst.Write(data)
+	if n < 0 || n > len(data) {
+		return 0, errors.New("xet: download writer returned invalid count")
+	}
+	if n != 0 {
+		_, _ = w.sha.Write(data[:n])
+		if _, splitErr := w.splitter.Write(data[:n]); splitErr != nil && err == nil {
+			err = splitErr
+		}
+		w.written += uint64(n)
+	}
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	return n, err
+}
+
+func (w *verifyingWriter) Close() error {
+	return w.splitter.Close()
 }
 
 type countingWriter struct {

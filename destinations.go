@@ -22,7 +22,7 @@ func (c *Client) DownloadAt(ctx context.Context, file FileInfo, dst io.WriterAt)
 	if dst == nil {
 		return DownloadReport{}, errors.New("xet: nil random-access download writer")
 	}
-	return c.download(ctx, file, nil, &sequentialWriterAt{dst: dst})
+	return c.Download(ctx, file, &sequentialWriterAt{dst: dst})
 }
 
 // DownloadRangeAt writes logical [Start,End) at destinationOffset. The

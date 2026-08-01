@@ -64,6 +64,35 @@ func TestReaderSegmentationDoesNotChangeBoundaries(t *testing.T) {
 	}
 }
 
+func TestIncrementalWriterMatchesSplit(t *testing.T) {
+	data := testData(2<<20 + 17)
+	wantEnds, _ := boundaries(t, bytes.NewReader(data), DefaultConfig)
+	for _, stride := range []int{1, 7, 8191, 8192, 65537, len(data)} {
+		var gotEnds []int
+		var joined []byte
+		writer, err := NewWriter(context.Background(), DefaultConfig, func(chunk Chunk) error {
+			joined = append(joined, chunk.Data...)
+			gotEnds = append(gotEnds, len(joined))
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for start := 0; start < len(data); start += stride {
+			end := min(start+stride, len(data))
+			if _, err := writer.Write(data[start:end]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(gotEnds, wantEnds) || !bytes.Equal(joined, data) {
+			t.Fatalf("stride %d produced different chunks", stride)
+		}
+	}
+}
+
 func TestChunkLimitsAndEmptyInput(t *testing.T) {
 	for _, n := range []int{0, 1, MinSize - 1, MinSize, MinSize + 1, MaxSize - 1, MaxSize, MaxSize + 1} {
 		chunks := Bytes(make([]byte, n))

@@ -58,27 +58,11 @@ func SplitContext(ctx context.Context, r io.Reader, cfg Config, emit func(Chunk)
 	if emit == nil {
 		return errors.New("chunker: nil emitter")
 	}
-	cfg, mask, err := normalize(cfg)
+	writer, err := NewWriter(ctx, cfg, emit)
 	if err != nil {
 		return err
 	}
-	readBuf := make([]byte, cfg.ReadBufferSize)
-	chunkBuf := make([]byte, 0, cfg.MaxSize)
-	var state uint64
-	var offset int64
-	emitChunk := func() error {
-		if len(chunkBuf) == 0 {
-			return nil
-		}
-		data := chunkBuf
-		if err := emit(Chunk{Offset: offset, Data: data}); err != nil {
-			return err
-		}
-		offset += int64(len(data))
-		chunkBuf = make([]byte, 0, cfg.MaxSize)
-		state = 0
-		return nil
-	}
+	readBuf := make([]byte, writer.cfg.ReadBufferSize)
 
 	emptyReads := 0
 	for {
@@ -98,13 +82,9 @@ func SplitContext(ctx context.Context, r io.Reader, cfg Config, emit func(Chunk)
 			emptyReads = 0
 		}
 
-		for _, b := range readBuf[:n] {
-			state = (state << 1) + gearTable[b]
-			chunkBuf = append(chunkBuf, b)
-			if len(chunkBuf) == cfg.MaxSize || (len(chunkBuf) >= cfg.MinSize && state&mask == 0) {
-				if err := emitChunk(); err != nil {
-					return err
-				}
+		if n != 0 {
+			if _, err := writer.Write(readBuf[:n]); err != nil {
+				return err
 			}
 		}
 
@@ -112,9 +92,98 @@ func SplitContext(ctx context.Context, r io.Reader, cfg Config, emit func(Chunk)
 			if !errors.Is(readErr, io.EOF) {
 				return readErr
 			}
-			return emitChunk()
+			return writer.Close()
 		}
 	}
+}
+
+// Writer incrementally applies Xet content-defined chunking to successive
+// writes. Write boundaries never affect emitted chunks. Close emits the final
+// short chunk, if any, and must be called exactly once.
+type Writer struct {
+	ctx      context.Context
+	cfg      Config
+	mask     uint64
+	emit     func(Chunk) error
+	chunkBuf []byte
+	state    uint64
+	offset   int64
+	closed   bool
+	err      error
+}
+
+// NewWriter constructs an incremental chunker. The caller retains ownership
+// of input slices; emitted Chunk.Data is independently owned.
+func NewWriter(ctx context.Context, cfg Config, emit func(Chunk) error) (*Writer, error) {
+	if ctx == nil {
+		return nil, errors.New("chunker: nil context")
+	}
+	if emit == nil {
+		return nil, errors.New("chunker: nil emitter")
+	}
+	cfg, mask, err := normalize(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Writer{
+		ctx: ctx, cfg: cfg, mask: mask, emit: emit,
+		chunkBuf: make([]byte, 0, cfg.MaxSize),
+	}, nil
+}
+
+func (w *Writer) Write(data []byte) (int, error) {
+	if w.closed {
+		return 0, errors.New("chunker: write after close")
+	}
+	if w.err != nil {
+		return 0, w.err
+	}
+	for i, value := range data {
+		if i&0x3fff == 0 {
+			if err := w.ctx.Err(); err != nil {
+				w.err = err
+				return i, err
+			}
+		}
+		w.state = (w.state << 1) + gearTable[value]
+		w.chunkBuf = append(w.chunkBuf, value)
+		if len(w.chunkBuf) == w.cfg.MaxSize ||
+			(len(w.chunkBuf) >= w.cfg.MinSize && w.state&w.mask == 0) {
+			if err := w.emitChunk(); err != nil {
+				w.err = err
+				return i + 1, err
+			}
+		}
+	}
+	return len(data), nil
+}
+
+func (w *Writer) Close() error {
+	if w.closed {
+		return errors.New("chunker: close after close")
+	}
+	w.closed = true
+	if w.err != nil {
+		return w.err
+	}
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	return w.emitChunk()
+}
+
+func (w *Writer) emitChunk() error {
+	if len(w.chunkBuf) == 0 {
+		return nil
+	}
+	data := w.chunkBuf
+	if err := w.emit(Chunk{Offset: w.offset, Data: data}); err != nil {
+		return err
+	}
+	w.offset += int64(len(data))
+	w.chunkBuf = make([]byte, 0, w.cfg.MaxSize)
+	w.state = 0
+	return nil
 }
 
 // Bytes chunks an in-memory value and returns independently owned chunks.

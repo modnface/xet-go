@@ -53,6 +53,7 @@ type Options struct {
 	UploadConcurrency         int
 	DownloadConcurrency       int
 	MaxDownloadMemory         uint64
+	MaxReconstructionWindow   uint64
 	GlobalDedup               bool
 	// DefragWindow is the number of recent reconstruction ranges used to
 	// estimate fragmentation. The zero value selects the Rust default of 128.
@@ -102,6 +103,9 @@ func NewClient(protocol Protocol, options Options) (*Client, error) {
 	}
 	if options.MaxDownloadMemory < xorb.MaxRawSize {
 		return nil, errors.New("xet: maximum download memory must permit at least one xorb")
+	}
+	if options.MaxReconstructionWindow == 0 {
+		options.MaxReconstructionWindow = 10 << 30
 	}
 	if options.DefragWindow == 0 {
 		options.DefragWindow = 128

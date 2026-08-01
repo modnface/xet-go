@@ -267,6 +267,40 @@ func TestUploadDownloadAndRangeEndToEnd(t *testing.T) {
 	}
 }
 
+func TestWholeDownloadUsesBoundedReconstructionWindows(t *testing.T) {
+	protocol := newMemoryProtocol()
+	client, err := NewClient(protocol, Options{
+		Compression: xorb.None, CompressionSet: true,
+		UploadConcurrency: 2, DownloadConcurrency: 2,
+		MaxReconstructionWindow: 200_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := deterministicData(750_123)
+	upload, err := client.Upload(context.Background(), bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocol.mu.Lock()
+	protocol.queryCalls = 0
+	protocol.mu.Unlock()
+	var output bytes.Buffer
+	report, err := client.Download(context.Background(), upload.File, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocol.mu.Lock()
+	queries := protocol.queryCalls
+	protocol.mu.Unlock()
+	if queries != 4 || !report.WholeFileHash || !report.SHA256Verified || report.LogicalBytes != uint64(len(data)) {
+		t.Fatalf("windowed report=%#v queries=%d", report, queries)
+	}
+	if !bytes.Equal(output.Bytes(), data) {
+		t.Fatal("windowed reconstruction differs")
+	}
+}
+
 func TestUploadBatchSessionDeduplicatesIdenticalFiles(t *testing.T) {
 	protocol := newMemoryProtocol()
 	client := newTestEngine(t, protocol)
