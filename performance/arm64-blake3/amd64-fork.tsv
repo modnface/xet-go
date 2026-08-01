@@ -1,0 +1,17 @@
+# GitHub Actions run 30722215506, https://github.com/jmwoliver/blake3/actions/runs/30722215506
+# Fork commit b11c1cdefad3 versus lukechampine.com/blake3 v1.4.1.
+# Native AMD EPYC 9V74 80-Core runner, linux/amd64, Go 1.22, GOMAXPROCS=4.
+# Seven alternating 500ms samples of the same BenchmarkSum256 inputs.
+# fork_over_upstream is upstream_ns_op/fork_ns_op; values above one are faster.
+bytes	fork_ns_op	upstream_ns_op	fork_over_upstream	fork_bytes_op	upstream_bytes_op	fork_allocs_op	upstream_allocs_op
+64	128.3	127.7	0.9953	0	0	0	0
+1024	1914	1912	0.9990	0	0	0	0
+65536	52404	54251	1.0352	38546	39460	14	33
+1048576	247437	281747	1.1387	43328	48971	60	174
+
+# Native differential test result on the same runner.
+kernel	result
+CompressBufferAVX2MatchesGeneric	pass
+CompressBlocksAVX2MatchesGeneric	pass
+CompressParentsAVX2MatchesGeneric	pass
+AVX512	unavailable-on-runner

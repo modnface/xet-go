@@ -16,29 +16,29 @@ parallelism. Xet imports this one module from one untagged `datahash.go`; the
 fork selects the architecture backend internally. The result remains CGO-free
 and restores the module's previous Go 1.23 minimum.
 
-The Xet module pins public fork commit `4b8a4e2a3803` through Go pseudo-version
-`v0.0.0-20260801214204-4b8a4e2a3803`; no local `replace` or architecture-
-specific Xet import is required. Native AMD64 hardware is still needed for a
-final AVX2/AVX-512 performance comparison.
+The Xet module pins public fork commit `b11c1cdefad3` through Go pseudo-version
+`v0.0.0-20260801225300-b11c1cdefad3`; no local `replace` or architecture-
+specific Xet import is required. The public CI validates native AMD64 AVX2 in
+addition to this host's ARM64 NEON path.
 
-On the official 63.5 MB CSV, the integrated fork is 1.03–4.47x official Rust
-for every hashing-inclusive xorb encode/decode case, and 1.55x for chunking
-plus the file hash. Owned chunking remains close at 0.96x. Merkle-only hashing
-is 0.69x but takes only about 0.12 ms per pass, so it is not an end-to-end
+On the official 63.5 MB CSV, the integrated fork is 1.02–4.45x official Rust
+for every hashing-inclusive xorb encode/decode case, and 1.54x for chunking
+plus the file hash. Owned chunking remains close at 0.92x. Merkle-only hashing
+is 0.65x but takes only about 0.12 ms per pass, so it is not an end-to-end
 bottleneck.
 
 | Operation | Go before, MiB/s | Go final, MiB/s | Go speedup | Rust final, MiB/s | Final Go/Rust |
 |---|---:|---:|---:|---:|---:|
-| Owned chunking | 1,856.09 | 1,896.69 | 1.02x | 1,985.40 | 0.955x |
-| Leaf hash, prepared chunks | 1,613.18 | 16,674.77 | 10.34x | 2,320.95 | 7.184x |
-| Merkle/file hash, prepared nodes | 482,156.91 | 523,154.89 | 1.09x | 761,268.70 | 0.687x |
-| Chunk + file hash | 849.70 | 1,653.86 | 1.95x | 1,065.58 | 1.552x |
-| Encode prepared chunks, none | 1,485.78 | 8,699.57 | 5.86x | 2,062.79 | 4.217x |
-| Encode prepared chunks, LZ4 | 549.81 | 848.95 | 1.54x | 776.74 | 1.093x |
-| End-to-end encode, none | 819.05 | 1,547.06 | 1.89x | 1,003.15 | 1.542x |
-| End-to-end encode, LZ4 | 408.13 | 579.44 | 1.42x | 563.80 | 1.028x |
-| Decode, none | 1,473.19 | 9,213.27 | 6.25x | 2,062.24 | 4.468x |
-| Decode, LZ4 | 1,111.08 | 3,782.87 | 3.40x | 1,399.98 | 2.702x |
+| Owned chunking | 1,856.09 | 1,901.27 | 1.02x | 2,068.36 | 0.919x |
+| Leaf hash, prepared chunks | 1,613.18 | 16,852.44 | 10.45x | 2,401.64 | 7.017x |
+| Merkle/file hash, prepared nodes | 482,156.91 | 542,343.61 | 1.12x | 835,326.76 | 0.649x |
+| Chunk + file hash | 849.70 | 1,696.44 | 2.00x | 1,104.99 | 1.535x |
+| Encode prepared chunks, none | 1,485.78 | 8,791.89 | 5.92x | 2,132.88 | 4.122x |
+| Encode prepared chunks, LZ4 | 549.81 | 871.00 | 1.58x | 817.04 | 1.066x |
+| End-to-end encode, none | 819.05 | 1,595.11 | 1.95x | 1,041.01 | 1.532x |
+| End-to-end encode, LZ4 | 408.13 | 596.70 | 1.46x | 582.26 | 1.025x |
+| Decode, none | 1,473.19 | 9,452.57 | 6.42x | 2,123.11 | 4.452x |
+| Decode, LZ4 | 1,111.08 | 3,837.65 | 3.45x | 1,457.11 | 2.634x |
 
 Every sample produced 796 chunks and matching protocol identities. The
 uncompressed xorb also had the same serialized length. LZ4 streams may differ
@@ -68,6 +68,16 @@ sample ranges are in `performance/arm64-blake3/end-to-end.tsv`.
   measured with `/usr/bin/time -l`. This processes 1,270,544,880 bytes per
   sample. Profiles recorded their own target JSON so overhead could be checked
   against unprofiled runs; target throughput stayed within a few percent.
+
+The benchmark binaries read the fixture before starting their internal timer.
+Comparing that timer with the surrounding fresh-process `/usr/bin/time -l`
+measurement separates timed computation from startup, file input, JSON output,
+and process exit. Across the nine final samples, Go's medians were 0.692342 s
+internally and 0.70 s for the whole process; Rust's were 1.098622 s and 1.11 s.
+The residual was therefore approximately 7.66 ms (1.09% of process wall time)
+for Go and 11.38 ms (1.03%) for Rust. `/usr/bin/time` reports only hundredths
+of a second, so these are approximate bounds, but they rule out startup and
+file I/O as an explanation for the throughput or switch gap.
 
 The end-to-end comparison intentionally runs each implementation through its
 normal path. The pinned Rust hasher is serial here; final Go batches independent
@@ -106,6 +116,10 @@ The evidence agrees across tools:
   `compressChunksNEON`; scheduler wait/signal samples fell from about 73% to
   about 9.4%. Go disassembly contains NEON `VDUP`, `VLD1`, `VTRN`, vector add,
   and vector XOR instructions.
+- Compiler diagnostics show that the allocation-free small keyed wrapper is
+  inlineable and its input does not escape. The batch worker closure and
+  synchronization state do escape, as expected; the measured final allocation
+  counts include them. NEON assembly arguments do not escape.
 
 ## Primitive-size result
 
@@ -116,10 +130,10 @@ Independent chunk batching supplies the large end-to-end gain.
 
 | Message | Previous Go | Final Go | Rust final | Final Go/Rust |
 |---|---:|---:|---:|---:|
-| 8 KiB | 566.85 MiB/s | 989.31 MiB/s | 2,425.13 MiB/s | 0.408x |
-| 64 KiB | 1,319.86 MiB/s | 1,485.09 MiB/s | 2,453.19 MiB/s | 0.605x |
-| 128 KiB | 1,852.06 MiB/s | 1,723.81 MiB/s | 2,442.47 MiB/s | 0.706x |
-| 1 MiB | 4,706.36 MiB/s | 7,458.81 MiB/s | 2,452.46 MiB/s | 3.041x |
+| 8 KiB | 566.85 MiB/s | 957.37 MiB/s | 2,360.44 MiB/s | 0.406x |
+| 64 KiB | 1,319.86 MiB/s | 1,475.57 MiB/s | 2,443.34 MiB/s | 0.604x |
+| 128 KiB | 1,852.06 MiB/s | 1,698.81 MiB/s | 2,430.18 MiB/s | 0.699x |
+| 1 MiB | 4,706.36 MiB/s | 7,270.73 MiB/s | 2,425.05 MiB/s | 2.998x |
 
 The official CSV chunk distribution is 8,407 bytes minimum, 18,670 p10,
 37,216 p25, 78,993 median, and 131,072 p75/p90/maximum. Chunks below 32 KiB
@@ -183,7 +197,7 @@ collapse: at 10 callers the retained encode/decode prototypes reached about
 | `github.com/zeebo/blake3` v0.2.4 | Mature Go 1.18 dependency; no ARM64 SIMD; about 954 MiB/s sequential and 9.5 GiB/s over the official chunk batch | Rejected: weaker ARM64 result |
 | `goforge.dev/blake3sum` v1.0.0 | Go 1.24, CGO-free ARM64 NEON; about 1,598 MiB/s sequential distribution and 14.5 GiB/s batched | Useful split prototype; superseded by the unified fork |
 | CGO/Rust or C BLAKE3 | Mature SIMD implementations | Rejected: violates the module's CGO-free deployment contract |
-| Luke-based unified fork | Existing AVX2/AVX-512 and zero-allocation small path plus attributed GoForge ARM64 NEON | Published and integrated; native AMD64 performance validation pending |
+| Luke-based unified fork | Existing AVX2/AVX-512 and zero-allocation small path plus attributed GoForge ARM64 NEON | Published, integrated, and native-AVX2 validated |
 
 The GoForge dependency was newer and had a shorter release history than the
 other Go candidates. That risk motivated the universal-fork follow-up rather
@@ -271,20 +285,34 @@ The complete 256 MiB-per-worker BLAKE3 matrix shows where the gains originate:
 
 | Scenario | Size | Previous Go | Fork | Fork/previous | Rust |
 |---|---:|---:|---:|---:|---:|
-| One shot | 64 B | 628.51 MiB/s | 682.82 MiB/s | 1.086x | 1,302.62 MiB/s |
-| One shot | 8 KiB | 566.85 MiB/s | 989.31 MiB/s | 1.745x | 2,425.13 MiB/s |
-| One shot | 128 KiB | 1,852.06 MiB/s | 1,723.81 MiB/s | 0.931x | 2,442.47 MiB/s |
-| One shot | 1 MiB | 4,706.36 MiB/s | 7,458.81 MiB/s | 1.585x | 2,452.46 MiB/s |
-| One shot | 16 MiB | 8,257.20 MiB/s | 16,708.50 MiB/s | 2.024x | 2,436.77 MiB/s |
-| Caller parallel | 64 KiB, 2 callers | 1,697.55 MiB/s | 2,570.37 MiB/s | 1.514x | 4,469.85 MiB/s |
+| One shot | 64 B | 628.51 MiB/s | 676.18 MiB/s | 1.076x | 1,291.44 MiB/s |
+| One shot | 8 KiB | 566.85 MiB/s | 957.37 MiB/s | 1.689x | 2,360.44 MiB/s |
+| One shot | 128 KiB | 1,852.06 MiB/s | 1,698.81 MiB/s | 0.917x | 2,430.18 MiB/s |
+| One shot | 1 MiB | 4,706.36 MiB/s | 7,270.73 MiB/s | 1.545x | 2,425.05 MiB/s |
+| One shot | 16 MiB | 8,257.20 MiB/s | 17,241.52 MiB/s | 2.088x | 2,408.46 MiB/s |
+| Caller parallel | 64 KiB, 2 callers | 1,697.55 MiB/s | 2,578.86 MiB/s | 1.519x | 4,473.05 MiB/s |
 
-The maximum fork median absolute deviation in the 41-row matrix was 3.85%; all
-but one row were lower, and all samples enforced equal digest and byte-count
-semantics. AMD64-specific differential tests compare AVX2 and AVX-512 buffer,
+The maximum fork median absolute deviation in the 41-row matrix was 2.57%; all
+but two rows were lower than 2%, and all samples enforced equal digest and
+byte-count semantics. AMD64-specific differential tests compare AVX2 and AVX-512 buffer,
 block, and parent kernels against the portable implementation. Cross-builds
-and a Rosetta execution pass succeeded, but Rosetta exposed neither AVX feature
-and therefore skipped those runtime SIMD tests. Native AMD64 correctness and
-performance remain a release gate rather than an inferred result.
+and a Rosetta execution pass succeeded, but Rosetta exposed neither AVX
+feature. Public CI run 30722215506 then executed the AVX2 buffer, block, and
+parent tests on a native AMD EPYC runner and passed the full Go 1.22/current
+Linux, macOS, and Windows matrix.
+
+Seven alternating native AMD64 samples compared the published fork with
+upstream v1.4.1. Median 64-byte and 1-KiB latency were within 0.5% and 0.1% of
+upstream, respectively. The fork was 3.5% faster at 64 KiB and 13.9% faster at
+1 MiB. At those larger sizes it cut allocation counts by 57.6% and 65.5%,
+respectively. A first bounded-callback prototype had regressed 64 KiB by 36.8%;
+it was rejected and replaced with direct small-tree fan-out. Static large-tree
+partitioning was then rejected because it slowed 1–16 MiB ARM64 hashes by
+6–12% on heterogeneous Apple cores. The final policy uses dynamic bounded work
+distribution for large trees. Raw medians are in
+`performance/arm64-blake3/amd64-fork.tsv`. The runner did not expose AVX-512,
+so native AVX-512 execution is explicitly not claimed; that code is unchanged
+from upstream and remains differential-tested when suitable hardware exists.
 
 An attempted follow-up removed the fork's 16 KiB eigentree padding allocation.
 It substantially reduced allocated bytes, but representative pipeline medians
@@ -298,9 +326,9 @@ serial operation. The complete comparisons and rejected samples are in
 
 There is no remaining throughput deficit in the complete chunk/hash or xorb
 pipelines on this ARM64 host. The fork's current seven-sample official results
-are 1.03–4.47x Rust for all hashing-inclusive encode/decode operations and
-1.55x Rust for chunk/file hashing. The isolated exceptions are owned chunking
-at 0.96x Rust and the tiny Merkle-only stage at 0.69x. Primitive 64–128 KiB
+are 1.02–4.45x Rust for all hashing-inclusive encode/decode operations and
+1.54x Rust for chunk/file hashing. The isolated exceptions are owned chunking
+at 0.92x Rust and the tiny Merkle-only stage at 0.65x. Primitive 64–128 KiB
 single hashes also remain 0.61–0.71x Rust, but bounded batching more than
 recovers that gap in the real pipeline.
 

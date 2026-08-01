@@ -1,7 +1,9 @@
 # Apple M4 Pro, darwin/arm64, Go 1.26.5, 2026-08-01.
 # split: xet-go commit 5e991e9 (Luke small/internal + GoForge data leaves).
-# fork: Luke-based code commit 59952ae, published as module commit 4b8a4e2,
-# integrated as the only BLAKE3 module.
+# fork: Luke-based code commit 59952ae, first published as module commit
+# 4b8a4e2 and integrated as the only BLAKE3 module. The final b11c1cd pin keeps
+# these Xet serial-batch semantics and refines only default internal fan-out;
+# its fresh official pipeline results are in end-to-end.tsv.
 # Nine alternating fresh-process samples; each pipeline sample runs three iterations.
 operation	split_mib_s	fork_mib_s	fork_over_split
 chunk_owned	1929.051	1934.910	1.0030

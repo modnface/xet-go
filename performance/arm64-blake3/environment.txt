@@ -18,5 +18,5 @@ fixture_bytes=63527244
 fixture_sha256=f41255b252f776125f2b657136654e4d4d5d2ccf8ef4db0ec186bd1981b69734
 go_build=go build -trimpath
 rust_build=cargo +1.95.0 build --locked --release
-retained_blake3_dependencies=goforge.dev/blake3sum@v1.0.0, lukechampine.com/blake3@v1.4.1
-integrated_blake3=github.com/jmwoliver/blake3@v0.0.0-20260801214204-4b8a4e2a3803
+previous_split_blake3_dependencies=goforge.dev/blake3sum@v1.0.0, lukechampine.com/blake3@v1.4.1
+integrated_blake3=github.com/jmwoliver/blake3@v0.0.0-20260801225300-b11c1cdefad3

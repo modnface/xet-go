@@ -101,6 +101,21 @@ go tool objdump -s 'blake3/guts[.]compressChunksNEON' "${GO_BENCHMARK}" \
 xcrun llvm-objdump --disassemble-symbols=_blake3_hash_many_neon "${RUST_BENCHMARK}" \
 	>"${OUTPUT_DIR}/rust-blake3-hash-many-neon.txt"
 
+# Record the compiler's decisions for the Xet hashing layer and its BLAKE3
+# dependency. These captures are separate from the benchmark binary because
+# -m=2 is a diagnostic build flag, not a production optimization setting.
+(
+	cd "${ROOT_DIR}"
+	go test -run '^$' \
+		-gcflags='github.com/jacobwoliver/xet-go/xethash=-m=2' ./xethash
+) >"${OUTPUT_DIR}/go-xethash-escape-inline.txt" 2>&1
+(
+	cd "${ROOT_DIR}"
+	go test -run '^$' \
+		-gcflags='github.com/jmwoliver/blake3/...=-m=2' \
+		github.com/jmwoliver/blake3/...
+) >"${OUTPUT_DIR}/go-blake3-escape-inline.txt" 2>&1
+
 run_timed() {
 	local implementation="$1"
 	local binary="$2"

@@ -24,6 +24,8 @@ toolchains, dependency graph, CPU topology, operation count, and
   overhead does not distort the scheduler evidence;
 - CPU call trees and top reports, allocation/heap/block/mutex profiles, and
   scheduler/synchronization profiles derived with `go tool trace`;
+- compiler escape and inlining diagnostics for both `xethash` and the pinned
+  BLAKE3 module;
 - Go and Rust compression-loop disassembly;
 - seven alternating fresh-process `/usr/bin/time -l` samples;
 - symmetric Go/Rust Samply profiles with context-switch markers;
@@ -50,6 +52,15 @@ could not produce a static SVG. The script emits the equivalent symbolized
 view (`go tool pprof -http=:0 <profile>`), and preserves Samply and Instruments
 profiles. The earlier zero-byte attempted SVG is ignored with the other raw
 cache files and is not evidence used by the report.
+
+The compiler diagnostics confirm that `smallKeyedHash` is inlineable and its
+input does not escape. `NewSerial` is inlineable; hashers intentionally escape
+when installed in `sync.Pool`. The batch function itself is not inlineable and
+its worker closure, `WaitGroup`, and atomic work index escape, as expected for
+goroutine-owned state. The NEON assembly declarations report that their input,
+output, and key pointers do not escape. The scalar `CompressNode` and ARM64
+`CompressChunk` bodies exceed the inliner budget, but profiles and disassembly
+show that the four-chunk hot path enters `compressChunksNEON` directly.
 
 No SIP or security setting was changed. `fs_usage`/`dtruss` were not used:
 System Trace supplied syscall and thread-state data without `sudo`, while the

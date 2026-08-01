@@ -1,5 +1,5 @@
-github.com/jmwoliver/blake3 v0.0.0-20260801214204-4b8a4e2a3803 h1:TcuQeIRwvEm8AzJffC7McAe+JOBN8uAgQfY6OSI6Uhs=
-github.com/jmwoliver/blake3 v0.0.0-20260801214204-4b8a4e2a3803/go.mod h1:cx4mmxt51qOv+rhDpVSumVJPLm+46uX7OLrLL4BVGpM=
+github.com/jmwoliver/blake3 v0.0.0-20260801225300-b11c1cdefad3 h1:KFso3QZvO7JDt7Mbunv1EvhjqCIgho3H47wFHgGGaqs=
+github.com/jmwoliver/blake3 v0.0.0-20260801225300-b11c1cdefad3/go.mod h1:cx4mmxt51qOv+rhDpVSumVJPLm+46uX7OLrLL4BVGpM=
 github.com/klauspost/compress v1.18.4 h1:RPhnKRAQ4Fh8zU2FY/6ZFDwTVTxgJ/EMydqSTzE9a2c=
 github.com/klauspost/compress v1.18.4/go.mod h1:R0h/fSBs8DE4ENlcrlib3PsXS61voFxhIs2DeRhCvJ4=
 github.com/klauspost/cpuid/v2 v2.0.9 h1:lgaqFMSdTdQYdZ04uHyN2d/eKdOMyi2YLSvlQIBFYa4=
