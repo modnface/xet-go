@@ -17,6 +17,10 @@ func TestRun(t *testing.T) {
 	t.Setenv("XET_PERF_CPU_PROFILE", "")
 	t.Setenv("XET_PERF_ALLOCS_PROFILE", "")
 	t.Setenv("XET_PERF_HEAP_PROFILE", "")
+	t.Setenv("XET_PERF_TRACE", "")
+	t.Setenv("XET_PERF_BLOCK_PROFILE", "")
+	t.Setenv("XET_PERF_MUTEX_PROFILE", "")
+	t.Setenv("XET_PERF_GOROUTINE_PROFILE", "")
 	var stdout bytes.Buffer
 	if err := run([]string{"perf", input, "chunk_hash", "1"}, &stdout); err != nil {
 		t.Fatal(err)
@@ -86,6 +90,10 @@ func TestBenchmarkOperationsPreserveIdentity(t *testing.T) {
 			t.Errorf("%s identity = %s, xorb identity = %s", operation, records[operation].Identity, records["xorb_encode_none"].Identity)
 		}
 	}
+	if records["chunk_hash"].AllocatedBytes == 0 || records["chunk_hash"].Allocations == 0 ||
+		records["chunk_hash"].GOMAXPROCS < 1 {
+		t.Fatalf("chunk_hash runtime metrics missing: %+v", records["chunk_hash"])
+	}
 }
 
 func TestBenchmarkRejectsUnknownOperation(t *testing.T) {
@@ -132,5 +140,20 @@ func TestOptionalProfiles(t *testing.T) {
 	info, err := os.Stat(path)
 	if err != nil || info.Size() == 0 {
 		t.Fatalf("profile was not written: info=%v err=%v", info, err)
+	}
+}
+
+func TestOptionalExecutionTrace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trace.out")
+	stop, err := startTrace(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop()
+	if info, err := os.Stat(path); err != nil || info.Size() == 0 {
+		t.Fatalf("execution trace was not written: info=%v err=%v", info, err)
+	}
+	if _, err := startTrace(filepath.Join(t.TempDir(), "missing", "trace.out")); err == nil {
+		t.Fatal("execution trace accepted a missing parent directory")
 	}
 }

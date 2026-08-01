@@ -49,12 +49,21 @@ type benchRecord struct {
 	Identity       string  `json:"identity"`
 	SerializedSize int     `json:"serialized_size"`
 	Chunks         int     `json:"chunks"`
+	AllocatedBytes uint64  `json:"allocated_bytes"`
+	Allocations    uint64  `json:"allocations"`
+	GCCycles       uint32  `json:"gc_cycles"`
+	GCPauseNS      uint64  `json:"gc_pause_ns"`
+	GOMAXPROCS     int     `json:"gomaxprocs"`
 }
 
 type sample struct {
 	ElapsedNS      uint64  `json:"elapsed_ns"`
 	BytesPerSecond float64 `json:"bytes_per_second"`
 	SerializedSize int     `json:"serialized_size"`
+	AllocatedBytes uint64  `json:"allocated_bytes"`
+	Allocations    uint64  `json:"allocations"`
+	GCCycles       uint32  `json:"gc_cycles"`
+	GCPauseNS      uint64  `json:"gc_pause_ns"`
 }
 
 type statistics struct {
@@ -253,7 +262,11 @@ func calculateStatistics(implementation string, records []benchRecord) statistic
 	for i, record := range records {
 		throughputs[i] = record.BytesPerSecond
 		elapsed[i] = record.ElapsedNS
-		samples[i] = sample{ElapsedNS: record.ElapsedNS, BytesPerSecond: record.BytesPerSecond, SerializedSize: record.SerializedSize}
+		samples[i] = sample{
+			ElapsedNS: record.ElapsedNS, BytesPerSecond: record.BytesPerSecond, SerializedSize: record.SerializedSize,
+			AllocatedBytes: record.AllocatedBytes, Allocations: record.Allocations,
+			GCCycles: record.GCCycles, GCPauseNS: record.GCPauseNS,
+		}
 	}
 	slices.Sort(throughputs)
 	slices.Sort(elapsed)

@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"runtime/trace"
 	"strconv"
 	"time"
 
@@ -30,6 +31,11 @@ type benchRecord struct {
 	Identity       string  `json:"identity"`
 	SerializedSize int     `json:"serialized_size"`
 	Chunks         int     `json:"chunks"`
+	AllocatedBytes uint64  `json:"allocated_bytes"`
+	Allocations    uint64  `json:"allocations"`
+	GCCycles       uint32  `json:"gc_cycles"`
+	GCPauseNS      uint64  `json:"gc_pause_ns"`
+	GOMAXPROCS     int     `json:"gomaxprocs"`
 }
 
 func main() {
@@ -59,7 +65,23 @@ func run(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	stopTrace, err := startTrace(os.Getenv("XET_PERF_TRACE"))
+	if err != nil {
+		stopCPUProfile()
+		return err
+	}
+	blockPath := os.Getenv("XET_PERF_BLOCK_PROFILE")
+	if blockPath != "" {
+		runtime.SetBlockProfileRate(1)
+		defer runtime.SetBlockProfileRate(0)
+	}
+	mutexPath := os.Getenv("XET_PERF_MUTEX_PROFILE")
+	if mutexPath != "" {
+		runtime.SetMutexProfileFraction(1)
+		defer runtime.SetMutexProfileFraction(0)
+	}
 	record, err := benchmark(data, args[2], iterations)
+	stopTrace()
 	stopCPUProfile()
 	if err != nil {
 		return err
@@ -68,6 +90,15 @@ func run(args []string, stdout io.Writer) error {
 		return err
 	}
 	if err := writeProfile(os.Getenv("XET_PERF_HEAP_PROFILE"), "heap"); err != nil {
+		return err
+	}
+	if err := writeProfile(blockPath, "block"); err != nil {
+		return err
+	}
+	if err := writeProfile(mutexPath, "mutex"); err != nil {
+		return err
+	}
+	if err := writeProfile(os.Getenv("XET_PERF_GOROUTINE_PROFILE"), "goroutine"); err != nil {
 		return err
 	}
 	return json.NewEncoder(stdout).Encode(record)
@@ -87,6 +118,24 @@ func startCPUProfile(path string) (func(), error) {
 	}
 	return func() {
 		pprof.StopCPUProfile()
+		_ = file.Close()
+	}, nil
+}
+
+func startTrace(path string) (func(), error) {
+	if path == "" {
+		return func() {}, nil
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("create execution trace: %w", err)
+	}
+	if err := trace.Start(file); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("start execution trace: %w", err)
+	}
+	return func() {
+		trace.Stop()
 		_ = file.Close()
 	}, nil
 }
@@ -154,6 +203,8 @@ func benchmark(data []byte, operation string, iterations int) (benchRecord, erro
 	}
 
 	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
 	start := time.Now()
 	for range iterations {
 		switch operation {
@@ -212,12 +263,16 @@ func benchmark(data []byte, operation string, iterations int) (benchRecord, erro
 		}
 	}
 	elapsed := time.Since(start)
+	runtime.ReadMemStats(&after)
 	runtime.KeepAlive(keepAlive)
 	return benchRecord{
 		SchemaVersion: 1, Implementation: "go-xet", Operation: operation, Scheme: schemeName,
 		InputSize: len(data), Iterations: iterations, ElapsedNS: uint64(elapsed.Nanoseconds()),
 		BytesPerSecond: float64(len(data)*iterations) / elapsed.Seconds(), Identity: identity.String(),
 		SerializedSize: serializedSize, Chunks: chunkCount,
+		AllocatedBytes: after.TotalAlloc - before.TotalAlloc, Allocations: after.Mallocs - before.Mallocs,
+		GCCycles: after.NumGC - before.NumGC, GCPauseNS: after.PauseTotalNs - before.PauseTotalNs,
+		GOMAXPROCS: runtime.GOMAXPROCS(0),
 	}, nil
 }
 

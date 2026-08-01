@@ -1,12 +1,14 @@
 //! Development-only differential oracle built inside the pinned official
 //! huggingface/xet-core workspace. This is never linked into the Go module.
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::env;
 use std::fs;
 use std::io::Cursor;
 use std::mem::size_of;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -30,6 +32,38 @@ use xet_core_structures::xorb_object::{
     xorb_format_test_utils::serialize_xorb_to_stream_reference,
 };
 use xet_data::deduplication::Chunker;
+
+struct CountingAllocator;
+
+static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() {
+            ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+        let new_pointer = unsafe { System.realloc(pointer, old_layout, new_size) };
+        if !new_pointer.is_null() {
+            ALLOCATED_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        new_pointer
+    }
+}
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 
 #[derive(Serialize)]
 struct ChunkRecord {
@@ -60,6 +94,11 @@ struct BenchRecord {
     identity: String,
     serialized_size: usize,
     chunks: usize,
+    allocated_bytes: u64,
+    allocations: u64,
+    gc_cycles: u32,
+    gc_pause_ns: u64,
+    gomaxprocs: usize,
 }
 
 #[derive(Serialize)]
@@ -234,6 +273,8 @@ fn benchmark(data: &[u8], operation: &str, iterations: usize) -> BenchRecord {
         _ => None,
     };
 
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    ALLOCATIONS.store(0, Ordering::Relaxed);
     let start = Instant::now();
     for _ in 0..iterations {
         match operation {
@@ -299,6 +340,8 @@ fn benchmark(data: &[u8], operation: &str, iterations: usize) -> BenchRecord {
         std::hint::black_box(&identity);
     }
     let elapsed = start.elapsed();
+    let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
     BenchRecord {
         schema_version: 1,
         implementation: "rust-xet-core",
@@ -311,6 +354,11 @@ fn benchmark(data: &[u8], operation: &str, iterations: usize) -> BenchRecord {
         identity: identity.to_string(),
         serialized_size,
         chunks,
+        allocated_bytes,
+        allocations,
+        gc_cycles: 0,
+        gc_pause_ns: 0,
+        gomaxprocs: 1,
     }
 }
 
