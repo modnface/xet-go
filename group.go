@@ -58,9 +58,15 @@ func (c *Client) DownloadGroup(ctx context.Context, requests []DownloadRequest) 
 			}
 		}
 	}
+	report := DownloadGroupReport{Downloads: make([]DownloadResult, len(requests))}
+	if err := ctx.Err(); err != nil {
+		for i := range report.Downloads {
+			report.Downloads[i].Err = err
+		}
+		return report, err
+	}
 	operationContext, cancel := context.WithCancel(ctx)
 	defer cancel()
-	report := DownloadGroupReport{Downloads: make([]DownloadResult, len(requests))}
 	jobs := make(chan int)
 	workers := min(c.options.DownloadConcurrency, len(requests))
 	var group sync.WaitGroup
