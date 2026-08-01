@@ -182,7 +182,7 @@ func summarize(scenario string, size, iterations, workers int, goRecords, rustRe
 func expectedGoImplementation(scenario string) string {
 	switch scenario {
 	case "stream_new", "stream_reuse", "stream_segmented", "caller_parallel_segmented":
-		return "go-lukechampine-blake3"
+		return "go-unified-blake3-fork"
 	default:
 		return "go-xethash"
 	}

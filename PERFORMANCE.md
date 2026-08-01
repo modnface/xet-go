@@ -7,7 +7,8 @@ implementation was slower and produced far more context switches.
 
 ## Outcome
 
-The recommended implementation is now a locally integrated fork of
+The recommended implementation is now the published
+`github.com/jmwoliver/blake3` fork of
 `lukechampine.com/blake3` v1.4.1. It retains Luke's portable, AMD64 AVX2, and
 AVX-512 implementations, adds the attributed GoForge ARM64 NEON four-chunk
 kernel, and provides a serial hasher for callers that already own the outer
@@ -15,11 +16,10 @@ parallelism. Xet imports this one module from one untagged `datahash.go`; the
 fork selects the architecture backend internally. The result remains CGO-free
 and restores the module's previous Go 1.23 minimum.
 
-The fork is committed in a separate local repository and the complete Xet
-integration is validated in this worktree. It is not yet shippable: `go.mod`
-uses an absolute local `replace` until the fork has a permanent published
-module path, and native AMD64 hardware is still needed for final AVX2/AVX-512
-performance validation.
+The Xet module pins public fork commit `4b8a4e2a3803` through Go pseudo-version
+`v0.0.0-20260801214204-4b8a4e2a3803`; no local `replace` or architecture-
+specific Xet import is required. Native AMD64 hardware is still needed for a
+final AVX2/AVX-512 performance comparison.
 
 On the official 63.5 MB CSV, the integrated fork is 1.03–4.47x official Rust
 for every hashing-inclusive xorb encode/decode case, and 1.55x for chunking
@@ -183,7 +183,7 @@ collapse: at 10 callers the retained encode/decode prototypes reached about
 | `github.com/zeebo/blake3` v0.2.4 | Mature Go 1.18 dependency; no ARM64 SIMD; about 954 MiB/s sequential and 9.5 GiB/s over the official chunk batch | Rejected: weaker ARM64 result |
 | `goforge.dev/blake3sum` v1.0.0 | Go 1.24, CGO-free ARM64 NEON; about 1,598 MiB/s sequential distribution and 14.5 GiB/s batched | Useful split prototype; superseded by the unified fork |
 | CGO/Rust or C BLAKE3 | Mature SIMD implementations | Rejected: violates the module's CGO-free deployment contract |
-| Luke-based unified fork | Existing AVX2/AVX-512 and zero-allocation small path plus attributed GoForge ARM64 NEON | Recommended and locally integrated; publication and native AMD64 performance validation pending |
+| Luke-based unified fork | Existing AVX2/AVX-512 and zero-allocation small path plus attributed GoForge ARM64 NEON | Published and integrated; native AMD64 performance validation pending |
 
 The GoForge dependency was newer and had a shorter release history than the
 other Go candidates. That risk motivated the universal-fork follow-up rather
@@ -226,14 +226,14 @@ hashes there. The unified fork supersedes that two-module arrangement.
 Detailed samples are in
 `performance/arm64-blake3/universal-goforge.tsv`.
 
-### Unified Luke-based fork prototype
+### Unified Luke-based fork
 
-A local fork starting from `lukechampine.com/blake3` v1.4.1 combines its
+A published fork starting from `lukechampine.com/blake3` v1.4.1 combines its
 existing portable, AVX2, and AVX-512 paths with the attributed GoForge ARM64
 NEON four-chunk kernel. The fork keeps the original MIT license, includes the
 GoForge MIT license and a third-party notice, and exposes a zero-allocation
 keyed one-shot API so Xet no longer imports the internal `guts` package. With
-the prototype integrated, Xet imports one BLAKE3 module, removes both original
+the fork integrated, Xet imports one BLAKE3 module, removes both original
 BLAKE3 module requirements, and no longer needs architecture-tagged data-hash
 files. MIT-to-MIT reuse permits this fork as long as both copyright/license
 notices remain with distributed copies; `LICENSE`, `LICENSE-GOFORGE`, and
@@ -315,7 +315,7 @@ scalar data-leaf path: disassembly and profiles confirm NEON execution.
 
 ## Validation
 
-The integrated prototype passed:
+The final integrated code passed:
 
 - `go test ./...`, `go test -race ./...`, `go vet ./...`, and
   `golangci-lint` 2.12.2 with Go 1.25.12;

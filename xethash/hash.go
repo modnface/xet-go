@@ -14,8 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"lukechampine.com/blake3"
-	"lukechampine.com/blake3/guts"
+	"github.com/jmwoliver/blake3"
 )
 
 const (
@@ -162,24 +161,7 @@ func (h *Hash) UnmarshalJSON(data []byte) error {
 func (h Hash) LastUint64() uint64 { return binary.LittleEndian.Uint64(h[24:]) }
 
 func smallKeyedHash(key [Size]byte, data []byte) Hash {
-	keyWords := blake3KeyWords(key)
-	node := guts.CompressChunk(data, &keyWords, 0, guts.FlagKeyedHash)
-	return rootNodeHash(node)
-}
-
-func blake3KeyWords(key [Size]byte) (words [8]uint32) {
-	for i := range words {
-		words[i] = binary.LittleEndian.Uint32(key[i*4:])
-	}
-	return words
-}
-
-func rootNodeHash(node guts.Node) Hash {
-	node.Flags |= guts.FlagRoot
-	block := guts.WordsToBytes(guts.CompressNode(node))
-	var out Hash
-	copy(out[:], block[:Size])
-	return out
+	return Hash(blake3.Sum256KeyedChunk(key, data))
 }
 
 func pooledHash(pool *sync.Pool, data []byte) Hash {
@@ -194,7 +176,7 @@ func pooledHash(pool *sync.Pool, data []byte) Hash {
 
 // Chunk computes the Xet leaf hash of uncompressed chunk bytes.
 func Chunk(data []byte) Hash {
-	if len(data) <= guts.ChunkSize {
+	if len(data) <= blake3.ChunkSize {
 		return smallKeyedHash(dataKey, data)
 	}
 	return pooledDataHash(data)
@@ -228,7 +210,7 @@ func Chunks(data [][]byte) []Hash {
 			if i >= len(data) {
 				return
 			}
-			if len(data[i]) <= guts.ChunkSize {
+			if len(data[i]) <= blake3.ChunkSize {
 				out[i] = smallKeyedHash(dataKey, data[i])
 			} else {
 				out[i] = pooledBatchHash(data[i])
@@ -268,7 +250,7 @@ func releaseChunkBatchWorkers(workers int) {
 // Internal computes the Xet internal-node hash of an already formatted node
 // message.
 func Internal(message []byte) Hash {
-	if len(message) <= guts.ChunkSize {
+	if len(message) <= blake3.ChunkSize {
 		return smallKeyedHash(internalKey, message)
 	}
 	return pooledHash(&internalHashers, message)

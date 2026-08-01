@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"lukechampine.com/blake3"
+	"github.com/jmwoliver/blake3"
 )
 
 func TestHashCanonicalText(t *testing.T) {
@@ -275,7 +275,7 @@ func BenchmarkChunkHashBatch64KiB(b *testing.B) {
 	}
 	b.SetBytes(int64(len(chunks) * len(chunks[0])))
 	b.ReportAllocs()
-	for b.Loop() {
+	for i := 0; i < b.N; i++ {
 		_ = Chunks(chunks)
 	}
 }
@@ -304,7 +304,7 @@ func BenchmarkChunksCrossover(b *testing.B) {
 		b.Run(test.name+"/individual", func(b *testing.B) {
 			b.SetBytes(int64(test.count * test.size))
 			b.ReportAllocs()
-			for b.Loop() {
+			for i := 0; i < b.N; i++ {
 				hashes := make([]Hash, len(chunks))
 				for i := range chunks {
 					hashes[i] = Chunk(chunks[i])
@@ -314,7 +314,7 @@ func BenchmarkChunksCrossover(b *testing.B) {
 		b.Run(test.name+"/batch", func(b *testing.B) {
 			b.SetBytes(int64(test.count * test.size))
 			b.ReportAllocs()
-			for b.Loop() {
+			for i := 0; i < b.N; i++ {
 				_ = Chunks(chunks)
 			}
 		})
@@ -338,21 +338,21 @@ func BenchmarkSmallKeyedHashes(b *testing.B) {
 		b.Run(fmt.Sprintf("chunk-%d", size), func(b *testing.B) {
 			b.SetBytes(int64(size))
 			b.ReportAllocs()
-			for b.Loop() {
+			for i := 0; i < b.N; i++ {
 				_ = Chunk(data)
 			}
 		})
 		b.Run(fmt.Sprintf("internal-%d", size), func(b *testing.B) {
 			b.SetBytes(int64(size))
 			b.ReportAllocs()
-			for b.Loop() {
+			for i := 0; i < b.N; i++ {
 				_ = Internal(data)
 			}
 		})
 	}
 	b.Run("protect", func(b *testing.B) {
 		b.ReportAllocs()
-		for b.Loop() {
+		for i := 0; i < b.N; i++ {
 			_ = Protect(Hash{1}, Hash{2})
 		}
 	})
@@ -364,7 +364,7 @@ func BenchmarkVerificationHashes(b *testing.B) {
 		b.Run(fmt.Sprintf("hashes-%d", count), func(b *testing.B) {
 			b.SetBytes(int64(count * Size))
 			b.ReportAllocs()
-			for b.Loop() {
+			for i := 0; i < b.N; i++ {
 				_ = Verification(hashes)
 			}
 		})

@@ -198,7 +198,7 @@ func TestStatisticsAndMedians(t *testing.T) {
 	if medianFloat([]float64{2, 4}) != 3 || medianUint64([]uint64{1, 2}) != 1 {
 		t.Fatal("even median calculation differs")
 	}
-	if expectedGoImplementation("stream_reuse") != "go-lukechampine-blake3" {
+	if expectedGoImplementation("stream_reuse") != "go-unified-blake3-fork" {
 		t.Fatal("streaming implementation label differs")
 	}
 }

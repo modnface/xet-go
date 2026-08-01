@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jmwoliver/blake3"
 	"github.com/jacobwoliver/xet-go/xethash"
-	"lukechampine.com/blake3"
 )
 
 var dataKey = [32]byte{
@@ -144,7 +144,7 @@ func benchmark(scenario string, size, iterations, workers int) (record, error) {
 func implementationName(scenario string) string {
 	switch scenario {
 	case "stream_new", "stream_reuse", "stream_segmented", "caller_parallel_segmented":
-		return "go-lukechampine-blake3"
+		return "go-unified-blake3-fork"
 	default:
 		return "go-xethash"
 	}

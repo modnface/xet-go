@@ -54,7 +54,7 @@ func TestRunAndErrors(t *testing.T) {
 	if got := implementationName("one_shot"); got != "go-xethash" {
 		t.Fatalf("one-shot implementation = %q", got)
 	}
-	if got := implementationName("stream_reuse"); got != "go-lukechampine-blake3" {
+	if got := implementationName("stream_reuse"); got != "go-unified-blake3-fork" {
 		t.Fatalf("streaming implementation = %q", got)
 	}
 	for _, args := range [][]string{
@@ -62,6 +62,8 @@ func TestRunAndErrors(t *testing.T) {
 		{"perf", "unknown", "64", "1", "1"},
 		{"perf", "one_shot", "bad", "1", "1"},
 		{"perf", "one_shot", "64", "0", "1"},
+		{"perf", "one_shot", "64", "1", "bad"},
+		{"perf", "one_shot", "64", "1", "0"},
 		{"perf", "one_shot", "64", "1", "2"},
 	} {
 		if err := run(args, &bytes.Buffer{}); err == nil {
