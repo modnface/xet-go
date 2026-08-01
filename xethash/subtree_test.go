@@ -98,6 +98,64 @@ func TestSubtreeRejectsInvalidJSONAndOrder(t *testing.T) {
 	}
 }
 
+func TestSubtreeEmptyNilAndInvalidContracts(t *testing.T) {
+	var nilTree *MerkleHashSubtree
+	if nilTree.AtStart() || nilTree.AtEnd() || nilTree.NumNodes() != 0 || nilTree.NumLevels() != 0 || !nilTree.IsEmpty() {
+		t.Fatal("nil subtree accessors differ")
+	}
+	if _, ok := nilTree.FinalHash(); ok {
+		t.Fatal("nil subtree has a final hash")
+	}
+	empty, err := MergeSubtrees()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash, ok := empty.FinalHash(); !ok || hash != Zero {
+		t.Fatalf("empty final hash = %v, %v", hash, ok)
+	}
+	if _, err := MergeSubtrees(nilTree); err == nil {
+		t.Fatal("nil first subtree merged")
+	}
+	if _, err := MergeSubtrees(NewSubtree(true, nil, false), nilTree); err == nil {
+		t.Fatal("nil later subtree merged")
+	}
+	partial := NewSubtree(true, subtreeNodes(2), false)
+	if _, ok := partial.FinalHash(); ok {
+		t.Fatal("partial subtree has a final hash")
+	}
+
+	corruptions := []*MerkleHashSubtree{
+		{atStart: true, atEnd: true, nodes: subtreeNodes(1)},
+		{atStart: true, atEnd: true, nodes: subtreeNodes(2), levels: [][2]int{{2, 0}}, leftOffsets: []int{0}, rightOffsets: []int{2}},
+		{atStart: true, atEnd: true, nodes: subtreeNodes(2), levels: [][2]int{{1, 0}, {1, 0}}, leftOffsets: []int{0, 1}, rightOffsets: []int{2, 2}},
+	}
+	for i, tree := range corruptions {
+		if _, ok := tree.FinalHash(); ok {
+			t.Errorf("corrupt subtree %d has a final hash", i)
+		}
+	}
+}
+
+func TestSubtreeJSONFailureContracts(t *testing.T) {
+	var nilTree *MerkleHashSubtree
+	if err := nilTree.UnmarshalJSON([]byte(`{}`)); err == nil {
+		t.Fatal("nil receiver unmarshal succeeded")
+	}
+	for name, wire := range map[string]string{
+		"syntax":       `{`,
+		"negative":     `{"nodes":[],"levels":[[-1,0]]}`,
+		"zero size":    `{"nodes":[{"hash":"0000000000000000000000000000000000000000000000000000000000000000","size":0}],"levels":[[1,0]]}`,
+		"invalid root": `{"nodes":[{"hash":"0000000000000000000000000000000000000000000000000000000000000000","size":1},{"hash":"0000000000000000000000000000000000000000000000000000000000000000","size":1}],"levels":[[2,0]],"at_start":true,"at_end":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var tree MerkleHashSubtree
+			if err := tree.UnmarshalJSON([]byte(wire)); err == nil {
+				t.Fatal("invalid subtree JSON succeeded")
+			}
+		})
+	}
+}
+
 func FuzzSubtreeMerge(f *testing.F) {
 	f.Add(uint16(100), uint16(37))
 	f.Add(uint16(1), uint16(0))

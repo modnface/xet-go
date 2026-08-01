@@ -75,7 +75,7 @@ xorb must have the same serialized length, before timings are reported.
 The local release gates are:
 
 ```sh
-./conformance/check-coverage.sh   # 75% aggregate statement floor
+./conformance/check-coverage.sh   # 95% aggregate statement floor
 ./conformance/fuzz-smoke.sh       # all 11 fuzz targets; XET_FUZZ_TIME overrides 2s
 ./conformance/cross-compile.sh    # seven supported GOOS/GOARCH targets
 ```

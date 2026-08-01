@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -96,35 +97,47 @@ type envInfo struct {
 }
 
 func main() {
-	goBinary := flag.String("go", "", "Go benchmark executable")
-	rustBinary := flag.String("rust", "", "Rust oracle executable")
-	inputPath := flag.String("input", "", "benchmark input")
-	iterations := flag.Int("iterations", 3, "iterations per timed sample")
-	sampleCount := flag.Int("samples", 5, "timed samples per implementation and operation")
-	jsonPath := flag.String("json", "", "JSON report path")
-	markdownPath := flag.String("markdown", "", "Markdown report path")
-	flag.Parse()
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		fatal(err)
+	}
+}
+
+func run(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("perf-compare", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	goBinary := flags.String("go", "", "Go benchmark executable")
+	rustBinary := flags.String("rust", "", "Rust oracle executable")
+	inputPath := flags.String("input", "", "benchmark input")
+	iterations := flags.Int("iterations", 3, "iterations per timed sample")
+	sampleCount := flags.Int("samples", 5, "timed samples per implementation and operation")
+	jsonPath := flags.String("json", "", "JSON report path")
+	markdownPath := flags.String("markdown", "", "Markdown report path")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 	if *goBinary == "" || *rustBinary == "" || *inputPath == "" || *jsonPath == "" || *markdownPath == "" ||
 		*iterations < 1 || *sampleCount < 1 {
-		fatal(errors.New("all paths and positive iteration/sample counts are required"))
+		return errors.New("all paths and positive iteration/sample counts are required")
 	}
 	result, err := compare(*goBinary, *rustBinary, *inputPath, *iterations, *sampleCount)
 	if err != nil {
-		fatal(err)
+		return err
 	}
 	jsonData, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
-		fatal(err)
+		return err
 	}
 	jsonData = append(jsonData, '\n')
 	if err := writeAtomic(*jsonPath, jsonData); err != nil {
-		fatal(err)
+		return err
 	}
 	if err := writeAtomic(*markdownPath, renderMarkdown(result)); err != nil {
-		fatal(err)
+		return err
 	}
-	fmt.Println(*jsonPath)
-	fmt.Println(*markdownPath)
+	if _, err := fmt.Fprintf(stdout, "%s\n%s\n", *jsonPath, *markdownPath); err != nil {
+		return err
+	}
+	return nil
 }
 
 func compare(goBinary, rustBinary, inputPath string, iterations, sampleCount int) (report, error) {

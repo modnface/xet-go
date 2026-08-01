@@ -33,13 +33,22 @@ type manifestFile struct {
 }
 
 func main() {
-	manifestPath := flag.String("manifest", "conformance/reference-manifest.json", "fixture manifest path")
-	destination := flag.String("destination", ".cache/xet-spec-reference-files", "download directory")
-	flag.Parse()
-	if err := run(*manifestPath, *destination); err != nil {
-		fmt.Fprintln(os.Stderr, "fetch-reference:", err)
-		os.Exit(1)
+	os.Exit(command(os.Args[1:], os.Stderr))
+}
+
+func command(args []string, stderr io.Writer) int {
+	flags := flag.NewFlagSet("fetch-reference", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	manifestPath := flags.String("manifest", "conformance/reference-manifest.json", "fixture manifest path")
+	destination := flags.String("destination", ".cache/xet-spec-reference-files", "download directory")
+	if err := flags.Parse(args); err != nil {
+		return 2
 	}
+	if err := run(*manifestPath, *destination); err != nil {
+		_, _ = fmt.Fprintln(stderr, "fetch-reference:", err)
+		return 1
+	}
+	return 0
 }
 
 func run(manifestPath, destination string) error {

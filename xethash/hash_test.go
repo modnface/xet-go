@@ -80,6 +80,40 @@ func TestHashRejectsMalformedValues(t *testing.T) {
 	}
 }
 
+func TestHashConvenienceAndFailureContracts(t *testing.T) {
+	hash := Chunk([]byte("copies"))
+	bytesValue := hash.Bytes()
+	if len(bytesValue) != Size {
+		t.Fatalf("Bytes length = %d", len(bytesValue))
+	}
+	bytesValue[0] ^= 0xff
+	if hash.Bytes()[0] == bytesValue[0] {
+		t.Fatal("Bytes aliases the hash")
+	}
+	if hash.IsZero() || !Zero.IsZero() {
+		t.Fatal("IsZero classification differs")
+	}
+	if _, err := ParseBase64("!"); !errors.Is(err, ErrInvalidHash) {
+		t.Fatalf("ParseBase64 error = %v", err)
+	}
+	if _, err := ParseBase64("AA"); !errors.Is(err, ErrInvalidHash) {
+		t.Fatalf("short ParseBase64 error = %v", err)
+	}
+	var decoded Hash
+	if err := decoded.UnmarshalText([]byte("bad")); !errors.Is(err, ErrInvalidHash) {
+		t.Fatalf("UnmarshalText error = %v", err)
+	}
+	if err := decoded.UnmarshalJSON([]byte("123")); !errors.Is(err, ErrInvalidHash) {
+		t.Fatalf("UnmarshalJSON error = %v", err)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("MustParse did not panic")
+		}
+	}()
+	_ = MustParse("bad")
+}
+
 func TestOfficialMerkleVectors(t *testing.T) {
 	h1 := MustParse("cfc5d07f6f03c29bbf424132963fe08d19a37d5757aaf520bf08119f05cd56d6")
 	h2 := MustParse("c3e67584b5c4fc2a89837ec39e40f2c8a6bb0b2987ac94cd4b31e5fbdd210a72")

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-readonly MINIMUM="${XET_COVERAGE_MIN:-75.0}"
+readonly MINIMUM="${XET_COVERAGE_MIN:-95.0}"
 readonly PROFILE="${1:-${ROOT_DIR}/coverage.out}"
 
 cd "${ROOT_DIR}"

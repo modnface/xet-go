@@ -122,6 +122,89 @@ func TestEncodeRejectsInvalidMetadata(t *testing.T) {
 	}
 }
 
+func TestMetadataValidationContracts(t *testing.T) {
+	if _, err := XorbFromObject(nil); err == nil {
+		t.Fatal("nil xorb object succeeded")
+	}
+	formatErr := &FormatError{Offset: 7, Reason: "reason"}
+	if got := formatErr.Error(); got != "shard: malformed data at offset 7: reason" {
+		t.Fatalf("FormatError = %q", got)
+	}
+	if err := validate(nil, true); err == nil {
+		t.Fatal("nil shard validated")
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Shard)
+	}{
+		{"upload footer", func(s *Shard) { s.Footer = &Footer{} }},
+		{"xorb no chunks", func(s *Shard) { s.Xorbs[0].Chunks = nil }},
+		{"xorb raw size", func(s *Shard) { s.Xorbs[0].RawBytes++ }},
+		{"xorb raw overflow", func(s *Shard) {
+			s.Xorbs[0].Chunks = []XorbChunk{{Length: ^uint32(0)}, {Offset: ^uint32(0), Length: 1}}
+		}},
+		{"file flags", func(s *Shard) { s.Files[0].Flags = 1 }},
+		{"empty term", func(s *Shard) { s.Files[0].Terms[0].End = s.Files[0].Terms[0].Start }},
+		{"zero term bytes", func(s *Shard) { s.Files[0].Terms[0].UnpackedBytes = 0 }},
+		{"verification mismatch", func(s *Shard) { s.Files[0].Terms[0].Verification = xethash.Chunk([]byte("wrong")) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := sampleShard(t)
+			test.mutate(&value)
+			if err := validate(&value, true); err == nil {
+				t.Fatal("invalid metadata validated")
+			}
+		})
+	}
+	if _, ok := checkedTableEnd(^uint64(0)-1, 2, 2); ok {
+		t.Fatal("overflowing table bounds succeeded")
+	}
+	if end, ok := checkedTableEnd(3, 2, 4); !ok || end != 11 {
+		t.Fatalf("checkedTableEnd = %d, %v", end, ok)
+	}
+	if allZero([]byte{0, 1}) || !allZero(nil) || isBookend(nil) {
+		t.Fatal("record helper classification differs")
+	}
+	if _, err := takeRecord(make([]byte, RecordSize), -1, RecordSize); err == nil {
+		t.Fatal("negative record offset succeeded")
+	}
+}
+
+func TestDecodeRejectsSemanticCorruption(t *testing.T) {
+	base, err := EncodeUpload(sampleShard(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]func([]byte){
+		"magic":                 func(data []byte) { data[0] ^= 1 },
+		"version":               func(data []byte) { binary.LittleEndian.PutUint64(data[32:40], Version+1) },
+		"footer size":           func(data []byte) { binary.LittleEndian.PutUint64(data[40:48], 1) },
+		"file flags":            func(data []byte) { binary.LittleEndian.PutUint32(data[80:84], 1) },
+		"file reserved":         func(data []byte) { data[88] = 1 },
+		"file count":            func(data []byte) { binary.LittleEndian.PutUint32(data[84:88], ^uint32(0)) },
+		"verification reserved": func(data []byte) { data[176] = 1 },
+		"SHA reserved":          func(data []byte) { data[224] = 1 },
+		"xorb count":            func(data []byte) { binary.LittleEndian.PutUint32(data[324:328], ^uint32(0)) },
+		"chunk reserved":        func(data []byte) { data[380] = 1 },
+		"trailing data":         func(data []byte) { data[len(data)-1] = 0 },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			data := append([]byte(nil), base...)
+			if name == "trailing data" {
+				data = append(data, 0)
+			} else {
+				mutate(data)
+			}
+			if _, err := Decode(data); err == nil {
+				t.Fatal("semantic corruption decoded")
+			}
+		})
+	}
+}
+
 func TestDecodeAcceptsLegacyZeroSerializedSize(t *testing.T) {
 	value := sampleShard(t)
 	data, err := EncodeUpload(value)

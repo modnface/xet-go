@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"slices"
+	"strconv"
 	"testing"
 )
 
@@ -135,6 +136,130 @@ func TestStableBoundary(t *testing.T) {
 	}
 	if _, ok := NextStableBoundary(50_001, boundaries); ok {
 		t.Fatal("unexpected stable boundary")
+	}
+}
+
+func TestInputAndConfigurationContracts(t *testing.T) {
+	emit := func(Chunk) error { return nil }
+	if err := SplitContext(context.Background(), nil, DefaultConfig, emit); err == nil {
+		t.Fatal("nil reader succeeded")
+	}
+	if err := SplitContext(context.Background(), bytes.NewReader(nil), DefaultConfig, nil); err == nil {
+		t.Fatal("nil emitter succeeded")
+	}
+	if _, err := NewWriter(nil, DefaultConfig, emit); err == nil { //nolint:staticcheck // Verify that the API rejects a nil context.
+		t.Fatal("nil context succeeded")
+	}
+	if _, err := NewWriter(context.Background(), DefaultConfig, nil); err == nil {
+		t.Fatal("nil emitter succeeded")
+	}
+
+	for name, cfg := range map[string]Config{
+		"small target":         {TargetSize: 64},
+		"non-power target":     {TargetSize: 100},
+		"maximum overflow":     {TargetSize: 1 << (strconv.IntSize - 2)},
+		"negative minimum":     {TargetSize: 128, MinSize: -1, MaxSize: 256},
+		"reversed range":       {TargetSize: 128, MinSize: 5, MaxSize: 5},
+		"negative read buffer": {TargetSize: 128, ReadBufferSize: -1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewWriter(context.Background(), cfg, emit); err == nil {
+				t.Fatalf("NewWriter(%#v) succeeded", cfg)
+			}
+			if err := SplitContext(context.Background(), bytes.NewReader(nil), cfg, emit); err == nil {
+				t.Fatalf("SplitContext(%#v) succeeded", cfg)
+			}
+		})
+	}
+}
+
+type countReader struct {
+	count int
+	err   error
+}
+
+func (r countReader) Read([]byte) (int, error) { return r.count, r.err }
+
+type dataErrorReader struct {
+	done bool
+}
+
+func (r *dataErrorReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	p[0] = 'x'
+	return 1, errors.New("reader failed")
+}
+
+func TestReaderAndWriterFailureContracts(t *testing.T) {
+	emit := func(Chunk) error { return nil }
+	for name, reader := range map[string]io.Reader{
+		"negative count": countReader{count: -1},
+		"large count":    countReader{count: 2},
+		"no progress":    countReader{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := SplitContext(context.Background(), reader, Config{TargetSize: 128, ReadBufferSize: 1}, emit)
+			if err == nil {
+				t.Fatal("invalid reader succeeded")
+			}
+			if name == "no progress" && !errors.Is(err, io.ErrNoProgress) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+	wantReadErr := errors.New("reader failed")
+	reader := &dataErrorReader{}
+	if err := SplitContext(context.Background(), reader, Config{TargetSize: 128, ReadBufferSize: 1}, emit); err == nil || err.Error() != wantReadErr.Error() {
+		t.Fatalf("reader error = %v", err)
+	}
+
+	wantEmitErr := errors.New("emitter failed")
+	writer, err := NewWriter(context.Background(), Config{TargetSize: 128, MinSize: 1, MaxSize: 2}, func(Chunk) error { return wantEmitErr })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := writer.Write([]byte("ab")); n != 2 || !errors.Is(err, wantEmitErr) {
+		t.Fatalf("first Write = %d, %v", n, err)
+	}
+	if n, err := writer.Write([]byte("c")); n != 0 || !errors.Is(err, wantEmitErr) {
+		t.Fatalf("second Write = %d, %v", n, err)
+	}
+	if err := writer.Close(); !errors.Is(err, wantEmitErr) {
+		t.Fatalf("Close = %v", err)
+	}
+	if err := writer.Close(); err == nil {
+		t.Fatal("second Close succeeded")
+	}
+	if n, err := writer.Write(nil); n != 0 || err == nil {
+		t.Fatalf("Write after Close = %d, %v", n, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	canceled, err := NewWriter(ctx, DefaultConfig, emit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if n, err := canceled.Write([]byte("x")); n != 0 || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Write = %d, %v", n, err)
+	}
+
+	ctx, cancel = context.WithCancel(context.Background())
+	canceled, err = NewWriter(ctx, DefaultConfig, emit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := canceled.Close(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Close = %v", err)
+	}
+
+	chunk := Chunk{Offset: 7, Data: []byte("abc")}
+	if chunk.End() != 10 {
+		t.Fatalf("Chunk.End = %d", chunk.End())
 	}
 }
 
