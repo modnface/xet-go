@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jacobwoliver/xet-go/xethash"
+	"github.com/jmwoliver/xet-go/xethash"
 )
 
 const (

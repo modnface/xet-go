@@ -7,7 +7,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/jacobwoliver/xet-go/xetcas"
+	"github.com/jmwoliver/xet-go/xetcas"
 )
 
 // DownloadRequest is one item in DownloadGroup. Set exactly one of Writer and

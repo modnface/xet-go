@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jacobwoliver/xet-go/xethash"
+	"github.com/jmwoliver/xet-go/xethash"
 )
 
 // UploadJournal records content identities that reached CAS during an

@@ -8,8 +8,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/jacobwoliver/xet-go/xethash"
-	"github.com/jacobwoliver/xet-go/xorb"
+	"github.com/jmwoliver/xet-go/xethash"
+	"github.com/jmwoliver/xet-go/xorb"
 )
 
 type cancelAfterContext struct {

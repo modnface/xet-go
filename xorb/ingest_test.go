@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/jacobwoliver/xet-go/xethash"
+	"github.com/jmwoliver/xet-go/xethash"
 )
 
 func TestIngestNetworkCanonicalizesAndDescribesXorb(t *testing.T) {

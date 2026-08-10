@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jacobwoliver/xet-go/chunker"
-	"github.com/jacobwoliver/xet-go/xethash"
+	"github.com/jmwoliver/xet-go/chunker"
+	"github.com/jmwoliver/xet-go/xethash"
 )
 
 func TestHeaderEncoding(t *testing.T) {

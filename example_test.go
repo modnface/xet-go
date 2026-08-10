@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"net/url"
 
-	xet "github.com/jacobwoliver/xet-go"
-	"github.com/jacobwoliver/xet-go/xetcas"
+	xet "github.com/jmwoliver/xet-go"
+	"github.com/jmwoliver/xet-go/xetcas"
 )
 
 func ExampleNewClient() {

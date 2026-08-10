@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jacobwoliver/xet-go/xethash"
+	"github.com/jmwoliver/xet-go/xethash"
 )
 
 func TestAdaptiveLimiterIncreaseDecreaseAndCancellation(t *testing.T) {

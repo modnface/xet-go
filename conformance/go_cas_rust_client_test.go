@@ -19,10 +19,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jacobwoliver/xet-go/chunker"
-	"github.com/jacobwoliver/xet-go/xetcas"
-	cas_server "github.com/jacobwoliver/xet-go/xetcas/server"
-	"github.com/jacobwoliver/xet-go/xethash"
+	"github.com/jmwoliver/xet-go/chunker"
+	"github.com/jmwoliver/xet-go/xetcas"
+	cas_server "github.com/jmwoliver/xet-go/xetcas/server"
+	"github.com/jmwoliver/xet-go/xethash"
 )
 
 type rustRemoteRoundtrip struct {

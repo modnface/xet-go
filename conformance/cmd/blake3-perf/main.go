@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/jmwoliver/blake3"
-	"github.com/jacobwoliver/xet-go/xethash"
+	"github.com/jmwoliver/xet-go/xethash"
 )
 
 var dataKey = [32]byte{

@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jacobwoliver/xet-go/shard"
-	"github.com/jacobwoliver/xet-go/xetcas"
-	"github.com/jacobwoliver/xet-go/xethash"
-	"github.com/jacobwoliver/xet-go/xorb"
+	"github.com/jmwoliver/xet-go/shard"
+	"github.com/jmwoliver/xet-go/xetcas"
+	"github.com/jmwoliver/xet-go/xethash"
+	"github.com/jmwoliver/xet-go/xorb"
 )
 
 type authorizerFunc func(context.Context, string, AccessRequest) (Grant, error)

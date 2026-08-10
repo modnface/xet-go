@@ -1,4 +1,4 @@
-module github.com/jacobwoliver/xet-go
+module github.com/jmwoliver/xet-go
 
 go 1.23.0
 

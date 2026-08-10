@@ -29,7 +29,7 @@ source baseline.
   empty for an unauthenticated local CAS.
 
 ```sh
-go get github.com/jacobwoliver/xet-go
+go get github.com/jmwoliver/xet-go
 ```
 
 The release library has no C or Rust dependency. Its only direct dependencies

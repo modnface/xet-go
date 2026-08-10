@@ -12,10 +12,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/jacobwoliver/xet-go/chunker"
-	"github.com/jacobwoliver/xet-go/shard"
-	"github.com/jacobwoliver/xet-go/xethash"
-	"github.com/jacobwoliver/xet-go/xorb"
+	"github.com/jmwoliver/xet-go/chunker"
+	"github.com/jmwoliver/xet-go/shard"
+	"github.com/jmwoliver/xet-go/xethash"
+	"github.com/jmwoliver/xet-go/xorb"
 )
 
 type oracleChunk struct {

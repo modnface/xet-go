@@ -107,7 +107,7 @@ xcrun llvm-objdump --disassemble-symbols=_blake3_hash_many_neon "${RUST_BENCHMAR
 (
 	cd "${ROOT_DIR}"
 	go test -run '^$' \
-		-gcflags='github.com/jacobwoliver/xet-go/xethash=-m=2' ./xethash
+		-gcflags='github.com/jmwoliver/xet-go/xethash=-m=2' ./xethash
 ) >"${OUTPUT_DIR}/go-xethash-escape-inline.txt" 2>&1
 (
 	cd "${ROOT_DIR}"

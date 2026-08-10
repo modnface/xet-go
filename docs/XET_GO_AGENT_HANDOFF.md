@@ -45,7 +45,7 @@ go test ./...
 
 Treat every existing modification as intentional until it has been reviewed. Make small commits organized by behavior. Do not fold unrelated current changes into a rewrite.
 
-There is also a repository/module-path discrepancy to resolve before a public release: the public repository has been referenced as `github.com/jmwoliver/xet-go`, while the current `go.mod` uses `github.com/jacobwoliver/xet-go`. Do not silently change it. Confirm the canonical path with the owner, then perform a deliberate one-time migration before publishing stable module versions.
+The repository/module-path discrepancy has been resolved with the owner: `github.com/jmwoliver/xet-go` is the canonical repository and Go module path. The deliberate one-time migration was completed before publishing stable module versions.
 
 ## 3. Product boundary
 
