@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jacobwoliver/xet-go/shard"
 	"github.com/jacobwoliver/xet-go/xetcas"
 	"github.com/jacobwoliver/xet-go/xethash"
 )
@@ -117,8 +118,14 @@ func (s *Service) handleShardV2(w http.ResponseWriter, r *http.Request, credenti
 		writeServerError(w, r, err)
 		return
 	}
+	release, err := s.acquireIngest(r.Context())
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
 	data, err := readBounded(r.Body, r.ContentLength, s.maxShard)
 	if err != nil {
+		release()
 		writeServerError(w, r, err)
 		return
 	}
@@ -132,6 +139,7 @@ func (s *Service) handleShardV2(w http.ResponseWriter, r *http.Request, credenti
 	}
 	last := validationEvent{Type: "validating"}
 	if encoder.Encode(last) != nil {
+		release()
 		return
 	}
 	flushResponse(w)
@@ -141,6 +149,7 @@ func (s *Service) handleShardV2(w http.ResponseWriter, r *http.Request, credenti
 	}
 	completed := make(chan outcome, 1)
 	go func() {
+		defer release()
 		result, err := s.publishShard(r.Context(), grant, data)
 		completed <- outcome{result: result, err: err}
 	}()
@@ -398,6 +407,8 @@ func writeServerError(w http.ResponseWriter, r *http.Request, err error) {
 
 func serverErrorStatus(err error) int {
 	switch {
+	case errors.Is(err, shard.ErrXorbLookup):
+		return http.StatusInternalServerError
 	case errors.Is(err, ErrUnauthorized):
 		return http.StatusUnauthorized
 	case errors.Is(err, ErrForbidden):

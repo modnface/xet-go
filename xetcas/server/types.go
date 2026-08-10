@@ -121,10 +121,12 @@ type Options struct {
 	Authorizer Authorizer
 	Now        func() time.Time
 
-	DedupProtectionKey xethash.Hash
-	DedupTTL           time.Duration
-	MaxXorbBody        int64
-	MaxShardBody       int64
+	DedupProtectionKey   xethash.Hash
+	DedupTTL             time.Duration
+	MaxXorbBody          int64
+	MaxShardBody         int64
+	RegistrationLimits   shard.RegistrationLimits
+	MaxConcurrentIngests int
 }
 
 type ShardResult struct {

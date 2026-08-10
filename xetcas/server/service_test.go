@@ -18,6 +18,12 @@ import (
 	"github.com/jacobwoliver/xet-go/xorb"
 )
 
+type authorizerFunc func(context.Context, string, AccessRequest) (Grant, error)
+
+func (f authorizerFunc) Authorize(ctx context.Context, credential string, request AccessRequest) (Grant, error) {
+	return f(ctx, credential, request)
+}
+
 func testService(t testing.TB, store *MemoryStore, index IndexStore) *Service {
 	t.Helper()
 	if index == nil {
@@ -196,6 +202,108 @@ func TestServiceAuthLimitsAndExistence(t *testing.T) {
 	}
 	if found, err := service.XorbExists(ctx, "secret", xetcas.DefaultXorbPrefix, hash); err != nil || found {
 		t.Fatalf("absent xorb = %v, %v", found, err)
+	}
+}
+
+func TestServiceRejectsAmplifiedShardBeforePublication(t *testing.T) {
+	store := NewMemoryStore()
+	service, err := New(Options{
+		Blobs: store, Index: store,
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
+			return "https://storage.example/object", nil
+		}),
+		Authorizer: AllowAllAuthorizer{},
+		RegistrationLimits: shard.RegistrationLimits{
+			MaxChunkReferences: 2,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	none, _, value, body := uploadFixture(t)
+	if _, err := service.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UploadShard(ctx, "", bytes.NewReader(body), int64(len(body))); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("amplified shard error = %v", err)
+	}
+	if _, found, err := store.GetFile(ctx, value.Files[0].Hash); err != nil || found {
+		t.Fatalf("over-budget file publication = %v, %v", found, err)
+	}
+}
+
+func TestReadPlanningRejectsAmplifiedStoredRecipe(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	writer := testService(t, store, nil)
+	none, _, value, body := uploadFixture(t)
+	if _, err := writer.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.UploadShard(ctx, "", bytes.NewReader(body), int64(len(body))); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := New(Options{
+		Blobs: store, Index: store, Authorizer: AllowAllAuthorizer{},
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
+			return "https://storage.example/object", nil
+		}),
+		RegistrationLimits: shard.RegistrationLimits{MaxChunkReferences: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileHash := value.Files[0].Hash
+	if _, err := reader.ReconstructionV2(ctx, "", fileHash, nil); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("v2 amplified recipe = %v", err)
+	}
+	if _, err := reader.ReconstructionV1(ctx, "", fileHash, nil); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("v1 amplified recipe = %v", err)
+	}
+	if _, err := reader.FileChunkHashes(ctx, "", fileHash, []xetcas.FileRange{{Start: 0, End: 1}}); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("chunk-hash amplified recipe = %v", err)
+	}
+}
+
+func TestGlobalFileIndexStillRequiresScopedReadAuthorization(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	writer := testService(t, store, nil)
+	none, _, value, body := uploadFixture(t)
+	if _, err := writer.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.UploadShard(ctx, "", bytes.NewReader(body), int64(len(body))); err != nil {
+		t.Fatal(err)
+	}
+
+	fileHash := value.Files[0].Hash
+	var authorized AccessRequest
+	reader, err := New(Options{
+		Blobs: store, Index: store,
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
+			return "https://storage.example/object", nil
+		}),
+		Authorizer: authorizerFunc(func(_ context.Context, credential string, request AccessRequest) (Grant, error) {
+			authorized = request
+			if credential != "tenant-b" || request.Operation != OperationReadFile || request.Hash == fileHash {
+				return Grant{}, ErrForbidden
+			}
+			return Grant{Namespace: "tenant-b"}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ReconstructionV2(ctx, "tenant-b", fileHash, nil); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("cross-scope reconstruction = %v", err)
+	}
+	if authorized.Operation != OperationReadFile || authorized.Hash != fileHash {
+		t.Fatalf("authorization request = %#v", authorized)
 	}
 }
 

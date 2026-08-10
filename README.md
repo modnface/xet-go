@@ -167,8 +167,8 @@ cas, err := server.New(server.Options{
 	Index:      store,
 	Authorizer: server.StaticTokenAuthorizer{Token: os.Getenv("XET_CAS_TOKEN")},
 	Signer:     objectRangeSigner,
-	// Configure a stable secret in production so protected dedup shards remain
-	// usable across process restarts.
+	// Optional: each protected shard embeds the key needed by clients, so key
+	// rotation does not invalidate shards already issued within their TTL.
 	DedupProtectionKey: protectionKey,
 })
 if err != nil {
@@ -182,11 +182,16 @@ Shard registration resolves durable xorb metadata and recomputes term and file
 identities instead of trusting client accounting. Publication writes the full
 shard and secondary indexes before exposing file reconstruction records. v2
 shard responses stream NDJSON heartbeats and a terminal result or error.
+Registration has configurable file, xorb, term, and aggregate chunk-reference
+budgets; ingestion admission is bounded before request bodies are buffered.
 
 The OpenAPI dedup namespace is `default-merkledb`; the server also accepts
 `default` because released official Rust clients currently reuse their xorb
 prefix for dedup requests. Repository reachability policy and S3/GCS signing
-belong in the injected adapters, not this module.
+belong in the injected adapters, not this module. File, xorb, and dedup indexes
+are physically global: an `Authorizer` must scope every hash-bearing request by
+repository reachability. `Grant.Namespace` scopes only SHA-256 associations and
+is not by itself a file-read authorization boundary.
 
 ## Package map
 

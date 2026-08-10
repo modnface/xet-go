@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -75,6 +76,7 @@ func TestNewServiceValidationAndDefaults(t *testing.T) {
 		"large xorb limit":   func(value *Options) { value.MaxXorbBody = xorb.MaxNetworkSize + 1 },
 		"zero shard limit":   func(value *Options) { value.MaxShardBody = -1 },
 		"large shard limit":  func(value *Options) { value.MaxShardBody = shard.MaxSize + 1 },
+		"negative ingests":   func(value *Options) { value.MaxConcurrentIngests = -1 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			options := base
@@ -90,9 +92,27 @@ func TestNewServiceValidationAndDefaults(t *testing.T) {
 	}
 	if service.now == nil || service.dedupKey.IsZero() || service.dedupTTL != time.Hour ||
 		service.maxXorb != xorb.MaxNetworkSize || service.maxShard != shard.MaxSize ||
+		service.registration.MaxFiles != defaultMaxRegistrationFiles ||
+		service.registration.MaxXorbs != defaultMaxRegistrationXorbs ||
+		service.registration.MaxTerms != defaultMaxRegistrationTerms ||
+		service.registration.MaxChunkReferences != defaultMaxRegistrationChunkRefs ||
+		cap(service.ingestSlots) != defaultMaxConcurrentIngests ||
 		service.shardHeartbeat != defaultShardHeartbeat {
 		t.Fatalf("defaults = %#v", service)
 	}
+
+	release, err := service.acquireIngest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.ingestSlots <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := service.acquireIngest(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ingest admission cancellation = %v", err)
+	}
+	<-service.ingestSlots
+	release()
 }
 
 func TestMemoryStoreBlobContractsAndClonesIndexes(t *testing.T) {
@@ -282,6 +302,24 @@ func TestServiceValidationAndReadFailures(t *testing.T) {
 	}
 }
 
+func TestValidateRecipeWorkRejectsAmplifiedAndMalformedRecipes(t *testing.T) {
+	service := &Service{registration: shard.RegistrationLimits{MaxTerms: 1, MaxChunkReferences: 2}}
+	if err := service.validateRecipeWork(context.Background(), shard.RegisteredFile{File: shard.File{Terms: []shard.Term{{}, {}}}}); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("term limit error = %v", err)
+	}
+	if err := service.validateRecipeWork(context.Background(), shard.RegisteredFile{File: shard.File{Terms: []shard.Term{{Start: 2, End: 1}}}}); err == nil {
+		t.Fatal("reversed stored range succeeded")
+	}
+	if err := service.validateRecipeWork(context.Background(), shard.RegisteredFile{File: shard.File{Terms: []shard.Term{{Start: 0, End: 3}}}}); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("chunk reference limit error = %v", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := service.validateRecipeWork(canceled, shard.RegisteredFile{File: shard.File{Terms: []shard.Term{{}}}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled recipe validation = %v", err)
+	}
+}
+
 func TestInjectedStorageIndexAndSignerFailuresPropagate(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryStore()
@@ -306,7 +344,7 @@ func TestInjectedStorageIndexAndSignerFailuresPropagate(t *testing.T) {
 		t.Fatal(err)
 	}
 	faults.failAt = "get-xorb"
-	if _, err := service.UploadShard(ctx, "", bytes.NewReader(uploadBody), int64(len(uploadBody))); !errors.Is(err, ErrInvalid) {
+	if _, err := service.UploadShard(ctx, "", bytes.NewReader(uploadBody), int64(len(uploadBody))); err == nil || errors.Is(err, ErrInvalid) || !errors.Is(err, shard.ErrXorbLookup) {
 		t.Fatalf("registration index failure = %v", err)
 	}
 	service.blobs = faultBlobStore{BlobStore: store, putErr: putFailure}
@@ -567,7 +605,10 @@ func TestHandlerErrorMappingAndStreamingShardEvents(t *testing.T) {
 		"too large":    {ErrTooLarge, http.StatusRequestEntityTooLarge},
 		"conflict":     {ErrConflict, http.StatusConflict},
 		"invalid":      {ErrInvalid, http.StatusBadRequest},
-		"internal":     {errors.New("internal"), http.StatusInternalServerError},
+		"lookup marker precedence": {
+			fmt.Errorf("%w: %w", shard.ErrXorbLookup, ErrNotFound), http.StatusInternalServerError,
+		},
+		"internal": {errors.New("internal"), http.StatusInternalServerError},
 	} {
 		t.Run(name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodGet, "/", nil)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"time"
 
 	"github.com/jacobwoliver/xet-go/shard"
@@ -31,6 +32,31 @@ func (s *Service) File(ctx context.Context, credential string, hash xethash.Hash
 	return s.file(ctx, credential, hash)
 }
 
+func (s *Service) validateRecipeWork(ctx context.Context, file shard.RegisteredFile) error {
+	if uint64(len(file.File.Terms)) > s.registration.MaxTerms {
+		return fmt.Errorf("%w: reconstruction has %d terms, limit %d",
+			ErrTooLarge, len(file.File.Terms), s.registration.MaxTerms)
+	}
+	var references uint64
+	for i, term := range file.File.Terms {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		if term.End < term.Start {
+			return errors.New("xet CAS server: stored reconstruction has a reversed chunk range")
+		}
+		count := uint64(term.End - term.Start)
+		if math.MaxUint64-references < count || references+count > s.registration.MaxChunkReferences {
+			return fmt.Errorf("%w: reconstruction exceeds %d chunk references",
+				ErrTooLarge, s.registration.MaxChunkReferences)
+		}
+		references += count
+	}
+	return nil
+}
+
 func (s *Service) layoutLookup(ctx context.Context) xetcas.XorbLayoutLookup {
 	return func(hash xethash.Hash) (*xorb.Ingested, bool, error) {
 		value, found, err := s.index.GetXorb(ctx, hash)
@@ -53,7 +79,10 @@ func (s *Service) ReconstructionV2(
 	if err != nil {
 		return nil, err
 	}
-	plan, err := xetcas.PlanReconstruction(file.File, requested, s.layoutLookup(ctx))
+	if err := s.validateRecipeWork(ctx, file.File); err != nil {
+		return nil, err
+	}
+	plan, err := xetcas.PlanReconstructionContext(ctx, file.File, requested, s.layoutLookup(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +120,10 @@ func (s *Service) ReconstructionV1(
 	if err != nil {
 		return nil, err
 	}
-	plan, err := xetcas.PlanReconstruction(file.File, requested, s.layoutLookup(ctx))
+	if err := s.validateRecipeWork(ctx, file.File); err != nil {
+		return nil, err
+	}
+	plan, err := xetcas.PlanReconstructionContext(ctx, file.File, requested, s.layoutLookup(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +156,7 @@ func (s *Service) BatchReconstructionV1(
 		FetchInfo: make(map[xethash.Hash][]xetcas.V1FetchInfo),
 	}
 	seen := make(map[xethash.Hash]struct{}, len(hashes))
+	var responseTerms uint64
 	for _, hash := range hashes {
 		if _, duplicate := seen[hash]; duplicate {
 			continue
@@ -136,6 +169,11 @@ func (s *Service) BatchReconstructionV1(
 		if err != nil {
 			return nil, err
 		}
+		if uint64(len(value.Terms)) > s.registration.MaxTerms-responseTerms {
+			return nil, fmt.Errorf("%w: batch reconstruction exceeds %d terms",
+				ErrTooLarge, s.registration.MaxTerms)
+		}
+		responseTerms += uint64(len(value.Terms))
 		response.Files[hash] = value.Terms
 		for xorbHash, fetches := range value.FetchInfo {
 			response.FetchInfo[xorbHash] = append(response.FetchInfo[xorbHash], fetches...)
@@ -154,7 +192,10 @@ func (s *Service) FileChunkHashes(
 	if err != nil {
 		return nil, err
 	}
-	return xetcas.PlanFileChunkHashes(file.File, dirty, s.layoutLookup(ctx))
+	if err := s.validateRecipeWork(ctx, file.File); err != nil {
+		return nil, err
+	}
+	return xetcas.PlanFileChunkHashesContext(ctx, file.File, dirty, s.layoutLookup(ctx))
 }
 
 func (s *Service) GlobalDedup(

@@ -27,8 +27,9 @@
 | Global protection hash | Keyed BLAKE3, despite historical “HMAC” naming |
 | Upload shard accounting | Zero serialized-xorb size is accepted and preserved because released xet-core upload sessions emit it; durable size/layout come from the independently validated xorb |
 | CAS server | Storage-neutral blob/index/signer/authorizer interfaces; canonical xorb and shard publication; v1/v2, batch, dedup, HEAD, and sparse-delta routes |
-| Shard publication | Canonical blob, non-unique dedup indexes, scoped SHA-256, then first-valid reconstructable file records; every write is retryable after partial failure |
+| Shard publication | Canonical blob, non-unique dedup indexes, scoped SHA-256, then first-valid reconstructable file records; in-process tests prove idempotent replay after partial failure, not cross-store atomicity |
 | Shard progress | v2 NDJSON emits validation/commit/result or terminal error frames and periodically repeats the latest frame as a heartbeat |
+| Server work limits | Configurable file/xorb/term/chunk-reference budgets, context-aware planners, bounded compact-gap memory, and pre-buffer ingestion admission |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
 | Credential refresh | Refresh 30 seconds before expiry, coalesce concurrent refresh, and retry exactly once after a 401 invalidation |
@@ -59,3 +60,49 @@ reachability and cloud-specific signing remain adapter responsibilities.
 
 Compatibility is continuously checked by the requirement matrix in
 [CONFORMANCE.md](CONFORMANCE.md).
+
+## Namespace and publication invariants
+
+- Xorb bytes may be physically deduplicated globally, but hash possession is
+  not authorization. `Authorizer.Authorize` runs before every externally
+  reachable file, xorb, dedup, and shard operation and must enforce the
+  credential's repository/storage reachability.
+- File reconstruction and shard registration authorize their top-level
+  operation once; underlying global Xorb lookups inherit that grant. An
+  `OperationWriteShard` grant therefore must be allowed to reference the
+  service's entire Xorb storage domain unless the injected index is itself
+  partitioned. The current interface does not authorize each referenced Xorb.
+- `Grant.Namespace` scopes `(SHA-256, size) -> Xet file` associations only.
+  File, xorb, and dedup index keys are global protocol identities; a static
+  all-operations token is suitable only for a single-scope deployment.
+- Xorb publication stores canonical immutable bytes before publishing layout
+  metadata. Shard publication stores the canonical shard before dedup and SHA
+  secondary indexes and publishes reconstructable file records last.
+- Every index write is idempotent. File and dedup indexes are non-unique
+  secondary indexes and may retain any already-valid durable source. A SHA key
+  is immutable within its namespace.
+- The service's publication order makes retry after a lost response safe, but
+  the interfaces do not create a transaction across object and index stores.
+  Durable adapters must not report success before their writes are durable.
+
+## Durable backend gap list
+
+The current server provides only the concurrency-safe memory reference store.
+Filesystem/SQLite and S3/PostgreSQL adapters still need to prove these
+invariants before production durability is claimed:
+
+1. conditional immutable object writes with identity/length verification and
+   crash-safe replacement on local filesystems;
+2. one SQL transaction for dedup, scoped SHA, and file-index publication, with
+   readers unable to observe a dangling or incomplete reconstruction root;
+3. staged-object protection and restart cleanup for a crash between object
+   publication and SQL commit;
+4. deterministic first-valid selection when duplicate file or dedup rows exist,
+   plus constraints for truly immutable xorb and SHA records;
+5. repository-aware authorization or partitioning for global identities,
+   including an explicit policy for transitive Xorb dependencies;
+6. paginated iteration over objects and indexes for audit, repair, migration,
+   and garbage collection without whole-bucket materialization; and
+7. cancellation-aware filesystem, SQL, S3, and signed-range operations, tested
+   with failures injected after every publication step and a real process
+   restart.

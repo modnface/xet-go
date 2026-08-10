@@ -16,8 +16,13 @@ import (
 )
 
 const (
-	defaultDedupTTL       = time.Hour
-	defaultShardHeartbeat = 5 * time.Second
+	defaultDedupTTL                 = time.Hour
+	defaultShardHeartbeat           = 5 * time.Second
+	defaultMaxRegistrationFiles     = 100_000
+	defaultMaxRegistrationXorbs     = 65_536
+	defaultMaxRegistrationTerms     = 250_000
+	defaultMaxRegistrationChunkRefs = 4_000_000
+	defaultMaxConcurrentIngests     = 2
 )
 
 type Service struct {
@@ -30,6 +35,8 @@ type Service struct {
 	dedupTTL       time.Duration
 	maxXorb        int64
 	maxShard       int64
+	registration   shard.RegistrationLimits
+	ingestSlots    chan struct{}
 	shardHeartbeat time.Duration
 }
 
@@ -65,9 +72,30 @@ func New(options Options) (*Service, error) {
 	if maxXorb < 1 || maxXorb > xorb.MaxNetworkSize || maxShard < 1 || maxShard > shard.MaxSize {
 		return nil, errors.New("xet CAS server: invalid request body limits")
 	}
+	registration := options.RegistrationLimits
+	if registration.MaxFiles == 0 {
+		registration.MaxFiles = defaultMaxRegistrationFiles
+	}
+	if registration.MaxXorbs == 0 {
+		registration.MaxXorbs = defaultMaxRegistrationXorbs
+	}
+	if registration.MaxTerms == 0 {
+		registration.MaxTerms = defaultMaxRegistrationTerms
+	}
+	if registration.MaxChunkReferences == 0 {
+		registration.MaxChunkReferences = defaultMaxRegistrationChunkRefs
+	}
+	maxConcurrentIngests := options.MaxConcurrentIngests
+	if maxConcurrentIngests == 0 {
+		maxConcurrentIngests = defaultMaxConcurrentIngests
+	}
+	if maxConcurrentIngests < 1 {
+		return nil, errors.New("xet CAS server: maximum concurrent ingests must be positive")
+	}
 	return &Service{
 		blobs: options.Blobs, index: options.Index, signer: options.Signer, authorizer: options.Authorizer,
 		now: now, dedupKey: dedupKey, dedupTTL: dedupTTL, maxXorb: maxXorb, maxShard: maxShard,
+		registration: registration, ingestSlots: make(chan struct{}, maxConcurrentIngests),
 		shardHeartbeat: defaultShardHeartbeat,
 	}, nil
 }
@@ -78,6 +106,15 @@ func (s *Service) authorize(ctx context.Context, credential string, request Acce
 		return Grant{}, err
 	}
 	return grant, nil
+}
+
+func (s *Service) acquireIngest(ctx context.Context) (func(), error) {
+	select {
+	case s.ingestSlots <- struct{}{}:
+		return func() { <-s.ingestSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // UploadXorb validates a footerless body, stores its canonical complete form,
@@ -97,6 +134,11 @@ func (s *Service) UploadXorb(
 	}); err != nil {
 		return false, err
 	}
+	release, err := s.acquireIngest(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer release()
 	data, err := readBounded(body, contentLength, s.maxXorb)
 	if err != nil {
 		return false, err
@@ -204,6 +246,11 @@ func (s *Service) UploadShard(
 	if err != nil {
 		return ShardResult{}, err
 	}
+	release, err := s.acquireIngest(ctx)
+	if err != nil {
+		return ShardResult{}, err
+	}
+	defer release()
 	data, err := readBounded(body, contentLength, s.maxShard)
 	if err != nil {
 		return ShardResult{}, err
@@ -219,15 +266,24 @@ func (s *Service) publishShard(ctx context.Context, grant Grant, data []byte) (S
 	if upload.Footer != nil {
 		return ShardResult{}, fmt.Errorf("%w: shard upload must be footerless", ErrInvalid)
 	}
-	registration, err := shard.ValidateRegistration(*upload, func(hash xethash.Hash) (shard.Xorb, bool, error) {
+	registration, err := shard.ValidateRegistrationContext(ctx, *upload, func(hash xethash.Hash) (shard.Xorb, bool, error) {
 		record, found, err := s.index.GetXorb(ctx, hash)
 		if err != nil || !found {
 			return shard.Xorb{}, found, err
 		}
 		value, err := shard.XorbFromIngested(&record.Layout)
 		return value, err == nil, err
-	})
+	}, s.registration)
 	if err != nil {
+		if errors.Is(err, shard.ErrRegistrationLimit) {
+			return ShardResult{}, fmt.Errorf("%w: %v", ErrTooLarge, err)
+		}
+		if errors.Is(err, shard.ErrXorbLookup) {
+			return ShardResult{}, err
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return ShardResult{}, err
+		}
 		return ShardResult{}, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
 	canonical := shard.Shard{Files: make([]shard.File, len(registration.Files)), Xorbs: registration.Xorbs}
