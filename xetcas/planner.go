@@ -1,6 +1,7 @@
 package xetcas
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -31,11 +32,33 @@ func PlanReconstruction(
 	requested *FileRange,
 	lookup XorbLayoutLookup,
 ) (*ReconstructionPlan, error) {
+	return PlanReconstructionContext(context.Background(), file, requested, lookup)
+}
+
+// PlanReconstructionContext is PlanReconstruction with cancellation for
+// server-side planning over untrusted or very large recipes.
+func PlanReconstructionContext(
+	ctx context.Context,
+	file shard.RegisteredFile,
+	requested *FileRange,
+	lookup XorbLayoutLookup,
+) (*ReconstructionPlan, error) {
+	if ctx == nil {
+		return nil, errors.New("xet CAS: nil reconstruction context")
+	}
 	if lookup == nil {
 		return nil, errors.New("xet CAS: nil xorb layout lookup")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var recipeSize uint64
-	for _, term := range file.File.Terms {
+	for i, term := range file.File.Terms {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		if math.MaxUint64-recipeSize < uint64(term.UnpackedBytes) {
 			return nil, errors.New("xet CAS: reconstruction size overflows")
 		}
@@ -71,6 +94,9 @@ func PlanReconstruction(
 
 	layouts := make(map[xethash.Hash]*xorb.Ingested)
 	resolve := func(hash xethash.Hash) (*xorb.Ingested, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if value, ok := layouts[hash]; ok {
 			return value, nil
 		}
@@ -91,6 +117,11 @@ func PlanReconstruction(
 	termIndex := 0
 	var cumulative uint64
 	for termIndex < len(file.File.Terms) {
+		if termIndex&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		termSize := uint64(file.File.Terms[termIndex].UnpackedBytes)
 		if math.MaxUint64-cumulative < termSize {
 			return nil, errors.New("xet CAS: reconstruction size overflows")
@@ -107,6 +138,11 @@ func PlanReconstruction(
 	firstChunkByteStart := cumulative
 
 	for termIndex < len(file.File.Terms) && cumulative < end {
+		if termIndex&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		term := file.File.Terms[termIndex]
 		layout, err := resolve(term.XorbHash)
 		if err != nil {
@@ -203,8 +239,25 @@ func PlanFileChunkHashes(
 	dirty []FileRange,
 	lookup XorbLayoutLookup,
 ) (*FileChunkHashesResponse, error) {
+	return PlanFileChunkHashesContext(context.Background(), file, dirty, lookup)
+}
+
+// PlanFileChunkHashesContext is PlanFileChunkHashes with cancellation and
+// bounded-memory gap accumulation for server-side sparse planning.
+func PlanFileChunkHashesContext(
+	ctx context.Context,
+	file shard.RegisteredFile,
+	dirty []FileRange,
+	lookup XorbLayoutLookup,
+) (*FileChunkHashesResponse, error) {
+	if ctx == nil {
+		return nil, errors.New("xet CAS: nil file chunk hash context")
+	}
 	if lookup == nil {
 		return nil, errors.New("xet CAS: nil xorb layout lookup")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if len(dirty) == 0 {
 		return nil, errors.New("xet CAS: file chunk hash query requires a dirty range")
@@ -230,6 +283,9 @@ func PlanFileChunkHashes(
 
 	layouts := make(map[xethash.Hash]*xorb.Ingested)
 	resolve := func(hash xethash.Hash) (*xorb.Ingested, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if value, ok := layouts[hash]; ok {
 			return value, nil
 		}
@@ -244,8 +300,14 @@ func PlanFileChunkHashes(
 		return value, nil
 	}
 
-	chunks := make([]xethash.Node, 0)
+	builder := newChunkWindowBuilder(normalized)
+	var total, totalChunks uint64
 	for i, term := range file.File.Terms {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		layout, err := resolve(term.XorbHash)
 		if err != nil {
 			return nil, err
@@ -255,28 +317,36 @@ func PlanFileChunkHashes(
 			return nil, fmt.Errorf("xet CAS: term %d: %w", i, err)
 		}
 		for _, chunk := range layout.Chunks[term.Start:term.End] {
-			chunks = append(chunks, xethash.Node{Hash: chunk.Hash, Size: uint64(chunk.UncompressedLength)})
+			if totalChunks&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			node := xethash.Node{Hash: chunk.Hash, Size: uint64(chunk.UncompressedLength)}
+			if math.MaxUint64-total < node.Size {
+				return nil, errors.New("xet CAS: file chunk sizes overflow")
+			}
+			if totalChunks == math.MaxUint64 {
+				return nil, errors.New("xet CAS: file chunk count overflows")
+			}
+			total += node.Size
+			totalChunks++
+			builder.process(node, total)
 		}
-	}
-	builder := newChunkWindowBuilder(normalized)
-	var total uint64
-	for _, chunk := range chunks {
-		if math.MaxUint64-total < chunk.Size {
-			return nil, errors.New("xet CAS: file chunk sizes overflow")
-		}
-		total += chunk.Size
-		builder.process(chunk, total)
 	}
 	if total != file.Size {
 		return nil, fmt.Errorf("xet CAS: chunk sizes total %d, expected file size %d", total, file.Size)
 	}
-	windows, hashRanges := builder.finish()
+	windows, hashRanges, err := builder.finish()
+	if err != nil {
+		return nil, err
+	}
 	if len(windows) == 0 {
 		return nil, ErrRangeNotSatisfiable
 	}
 
 	response := &FileChunkHashesResponse{
-		TotalChunks: uint64(len(chunks)), FileSize: file.Size,
+		TotalChunks: totalChunks, FileSize: file.Size,
 		Windows: make([]ChunkWindow, len(windows)), HashRanges: hashRanges,
 	}
 	for i, value := range windows {
@@ -314,21 +384,66 @@ func PlanFileChunkHashes(
 	return response, nil
 }
 
+type subtreeAccumulator struct {
+	atStart bool
+	tree    *xethash.MerkleHashSubtree
+	pending []xethash.Node
+}
+
+func newSubtreeAccumulator(atStart bool) subtreeAccumulator {
+	return subtreeAccumulator{atStart: atStart, pending: make([]xethash.Node, 0, xorb.MaxChunks)}
+}
+
+func (a *subtreeAccumulator) add(node xethash.Node) error {
+	if len(a.pending) == xorb.MaxChunks {
+		if err := a.flush(false); err != nil {
+			return err
+		}
+	}
+	a.pending = append(a.pending, node)
+	return nil
+}
+
+func (a *subtreeAccumulator) flush(atEnd bool) error {
+	if len(a.pending) == 0 {
+		return nil
+	}
+	part := xethash.NewSubtree(a.tree == nil && a.atStart, a.pending, atEnd)
+	a.pending = a.pending[:0]
+	if a.tree == nil {
+		a.tree = part
+		return nil
+	}
+	merged, err := xethash.MergeSubtrees(a.tree, part)
+	if err != nil {
+		return err
+	}
+	a.tree = merged
+	return nil
+}
+
+func (a *subtreeAccumulator) finish(atEnd bool) (*xethash.MerkleHashSubtree, error) {
+	if err := a.flush(atEnd); err != nil {
+		return nil, err
+	}
+	return a.tree, nil
+}
+
 type chunkWindowBuilder struct {
 	dirty        []FileRange
 	dirtyIndex   int
 	inDirty      bool
-	gapIsFirst   bool
 	cursor       uint64
-	gapChunks    []xethash.Node
+	gap          subtreeAccumulator
 	windows      []FileRange
 	hashRanges   []*xethash.MerkleHashSubtree
 	tailPrevious uint64
 	hasTail      bool
+	err          error
 }
 
 func newChunkWindowBuilder(dirty []FileRange) *chunkWindowBuilder {
-	return &chunkWindowBuilder{dirty: dirty, gapIsFirst: true}
+	return &chunkWindowBuilder{dirty: dirty, gap: newSubtreeAccumulator(true)}
 }
 
 func (b *chunkWindowBuilder) process(chunk xethash.Node, byteEnd uint64) {
@@ -340,7 +455,9 @@ func (b *chunkWindowBuilder) process(chunk xethash.Node, byteEnd uint64) {
 			b.inDirty = true
 			b.hasTail = false
 		} else {
-			b.gapChunks = append(b.gapChunks, chunk)
+			if b.err == nil {
+				b.err = b.gap.add(chunk)
+			}
 		}
 	} else if overlaps || b.overlaps(b.dirtyIndex+1, byteStart, byteEnd) {
 		if !overlaps {
@@ -356,7 +473,6 @@ func (b *chunkWindowBuilder) process(chunk xethash.Node, byteEnd uint64) {
 		b.hasTail = true
 		if stable {
 			b.dirtyIndex++
-			b.gapIsFirst = false
 			b.inDirty = false
 			b.hasTail = false
 		}
@@ -366,7 +482,7 @@ func (b *chunkWindowBuilder) process(chunk xethash.Node, byteEnd uint64) {
 
 func (b *chunkWindowBuilder) open(byteEnd uint64) {
 	b.appendGap(false)
-	b.gapChunks = b.gapChunks[:0]
+	b.gap = newSubtreeAccumulator(false)
 	b.windows = append(b.windows, FileRange{Start: b.cursor, End: byteEnd})
 	b.mergeAhead(byteEnd)
 }
@@ -384,14 +500,21 @@ func (b *chunkWindowBuilder) mergeAhead(byteEnd uint64) {
 }
 
 func (b *chunkWindowBuilder) appendGap(atEnd bool) {
-	value := xethash.NewSubtree(b.gapIsFirst, b.gapChunks, atEnd)
+	if b.err != nil {
+		return
+	}
+	value, err := b.gap.finish(atEnd)
+	if err != nil {
+		b.err = fmt.Errorf("xet CAS: build compact gap subtree: %w", err)
+		return
+	}
 	if value.IsEmpty() {
 		value = nil
 	}
 	b.hashRanges = append(b.hashRanges, value)
 }
 
-func (b *chunkWindowBuilder) finish() ([]FileRange, []*xethash.MerkleHashSubtree) {
+func (b *chunkWindowBuilder) finish() ([]FileRange, []*xethash.MerkleHashSubtree, error) {
 	b.appendGap(true)
-	return b.windows, b.hashRanges
+	return b.windows, b.hashRanges, b.err
 }

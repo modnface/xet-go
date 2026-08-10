@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"slices"
 	"sync"
 	"testing"
@@ -223,6 +224,37 @@ func TestChunksSmallBatchFallback(t *testing.T) {
 		if want := Chunk(inputs[i]); got[i] != want {
 			t.Fatalf("small chunk %d: Chunks = %s, Chunk = %s", i, got[i], want)
 		}
+	}
+}
+
+func TestChunkBatchWorkerBudgetAndSerialHasher(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(4)
+	defer runtime.GOMAXPROCS(previousProcs)
+
+	chunkBatchBudget.Lock()
+	previousActive := chunkBatchBudget.active
+	chunkBatchBudget.active = 0
+	chunkBatchBudget.Unlock()
+	defer func() {
+		chunkBatchBudget.Lock()
+		chunkBatchBudget.active = previousActive
+		chunkBatchBudget.Unlock()
+	}()
+
+	workers := claimChunkBatchWorkers(4)
+	if workers != 4 {
+		t.Fatalf("first worker claim = %d, want 4", workers)
+	}
+	contended := claimChunkBatchWorkers(4)
+	if contended != 1 {
+		t.Fatalf("contended worker claim = %d, want 1", contended)
+	}
+	releaseChunkBatchWorkers(contended)
+	releaseChunkBatchWorkers(workers)
+
+	data := make([]byte, 64<<10)
+	if got, want := pooledBatchHash(data), Chunk(data); got != want {
+		t.Fatalf("serial batch hash = %s, want %s", got, want)
 	}
 }
 

@@ -126,6 +126,10 @@ func TestSplitCancellationAndEmitterError(t *testing.T) {
 	if err := Split(bytes.NewReader([]byte("x")), func(Chunk) error { return want }); !errors.Is(err, want) {
 		t.Fatalf("emitter error = %v", err)
 	}
+	if err := SplitContext(context.Background(), bytes.NewReader([]byte("abcd")),
+		Config{TargetSize: 128, MinSize: 1, MaxSize: 2}, func(Chunk) error { return want }); !errors.Is(err, want) {
+		t.Fatalf("write-time emitter error = %v", err)
+	}
 }
 
 func TestStableBoundary(t *testing.T) {
@@ -141,6 +145,10 @@ func TestStableBoundary(t *testing.T) {
 
 func TestInputAndConfigurationContracts(t *testing.T) {
 	emit := func(Chunk) error { return nil }
+	defaults, _, err := normalize(Config{})
+	if err != nil || defaults.TargetSize != TargetSize {
+		t.Fatalf("default normalization = %#v, %v", defaults, err)
+	}
 	if err := SplitContext(context.Background(), nil, DefaultConfig, emit); err == nil {
 		t.Fatal("nil reader succeeded")
 	}

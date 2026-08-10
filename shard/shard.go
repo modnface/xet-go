@@ -4,6 +4,7 @@ package shard
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -633,14 +634,29 @@ func validateFooter(f *Footer, metadataEnd, xorbStart, footerStart, total int) e
 }
 
 func validate(value *Shard, upload bool) error {
+	return validateContext(context.Background(), value, upload)
+}
+
+func validateContext(ctx context.Context, value *Shard, upload bool) error {
+	if ctx == nil {
+		return errors.New("shard: nil validation context")
+	}
 	if value == nil {
 		return errors.New("shard: nil value")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if upload && value.Footer != nil {
 		return errors.New("shard: upload form cannot contain a footer")
 	}
 	xorbs := make(map[xethash.Hash]Xorb, len(value.Xorbs))
 	for i, x := range value.Xorbs {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		if _, exists := xorbs[x.Hash]; exists {
 			return fmt.Errorf("shard: duplicate xorb hash %s", x.Hash)
 		}
@@ -656,6 +672,11 @@ func validate(value *Shard, upload bool) error {
 		var end uint64
 		nodes := make([]xethash.Node, len(x.Chunks))
 		for j, chunk := range x.Chunks {
+			if j&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			if upload && chunk.Flags&^uint32(ChunkFlagGlobalDedup) != 0 {
 				return fmt.Errorf("shard: xorb %d chunk %d has unsupported flags", i, j)
 			}
@@ -680,6 +701,11 @@ func validate(value *Shard, upload bool) error {
 	}
 	files := make(map[xethash.Hash]struct{}, len(value.Files))
 	for i, file := range value.Files {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		if _, exists := files[file.Hash]; exists {
 			return fmt.Errorf("shard: duplicate file hash %s", file.Hash)
 		}
@@ -688,6 +714,11 @@ func validate(value *Shard, upload bool) error {
 			return fmt.Errorf("shard: file %d has unsupported flags", i)
 		}
 		for j, term := range file.Terms {
+			if j&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			if upload && term.Flags != 0 {
 				return fmt.Errorf("shard: file %d term %d has unsupported flags", i, j)
 			}
@@ -703,7 +734,12 @@ func validate(value *Shard, upload bool) error {
 				}
 				var size uint64
 				hashes := make([]xethash.Hash, 0, term.End-term.Start)
-				for _, chunk := range x.Chunks[term.Start:term.End] {
+				for k, chunk := range x.Chunks[term.Start:term.End] {
+					if k&1023 == 0 {
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+					}
 					size += uint64(chunk.Length)
 					hashes = append(hashes, chunk.Hash)
 				}

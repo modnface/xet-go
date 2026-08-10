@@ -2,6 +2,8 @@ package xetcas
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -51,6 +53,19 @@ func layoutLookup(want *xorb.Ingested) XorbLayoutLookup {
 	return func(hash xethash.Hash) (*xorb.Ingested, bool, error) {
 		return want, hash == want.Hash, nil
 	}
+}
+
+type cancelOnSecondCheckContext struct {
+	context.Context
+	calls int
+}
+
+func (c *cancelOnSecondCheckContext) Err() error {
+	c.calls++
+	if c.calls >= 2 {
+		return context.Canceled
+	}
+	return nil
 }
 
 func TestPlanReconstructionMatchesRustRangeCropping(t *testing.T) {
@@ -103,6 +118,9 @@ func TestPlanReconstructionRejectsUnusableRecipes(t *testing.T) {
 	if _, err := PlanReconstruction(file, nil, nil); err == nil {
 		t.Fatal("nil layout lookup succeeded")
 	}
+	if _, err := PlanReconstructionContext(nil, file, nil, layoutLookup(layout)); err == nil { //nolint:staticcheck // Verify that the API rejects a nil context.
+		t.Fatal("nil context succeeded")
+	}
 	wrongSize := file
 	wrongSize.Size++
 	if _, err := PlanReconstruction(wrongSize, nil, layoutLookup(layout)); err == nil {
@@ -110,6 +128,71 @@ func TestPlanReconstructionRejectsUnusableRecipes(t *testing.T) {
 	}
 	if _, err := PlanReconstruction(shard.RegisteredFile{Size: 1}, nil, layoutLookup(layout)); err == nil {
 		t.Fatal("non-empty file without terms succeeded")
+	}
+	emptyWithTerms := shard.RegisteredFile{File: shard.File{Terms: []shard.Term{{}}}}
+	if _, err := PlanReconstruction(emptyWithTerms, nil, layoutLookup(layout)); err == nil {
+		t.Fatal("empty file with terms succeeded")
+	}
+	if _, err := PlanReconstruction(file, &FileRange{Start: 1, End: 1}, layoutLookup(layout)); err == nil {
+		t.Fatal("empty requested range succeeded")
+	}
+	wantErr := errors.New("layout failed")
+	if _, err := PlanReconstruction(file, nil, func(xethash.Hash) (*xorb.Ingested, bool, error) {
+		return nil, false, wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("layout error = %v", err)
+	}
+	if _, err := PlanReconstruction(file, nil, func(xethash.Hash) (*xorb.Ingested, bool, error) {
+		return nil, false, nil
+	}); err == nil {
+		t.Fatal("missing layout succeeded")
+	}
+	mismatchedLayout := *layout
+	mismatchedLayout.Hash = xethash.Chunk([]byte("other xorb"))
+	if _, err := PlanReconstruction(file, nil, func(xethash.Hash) (*xorb.Ingested, bool, error) {
+		return &mismatchedLayout, true, nil
+	}); err == nil {
+		t.Fatal("mismatched layout succeeded")
+	}
+	badRange := file
+	badRange.File.Terms = append([]shard.Term(nil), file.File.Terms...)
+	badRange.File.Terms[0].End++
+	if _, err := PlanReconstruction(badRange, nil, layoutLookup(layout)); err == nil {
+		t.Fatal("out-of-bounds chunk range succeeded")
+	}
+	badSerializedLayout := *layout
+	badSerializedLayout.NetworkBytes = 0
+	if _, err := PlanReconstruction(file, nil, layoutLookup(&badSerializedLayout)); err == nil {
+		t.Fatal("out-of-bounds serialized range succeeded")
+	}
+	if err := validateLayoutRange(layout, ChunkRange{}); err == nil {
+		t.Fatal("empty layout range succeeded")
+	}
+	if err := validateLayoutRange(layout, ChunkRange{Start: 0, End: uint32(len(layout.Chunks) + 1)}); err == nil {
+		t.Fatal("oversized layout range succeeded")
+	}
+	if plan, err := PlanReconstruction(shard.RegisteredFile{}, nil, layoutLookup(layout)); err != nil || len(plan.Terms) != 0 {
+		t.Fatalf("empty full-file plan = %#v, %v", plan, err)
+	}
+}
+
+func TestPlanReconstructionSkipsTermsAndPropagatesMidPlanCancellation(t *testing.T) {
+	file, layout := plannerFixture(t, []int{100, 100}, []ChunkRange{{0, 1}, {1, 2}})
+	plan, err := PlanReconstruction(file, &FileRange{Start: 100, End: 200}, layoutLookup(layout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Terms) != 1 || plan.Terms[0].Range != (ChunkRange{Start: 1, End: 2}) {
+		t.Fatalf("term-boundary plan = %#v", plan)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err = PlanReconstructionContext(ctx, file, nil, func(hash xethash.Hash) (*xorb.Ingested, bool, error) {
+		cancel()
+		return layout, hash == layout.Hash, nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("mid-plan cancellation = %v", err)
 	}
 }
 
@@ -138,13 +221,132 @@ func TestPlanFileChunkHashesContracts(t *testing.T) {
 	if _, err := PlanFileChunkHashes(file, []FileRange{{0, 1}}, nil); err == nil {
 		t.Fatal("nil layout lookup succeeded")
 	}
+	if _, err := PlanFileChunkHashesContext(nil, file, []FileRange{{0, 1}}, layoutLookup(layout)); err == nil { //nolint:staticcheck // Verify that the API rejects a nil context.
+		t.Fatal("nil context succeeded")
+	}
 	if _, err := PlanFileChunkHashes(file, nil, layoutLookup(layout)); err == nil {
 		t.Fatal("empty dirty ranges succeeded")
 	}
 	if _, err := PlanFileChunkHashes(file, []FileRange{{10, 20}, {15, 30}}, layoutLookup(layout)); err == nil {
 		t.Fatal("overlapping dirty ranges succeeded")
 	}
+	if _, err := PlanFileChunkHashes(file, []FileRange{{20, 10}}, layoutLookup(layout)); err == nil {
+		t.Fatal("reversed dirty range succeeded")
+	}
 	if _, err := PlanFileChunkHashes(file, []FileRange{{file.Size, file.Size + 1}}, layoutLookup(layout)); !errors.Is(err, ErrRangeNotSatisfiable) {
 		t.Fatalf("out-of-bounds dirty error = %v", err)
+	}
+	wantErr := errors.New("layout failed")
+	if _, err := PlanFileChunkHashes(file, []FileRange{{0, 1}}, func(xethash.Hash) (*xorb.Ingested, bool, error) {
+		return nil, false, wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("layout error = %v", err)
+	}
+	if _, err := PlanFileChunkHashes(file, []FileRange{{0, 1}}, func(xethash.Hash) (*xorb.Ingested, bool, error) {
+		return nil, false, nil
+	}); err == nil {
+		t.Fatal("missing layout succeeded")
+	}
+	mismatched := *layout
+	mismatched.Hash = xethash.Chunk([]byte("other xorb"))
+	if _, err := PlanFileChunkHashes(file, []FileRange{{0, 1}}, func(xethash.Hash) (*xorb.Ingested, bool, error) {
+		return &mismatched, true, nil
+	}); err == nil {
+		t.Fatal("mismatched layout succeeded")
+	}
+	badRange := file
+	badRange.File.Terms = append([]shard.Term(nil), file.File.Terms...)
+	badRange.File.Terms[0].End++
+	if _, err := PlanFileChunkHashes(badRange, []FileRange{{0, 1}}, layoutLookup(layout)); err == nil {
+		t.Fatal("bad term range succeeded")
+	}
+	wrongSize := file
+	wrongSize.Size++
+	if _, err := PlanFileChunkHashes(wrongSize, []FileRange{{0, 1}}, layoutLookup(layout)); err == nil {
+		t.Fatal("wrong file size succeeded")
+	}
+	partial, partialLayout := plannerFixture(t, []int{100, 100}, []ChunkRange{{0, 1}, {1, 2}})
+	partial.File.Terms[1].Verification = xethash.Zero
+	if _, err := PlanFileChunkHashes(partial, []FileRange{{0, 1}}, layoutLookup(partialLayout)); err == nil {
+		t.Fatal("partial verification succeeded")
+	}
+}
+
+func TestPlanFileChunkHashesPropagatesMidPlanCancellation(t *testing.T) {
+	file, layout := plannerFixture(t, []int{100}, []ChunkRange{{0, 1}})
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := PlanFileChunkHashesContext(ctx, file, []FileRange{{0, 1}}, func(hash xethash.Hash) (*xorb.Ingested, bool, error) {
+		cancel()
+		return layout, hash == layout.Hash, nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("mid-plan cancellation = %v", err)
+	}
+}
+
+func TestChunkWindowBuilderBridgesMultipleDirtyRanges(t *testing.T) {
+	builder := &chunkWindowBuilder{
+		dirty:      []FileRange{{Start: 0, End: 1}, {Start: 2, End: 3}, {Start: 4, End: 5}},
+		inDirty:    true,
+		cursor:     1,
+		gap:        newSubtreeAccumulator(false),
+		windows:    []FileRange{{Start: 0, End: 1}},
+		dirtyIndex: 0,
+	}
+	builder.process(xethash.Node{Hash: xethash.Chunk([]byte("bridge")), Size: 5}, 6)
+	if builder.dirtyIndex != 2 || builder.windows[0].End != 6 {
+		t.Fatalf("bridged builder = %#v", builder)
+	}
+	wantErr := errors.New("earlier gap failure")
+	builder.err = wantErr
+	builder.appendGap(false)
+	if !errors.Is(builder.err, wantErr) {
+		t.Fatalf("preserved gap error = %v", builder.err)
+	}
+}
+
+func TestPlanningContextCancellationAndBoundedGapAccumulation(t *testing.T) {
+	file, layout := plannerFixture(t, []int{100}, []ChunkRange{{0, 1}})
+	if _, err := PlanReconstructionContext(&cancelOnSecondCheckContext{Context: context.Background()}, file, nil,
+		layoutLookup(layout)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("reconstruction preflight cancellation = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := PlanReconstructionContext(ctx, file, nil, layoutLookup(layout)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("reconstruction cancellation = %v", err)
+	}
+	if _, err := PlanFileChunkHashesContext(ctx, file, []FileRange{{0, 1}}, layoutLookup(layout)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("chunk-hash cancellation = %v", err)
+	}
+
+	sizes := make([]int, xorb.MaxChunks)
+	for i := range sizes {
+		sizes[i] = 1
+	}
+	file, layout = plannerFixture(t, sizes, []ChunkRange{{0, 5_000}, {0, 5_000}})
+	response, err := PlanFileChunkHashes(file, []FileRange{{9_999, 10_000}}, layoutLookup(layout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNodes := make([]xethash.Node, 0, 9_999)
+	for len(wantNodes) < cap(wantNodes) {
+		for _, chunk := range layout.Chunks[:5_000] {
+			if len(wantNodes) == cap(wantNodes) {
+				break
+			}
+			wantNodes = append(wantNodes, xethash.Node{Hash: chunk.Hash, Size: uint64(chunk.UncompressedLength)})
+		}
+	}
+	want, err := json.Marshal(xethash.NewSubtree(true, wantNodes, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := json.Marshal(response.HashRanges[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("batched compact gap differs from one-shot subtree")
 	}
 }

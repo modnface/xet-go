@@ -2,6 +2,7 @@ package shard
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -10,6 +11,20 @@ import (
 	"github.com/jacobwoliver/xet-go/xethash"
 	"github.com/jacobwoliver/xet-go/xorb"
 )
+
+type cancelAfterContext struct {
+	context.Context
+	after int
+	calls int
+}
+
+func (c *cancelAfterContext) Err() error {
+	c.calls++
+	if c.calls >= c.after {
+		return context.Canceled
+	}
+	return nil
+}
 
 func sampleShard(t testing.TB) Shard {
 	t.Helper()
@@ -237,6 +252,79 @@ func TestValidateRegistrationRecomputesFilesAndDedupKeys(t *testing.T) {
 	}
 }
 
+func TestValidateRegistrationContextLimitsCancellationAndIncrementalMerkle(t *testing.T) {
+	value := sampleShard(t)
+	stored := value.Xorbs[0]
+	lookup := func(hash xethash.Hash) (Xorb, bool, error) {
+		return stored, hash == stored.Hash, nil
+	}
+
+	term := value.Files[0].Terms[0]
+	value.Files[0].Terms = append(value.Files[0].Terms, term)
+	nodes := make([]xethash.Node, 0, 2*len(stored.Chunks))
+	for range 2 {
+		for _, chunk := range stored.Chunks {
+			nodes = append(nodes, xethash.Node{Hash: chunk.Hash, Size: uint64(chunk.Length)})
+		}
+	}
+	value.Files[0].Hash = xethash.File(nodes)
+
+	registration, err := ValidateRegistrationContext(context.Background(), value, lookup, RegistrationLimits{
+		MaxFiles: 1, MaxXorbs: 1, MaxTerms: 2, MaxChunkReferences: uint64(len(nodes)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registration.Files[0].Size != 2*uint64(stored.RawBytes) {
+		t.Fatalf("incremental registration size = %d", registration.Files[0].Size)
+	}
+	if _, err := ValidateRegistrationContext(nil, value, lookup, RegistrationLimits{}); err == nil { //nolint:staticcheck // Verify that the API rejects a nil context.
+		t.Fatal("nil context succeeded")
+	}
+
+	for name, limits := range map[string]RegistrationLimits{
+		"terms":            {MaxTerms: 1},
+		"chunk references": {MaxChunkReferences: uint64(len(nodes) - 1)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ValidateRegistrationContext(context.Background(), value, lookup, limits); !errors.Is(err, ErrRegistrationLimit) {
+				t.Fatalf("limit error = %v", err)
+			}
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := ValidateRegistrationContext(ctx, value, lookup, RegistrationLimits{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation error = %v", err)
+	}
+
+	overFiles := value
+	overFiles.Files = append(overFiles.Files, overFiles.Files[0])
+	if _, err := ValidateRegistrationContext(context.Background(), overFiles, lookup, RegistrationLimits{MaxFiles: 1}); !errors.Is(err, ErrRegistrationLimit) {
+		t.Fatalf("file limit error = %v", err)
+	}
+	overXorbs := value
+	overXorbs.Xorbs = append(overXorbs.Xorbs, overXorbs.Xorbs[0])
+	if _, err := ValidateRegistrationContext(context.Background(), overXorbs, lookup, RegistrationLimits{MaxXorbs: 1}); !errors.Is(err, ErrRegistrationLimit) {
+		t.Fatalf("xorb limit error = %v", err)
+	}
+
+	reversed := sampleShard(t)
+	reversed.Files[0].Terms[0].Start = reversed.Files[0].Terms[0].End
+	reversed.Files[0].Terms[0].End--
+	if _, err := ValidateRegistrationContext(context.Background(), reversed, lookup, RegistrationLimits{}); err == nil {
+		t.Fatal("reversed term succeeded")
+	}
+
+	for cancelAfter := 2; cancelAfter <= 21; cancelAfter++ {
+		ctx := &cancelAfterContext{Context: context.Background(), after: cancelAfter}
+		if _, err := ValidateRegistrationContext(ctx, value, lookup, RegistrationLimits{}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancellation after context check %d = %v", cancelAfter, err)
+		}
+	}
+}
+
 func TestValidateRegistrationRejectsStorageAndIdentityConflicts(t *testing.T) {
 	value := sampleShard(t)
 	stored := value.Xorbs[0]
@@ -270,6 +358,72 @@ func TestValidateRegistrationRejectsStorageAndIdentityConflicts(t *testing.T) {
 	}
 }
 
+func TestValidateRegistrationRejectsInvalidExternalRecipesAndStoredXorbs(t *testing.T) {
+	value := sampleShard(t)
+	stored := value.Xorbs[0]
+	lookup := func(hash xethash.Hash) (Xorb, bool, error) { return stored, hash == stored.Hash, nil }
+	for name, mutate := range map[string]func(*Shard){
+		"chunk range":  func(s *Shard) { s.Files[0].Terms[0].End++ },
+		"term size":    func(s *Shard) { s.Files[0].Terms[0].UnpackedBytes++ },
+		"verification": func(s *Shard) { s.Files[0].Terms[0].Verification = xethash.Chunk([]byte("wrong verification")) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			external := sampleShard(t)
+			external.Xorbs = nil
+			mutate(&external)
+			if _, err := ValidateRegistration(external, lookup); err == nil {
+				t.Fatal("invalid external recipe succeeded")
+			}
+		})
+	}
+
+	invalidStored := stored
+	invalidStored.Flags = 1
+	if _, err := ValidateRegistration(value, func(xethash.Hash) (Xorb, bool, error) {
+		return invalidStored, true, nil
+	}); !errors.Is(err, ErrXorbLookup) {
+		t.Fatalf("invalid stored xorb error = %v", err)
+	}
+	otherObject, err := xorb.Encode([][]byte{[]byte("different valid xorb")}, xorb.None)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := XorbFromObject(otherObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateRegistration(value, func(xethash.Hash) (Xorb, bool, error) {
+		return other, true, nil
+	}); !errors.Is(err, ErrXorbLookup) {
+		t.Fatalf("wrong stored xorb error = %v", err)
+	}
+
+	external := sampleShard(t)
+	external.Xorbs = nil
+	if _, err := ValidateRegistration(external, func(xethash.Hash) (Xorb, bool, error) {
+		return Xorb{}, false, nil
+	}); err == nil {
+		t.Fatal("missing external xorb succeeded")
+	}
+
+	eligible := sampleShard(t)
+	for i := range eligible.Xorbs[0].Chunks {
+		eligible.Xorbs[0].Chunks[i].Flags = ChunkFlagGlobalDedup
+	}
+	registration, err := ValidateRegistration(eligible, lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(registration.GlobalDedupChunks) != len(eligible.Xorbs[0].Chunks) {
+		t.Fatalf("global dedup chunks = %d, want %d", len(registration.GlobalDedupChunks), len(eligible.Xorbs[0].Chunks))
+	}
+	for i := 1; i < len(registration.GlobalDedupChunks); i++ {
+		if registration.GlobalDedupChunks[i-1].String() > registration.GlobalDedupChunks[i].String() {
+			t.Fatal("global dedup chunks are not sorted")
+		}
+	}
+}
+
 func containsHash(values []xethash.Hash, want xethash.Hash) bool {
 	for _, value := range values {
 		if value == want {
@@ -280,6 +434,9 @@ func containsHash(values []xethash.Hash, want xethash.Hash) bool {
 }
 
 func TestMetadataValidationContracts(t *testing.T) {
+	if err := validateContext(nil, &Shard{}, true); err == nil { //nolint:staticcheck // Verify that internal validation rejects a nil context.
+		t.Fatal("nil validation context succeeded")
+	}
 	if _, err := XorbFromObject(nil); err == nil {
 		t.Fatal("nil xorb object succeeded")
 	}
