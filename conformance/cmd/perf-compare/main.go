@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const rustRevision = "7a267506b77b484688654c46079e3aec35394611"
+const rustRevision = "de71453d952bd8b806edaa997c72313051a49050"
 
 var operations = []string{
 	"chunk_owned",

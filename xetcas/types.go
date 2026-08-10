@@ -13,7 +13,31 @@ import (
 	"github.com/jacobwoliver/xet-go/xethash"
 )
 
-const DefaultPrefix = "default"
+const (
+	// DefaultXorbPrefix is the only namespace accepted by the public xorb
+	// upload and existence routes.
+	DefaultXorbPrefix = "default"
+	// DefaultFilePrefix is the namespace used by batch reconstruction keys.
+	DefaultFilePrefix = "default"
+	// DefaultDedupPrefix is the namespace specified by the public global
+	// chunk-deduplication API. Servers may additionally accept
+	// DefaultXorbPrefix for compatibility with released xet-core clients, which
+	// currently send their shared default prefix to both APIs.
+	DefaultDedupPrefix = "default-merkledb"
+
+	// DefaultPrefix is retained as a source-compatible alias for the xorb
+	// namespace. New code should name the protocol namespace explicitly.
+	//
+	// Deprecated: use DefaultXorbPrefix, DefaultFilePrefix, or
+	// DefaultDedupPrefix as appropriate.
+	DefaultPrefix = DefaultXorbPrefix
+)
+
+// Key is the namespace-qualified object identity used by batch CAS requests.
+type Key struct {
+	Prefix string       `json:"prefix"`
+	Hash   xethash.Hash `json:"hash"`
+}
 
 var (
 	ErrRangeNotSatisfiable = errors.New("xet CAS: range not satisfiable")
@@ -198,24 +222,27 @@ type ShardUploadEvent struct {
 
 func (e ShardUploadEvent) Terminal() bool { return e.Type == "result" || e.Type == "error" }
 
-type v1FetchInfo struct {
+// V1FetchInfo is one legacy signed single-range xorb fetch.
+type V1FetchInfo struct {
 	Range    ChunkRange `json:"range"`
 	URL      string     `json:"url"`
 	URLRange HTTPRange  `json:"url_range"`
 }
 
-type reconstructionV1 struct {
+// ReconstructionV1 is the deprecated single-file v1 wire response.
+type ReconstructionV1 struct {
 	OffsetIntoFirstRange uint64                         `json:"offset_into_first_range"`
 	Terms                []ReconstructionTerm           `json:"terms"`
-	FetchInfo            map[xethash.Hash][]v1FetchInfo `json:"fetch_info"`
+	FetchInfo            map[xethash.Hash][]V1FetchInfo `json:"fetch_info"`
 }
 
-type batchReconstructionV1 struct {
+// BatchReconstructionV1 is the v1 batch reconstruction wire response.
+type BatchReconstructionV1 struct {
 	Files     map[xethash.Hash][]ReconstructionTerm `json:"files"`
-	FetchInfo map[xethash.Hash][]v1FetchInfo        `json:"fetch_info"`
+	FetchInfo map[xethash.Hash][]V1FetchInfo        `json:"fetch_info"`
 }
 
-func (v batchReconstructionV1) normalize() (map[xethash.Hash]*Reconstruction, error) {
+func (v BatchReconstructionV1) normalize() (map[xethash.Hash]*Reconstruction, error) {
 	result := make(map[xethash.Hash]*Reconstruction, len(v.Files))
 	for fileID, terms := range v.Files {
 		reconstruction := &Reconstruction{
@@ -279,7 +306,7 @@ func (r *FileChunkHashesResponse) Validate() error {
 	return nil
 }
 
-func (v reconstructionV1) normalize() *Reconstruction {
+func (v ReconstructionV1) normalize() *Reconstruction {
 	r := &Reconstruction{
 		OffsetIntoFirstRange: v.OffsetIntoFirstRange,
 		Terms:                v.Terms,

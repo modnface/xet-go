@@ -34,7 +34,7 @@ func TestUploadSourcesAndConvenienceInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Files) != 3 || result.Files[0] != result.Files[2] || result.Report.Files != 3 ||
+	if len(result.Files) != 3 || !result.Files[0].Equal(result.Files[2]) || result.Report.Files != 3 ||
 		result.Report.Dedup.SessionDedupBytes < uint64(len(first)) {
 		t.Fatalf("unexpected source result: %#v", result)
 	}
@@ -91,7 +91,8 @@ func TestDownloadFilePublishesOnlyVerifiedContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	bad := upload.File
-	bad.SHA256 = sha256.Sum256([]byte("wrong SHA-256"))
+	badSHA := sha256.Sum256([]byte("wrong SHA-256"))
+	bad.SHA256 = &badSHA
 	if _, err := client.DownloadFile(context.Background(), bad, path, DownloadFileOptions{NoSync: true}); err == nil {
 		t.Fatal("corrupt file identity unexpectedly published")
 	}

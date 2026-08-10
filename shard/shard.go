@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/jacobwoliver/xet-go/xethash"
@@ -136,6 +137,29 @@ func XorbFromObject(object *xorb.Object) (Xorb, error) {
 	return result, nil
 }
 
+// XorbFromIngested converts canonical server-ingestion metadata into the
+// shard record used for registration and reconstruction planning.
+func XorbFromIngested(object *xorb.Ingested) (Xorb, error) {
+	if object == nil {
+		return Xorb{}, errors.New("shard: nil ingested xorb")
+	}
+	result := Xorb{
+		Hash:            object.Hash,
+		RawBytes:        object.UncompressedSize,
+		SerializedBytes: object.NetworkBytes,
+		Chunks:          make([]XorbChunk, len(object.Chunks)),
+	}
+	for i, chunk := range object.Chunks {
+		result.Chunks[i] = XorbChunk{
+			Hash: chunk.Hash, Offset: chunk.UncompressedOffset, Length: chunk.UncompressedLength,
+		}
+	}
+	if err := validate(&Shard{Xorbs: []Xorb{result}}, true); err != nil {
+		return Xorb{}, err
+	}
+	return result, nil
+}
+
 // EncodeUpload emits the production footerless shard form accepted by the CAS.
 // Files and xorbs are sorted by hash, matching the official Rust BTreeMap writer.
 func EncodeUpload(value Shard) ([]byte, error) {
@@ -164,6 +188,179 @@ func EncodeUpload(value Shard) ([]byte, error) {
 		return nil, fmt.Errorf("shard: encoded size %d exceeds maximum %d", out.Len(), MaxSize)
 	}
 	return out.Bytes(), nil
+}
+
+type lookup12 struct {
+	key   uint64
+	index uint32
+}
+
+type lookup16 struct {
+	key        uint64
+	xorbIndex  uint32
+	chunkIndex uint32
+}
+
+// EncodeFull emits the canonical footer-bearing shard form with complete
+// file, xorb, and chunk lookup tables. Its zero-valued timestamps match the
+// deterministic xet-core in-memory shard encoder.
+func EncodeFull(value Shard) ([]byte, error) {
+	if err := validate(&value, true); err != nil {
+		return nil, err
+	}
+	return encodeFull(value.Files, value.Xorbs, Footer{Version: 1, KeyExpiresAtUnix: math.MaxUint64})
+}
+
+// EncodeProtectedDedup emits a footer-bearing, file-free shard for global
+// deduplication. Chunk hashes are keyed, and file-start chunks are marked
+// globally eligible before the file section is removed.
+func EncodeProtectedDedup(value Shard, key xethash.Hash, createdAtUnix, expiresAtUnix uint64) ([]byte, error) {
+	if key.IsZero() {
+		return nil, errors.New("shard: protected dedup key is zero")
+	}
+	if expiresAtUnix <= createdAtUnix {
+		return nil, errors.New("shard: protected dedup expiry must follow creation")
+	}
+	if err := validate(&value, true); err != nil {
+		return nil, err
+	}
+	xorbs := cloneXorbs(value.Xorbs)
+	byHash := make(map[xethash.Hash]int, len(xorbs))
+	for i := range xorbs {
+		byHash[xorbs[i].Hash] = i
+	}
+	for i, file := range value.Files {
+		if len(file.Terms) == 0 {
+			continue
+		}
+		first := file.Terms[0]
+		xorbIndex, ok := byHash[first.XorbHash]
+		if !ok || first.Start >= uint32(len(xorbs[xorbIndex].Chunks)) {
+			return nil, fmt.Errorf("shard: file %d start chunk is not present in protected dedup xorbs", i)
+		}
+		xorbs[xorbIndex].Chunks[first.Start].Flags |= ChunkFlagGlobalDedup
+	}
+	for i := range xorbs {
+		for j := range xorbs[i].Chunks {
+			xorbs[i].Chunks[j].Hash = xethash.Protect(xorbs[i].Chunks[j].Hash, key)
+		}
+	}
+	return encodeFull(nil, xorbs, Footer{
+		Version: 1, ChunkProtectionKey: key,
+		CreatedAtUnix: createdAtUnix, KeyExpiresAtUnix: expiresAtUnix,
+	})
+}
+
+func encodeFull(files []File, xorbs []Xorb, footer Footer) ([]byte, error) {
+	files = append([]File(nil), files...)
+	xorbs = cloneXorbs(xorbs)
+	sort.Slice(files, func(i, j int) bool { return files[i].Hash.String() < files[j].Hash.String() })
+	sort.Slice(xorbs, func(i, j int) bool { return xorbs[i].Hash.String() < xorbs[j].Hash.String() })
+
+	var out bytes.Buffer
+	out.Write(headerMagic[:])
+	writeU64(&out, Version)
+	writeU64(&out, FooterSize)
+	footer.FileInfoOffset = HeaderSize
+	fileLookup := make([]lookup12, 0, len(files))
+	var fileIndex uint32
+	for _, file := range files {
+		fileLookup = append(fileLookup, lookup12{key: truncateHash(file.Hash), index: fileIndex})
+		writeFile(&out, file)
+		fileIndex += uint32(1 + 2*len(file.Terms))
+		if file.SHA256 != nil {
+			fileIndex++
+		}
+		for _, term := range file.Terms {
+			footer.MaterializedBytes += uint64(term.UnpackedBytes)
+		}
+	}
+	writeBookend(&out)
+
+	footer.XorbInfoOffset = uint64(out.Len())
+	xorbLookup := make([]lookup12, 0, len(xorbs))
+	chunkLookup := make([]lookup16, 0)
+	var xorbIndex uint32
+	for _, value := range xorbs {
+		xorbLookup = append(xorbLookup, lookup12{key: truncateHash(value.Hash), index: xorbIndex})
+		writeXorb(&out, value)
+		for i, chunk := range value.Chunks {
+			chunkLookup = append(chunkLookup, lookup16{
+				key: truncateHash(chunk.Hash), xorbIndex: xorbIndex, chunkIndex: uint32(i),
+			})
+		}
+		xorbIndex += uint32(1 + len(value.Chunks))
+		footer.StoredBytesOnDisk += uint64(value.SerializedBytes)
+		footer.StoredBytes += uint64(value.RawBytes)
+	}
+	writeBookend(&out)
+
+	footer.FileLookupOffset = uint64(out.Len())
+	footer.FileLookupEntries = uint64(len(fileLookup))
+	for _, entry := range fileLookup {
+		writeU64(&out, entry.key)
+		writeU32(&out, entry.index)
+	}
+	footer.XorbLookupOffset = uint64(out.Len())
+	footer.XorbLookupEntries = uint64(len(xorbLookup))
+	for _, entry := range xorbLookup {
+		writeU64(&out, entry.key)
+		writeU32(&out, entry.index)
+	}
+	sort.Slice(chunkLookup, func(i, j int) bool {
+		if chunkLookup[i].key != chunkLookup[j].key {
+			return chunkLookup[i].key < chunkLookup[j].key
+		}
+		if chunkLookup[i].xorbIndex != chunkLookup[j].xorbIndex {
+			return chunkLookup[i].xorbIndex < chunkLookup[j].xorbIndex
+		}
+		return chunkLookup[i].chunkIndex < chunkLookup[j].chunkIndex
+	})
+	footer.ChunkLookupOffset = uint64(out.Len())
+	footer.ChunkLookupEntries = uint64(len(chunkLookup))
+	for _, entry := range chunkLookup {
+		writeU64(&out, entry.key)
+		writeU32(&out, entry.xorbIndex)
+		writeU32(&out, entry.chunkIndex)
+	}
+	footer.Offset = uint64(out.Len())
+	writeFooter(&out, footer)
+	if out.Len() > MaxSize {
+		return nil, fmt.Errorf("shard: encoded size %d exceeds maximum %d", out.Len(), MaxSize)
+	}
+	return out.Bytes(), nil
+}
+
+func writeFooter(out *bytes.Buffer, value Footer) {
+	writeU64(out, value.Version)
+	writeU64(out, value.FileInfoOffset)
+	writeU64(out, value.XorbInfoOffset)
+	writeU64(out, value.FileLookupOffset)
+	writeU64(out, value.FileLookupEntries)
+	writeU64(out, value.XorbLookupOffset)
+	writeU64(out, value.XorbLookupEntries)
+	writeU64(out, value.ChunkLookupOffset)
+	writeU64(out, value.ChunkLookupEntries)
+	out.Write(value.ChunkProtectionKey[:])
+	writeU64(out, value.CreatedAtUnix)
+	writeU64(out, value.KeyExpiresAtUnix)
+	for _, reserved := range value.Reserved {
+		writeU64(out, reserved)
+	}
+	writeU64(out, value.StoredBytesOnDisk)
+	writeU64(out, value.MaterializedBytes)
+	writeU64(out, value.StoredBytes)
+	writeU64(out, value.Offset)
+}
+
+func truncateHash(hash xethash.Hash) uint64 { return binary.LittleEndian.Uint64(hash[:8]) }
+
+func cloneXorbs(values []Xorb) []Xorb {
+	result := append([]Xorb(nil), values...)
+	for i := range result {
+		result[i].Chunks = append([]XorbChunk(nil), result[i].Chunks...)
+	}
+	return result
 }
 
 // Decode parses both footerless upload shards and footer-bearing cache/global
@@ -444,18 +641,24 @@ func validate(value *Shard, upload bool) error {
 	}
 	xorbs := make(map[xethash.Hash]Xorb, len(value.Xorbs))
 	for i, x := range value.Xorbs {
+		if _, exists := xorbs[x.Hash]; exists {
+			return fmt.Errorf("shard: duplicate xorb hash %s", x.Hash)
+		}
+		if upload && x.Flags != 0 {
+			return fmt.Errorf("shard: xorb %d has unsupported flags", i)
+		}
 		if len(x.Chunks) == 0 {
 			return fmt.Errorf("shard: xorb %d has no chunks", i)
 		}
-		// Historical cache/reference shards leave this field zero. It remains
-		// mandatory on newly encoded upload shards because it authenticates the
-		// actual footerless xorb body sent to the CAS.
-		if upload && x.SerializedBytes == 0 {
-			return fmt.Errorf("shard: xorb %d has zero serialized size", i)
-		}
+		// Official upload sessions may leave SerializedBytes zero. The CAS must
+		// derive the durable serialized layout from the separately ingested xorb,
+		// rather than treating this unauthenticated accounting field as identity.
 		var end uint64
 		nodes := make([]xethash.Node, len(x.Chunks))
 		for j, chunk := range x.Chunks {
+			if upload && chunk.Flags&^uint32(ChunkFlagGlobalDedup) != 0 {
+				return fmt.Errorf("shard: xorb %d chunk %d has unsupported flags", i, j)
+			}
 			if chunk.Length == 0 || uint64(chunk.Offset) != end {
 				return fmt.Errorf("shard: xorb %d chunk %d has non-contiguous range", i, j)
 			}
@@ -475,11 +678,19 @@ func validate(value *Shard, upload bool) error {
 		}
 		xorbs[x.Hash] = x
 	}
+	files := make(map[xethash.Hash]struct{}, len(value.Files))
 	for i, file := range value.Files {
+		if _, exists := files[file.Hash]; exists {
+			return fmt.Errorf("shard: duplicate file hash %s", file.Hash)
+		}
+		files[file.Hash] = struct{}{}
 		if upload && file.Flags&^uint32(FileFlagVerification|FileFlagSHA256) != 0 {
 			return fmt.Errorf("shard: file %d has unsupported flags", i)
 		}
 		for j, term := range file.Terms {
+			if upload && term.Flags != 0 {
+				return fmt.Errorf("shard: file %d term %d has unsupported flags", i, j)
+			}
 			if term.Start >= term.End || term.UnpackedBytes == 0 {
 				return fmt.Errorf("shard: file %d term %d has empty or reversed range", i, j)
 			}

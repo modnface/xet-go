@@ -400,24 +400,20 @@ func (c *Client) BatchQueryReconstruction(
 	if len(fileIDs) > 10_000 {
 		return nil, errors.New("xet CAS: batch reconstruction exceeds 10000 file limit")
 	}
-	type key struct {
-		Prefix string       `json:"prefix"`
-		Hash   xethash.Hash `json:"hash"`
-	}
 	unique := make(map[xethash.Hash]struct{}, len(fileIDs))
-	request := make([]key, 0, len(fileIDs))
+	request := make([]Key, 0, len(fileIDs))
 	for _, hash := range fileIDs {
 		if _, duplicate := unique[hash]; duplicate {
 			continue
 		}
 		unique[hash] = struct{}{}
-		request = append(request, key{Prefix: DefaultPrefix, Hash: hash})
+		request = append(request, Key{Prefix: DefaultFilePrefix, Hash: hash})
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
 		return nil, err
 	}
-	response := &batchReconstructionV1{}
+	response := &BatchReconstructionV1{}
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/json")
 	_, err = c.casCall(ctx, AccessRead, http.MethodPost, "v1/reconstructions", headers, body,
@@ -432,7 +428,7 @@ func (c *Client) BatchQueryReconstruction(
 		for _, item := range request {
 			query.Add("file_id", item.Hash.String())
 		}
-		response = &batchReconstructionV1{}
+		response = &BatchReconstructionV1{}
 		_, err = c.casCall(ctx, AccessRead, http.MethodGet, "v1/reconstructions?"+query.Encode(), nil, nil,
 			c.jsonProcessor(response, c.maxResponseBytes))
 		if err != nil {
@@ -612,7 +608,7 @@ func (c *Client) QueryReconstruction(ctx context.Context, fileID xethash.Hash, r
 			}
 			return value, nil
 		}
-		value := &reconstructionV1{}
+		value := &ReconstructionV1{}
 		_, err := c.casCall(ctx, AccessRead, http.MethodGet, route, headers, nil, c.jsonProcessor(value, c.maxResponseBytes))
 		if err != nil {
 			return nil, mapRangeError(err)
@@ -796,7 +792,7 @@ func (c *Client) QueryGlobalDedup(ctx context.Context, prefix string, chunkHash 
 		return nil, false, err
 	}
 	route := fmt.Sprintf("v1/chunks/%s/%s", prefix, chunkHash)
-	value, err := c.casCall(ctx, AccessWrite, http.MethodGet, route, nil, nil, c.bytesProcessor(c.maxResponseBytes))
+	value, err := c.casCall(ctx, AccessRead, http.MethodGet, route, nil, nil, c.bytesProcessor(c.maxResponseBytes))
 	if err != nil {
 		var httpErr *HTTPError
 		if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {

@@ -1,8 +1,8 @@
 # Conformance and release evidence
 
 The compatibility target is Xet specification v1.1.0, official
-`huggingface/xet-core` commit
-`7a267506b77b484688654c46079e3aec35394611`, and official reference corpus
+`huggingface/xet-core` 1.6.0 commit
+`de71453d952bd8b806edaa997c72313051a49050`, and official reference corpus
 commit `c4aa3a3f15b1395fff5ce934784bf6c8f2d62de8`.
 
 “Exact” below means byte-for-byte agreement where the protocol has one
@@ -24,8 +24,14 @@ to differ while preserving bounded, cancelable, backoff/recovery semantics.
 | Official historical xorb | `TestOfficialReferenceCorpus`, `TestOfficialLegacyTrailerDecode` | Legacy `XETB` terminator accepted on decode only |
 | Footerless upload shards | `TestRustDifferentialShard`, `TestUploadRoundTripAndLayout` | Byte-exact sorted file/xorb records, verification and SHA-256 extensions |
 | Cache/global-dedup shards | `TestOfficialReferenceCorpus`, `TestFooterValidation`, `TestGlobalDedupProtectedShard` | All four official shard variants, footer bounds, protected lookup hashes |
+| Server xorb ingestion | `TestIngestNetworkCanonicalizesAndDescribesXorb`, `TestRustDifferentialCompleteXorb`, server fault tests | Footerless-only input, URL identity, decoded bounds, canonical complete V1 bytes, representation-independent index repair |
+| Server shard registration | `TestValidateRegistrationRecomputesFilesAndDedupKeys`, `TestRustDifferentialShard` | External xorb resolution, term/file identity recomputation, canonical full shard exactness, protected shard interoperability |
+| Server reconstruction planners | `TestPlanReconstructionMatchesRustRangeCropping`, `TestPlanFileChunkHashesMatchesRustStableWindow` | Exact Rust range cropping, offsets, range merging, dirty windows, compact subtrees, and gap verification |
 | Whole and range reconstruction | `TestUploadDownloadAndRangeEndToEnd`, `TestWholeDownloadUsesBoundedReconstructionWindows`, `FuzzUploadDownload` | Logical order, exact ranges, term verification, bounded windows, final identities |
 | Rust CAS black-box interoperability | `TestOfficialRustLocalCASRoundTrip` | Go upload/full download/range download/global dedup through official Rust server |
+| Go CAS black-box interoperability | `TestOfficialRustClientGoCASRoundTrip` | Released Rust RemoteClient upload/download through Go; zero xorb accounting compatibility; protected Go dedup consumed with nonzero Rust global-dedup metrics |
+| CAS HTTP server | `TestHTTPHandlerGoClientEndToEnd`, handler audit/status tests | All v1/v2 routes, exact namespace paths, signed one-range URLs, credential isolation, limits, error mapping, and NDJSON heartbeat/terminal semantics |
+| Durable server publication | service memory/fault/audit tests | Immutable xorb/SHA records, first-valid file/dedup secondary indexes, file-last visibility, alternative compressed representation repair, and restartable partial writes |
 | Reconstruction API versions | `TestQueryReconstructionV2RangeAndAuthentication`, `TestQueryReconstructionFallsBackAndPinsV1`, `TestBatchReconstructionPostThenLegacyGetFallback` | v2 preferred, explicit unsupported-route v1 fallback, normalized DTOs |
 | Shard API versions and NDJSON | `TestUploadShardV2RetriesTerminalError`, `TestUploadShardFallbackAndMissingTerminal`, `TestNDJSONStructuralFaults` | v2 progress/terminal handling, retryable errors, v1 fallback |
 | Signed multipart ranges | `TestSignedFetchExactMultipartRangeAndCredentialIsolation`, `TestMultipartStructuralFaults`, `FuzzDecodeMultipart` | Content-Range matching, reordering, truncation, duplicate/missing parts, no CAS credentials |
@@ -37,11 +43,11 @@ to differ while preserving bounded, cancelable, backoff/recovery semantics.
 | Sparse delta upload | `TestUploadDeltaReusesStableOriginalTerms`, `TestUploadDeltaValidatesEdits`, `TestQueryFileChunkHashesHeaderAndValidation` | dirty-window protocol, unchanged terms, exact subtree merge, invalid edit rejection |
 | Cache and durable replay | `TestPersistentRangeCacheAvoidsSecondSignedFetch`, `TestRangeRoundTripAndCorruptionEviction`, `TestUploadJournalResumesAfterShardFailure`, `TestDiskUploadJournalLifecycleAndCorruption` | checksum/expiry, atomic publication, corruption eviction, CAS existence recheck |
 | Random access, atomic files, groups | `TestDownloadAtAndRangeAt`, `TestDownloadFilePublishesOnlyVerifiedContent`, `TestDownloadGroupPreservesRequestOrder` | independent offsets, verified rename, ordered outcomes and cancellation |
-| Fault containment | all `xetcas` structural/fault tests plus xorb/shard truncation tests | untrusted sizes, malformed frames, truncated bodies, bad content ranges, transient network failures |
+| Fault containment | all `xetcas` client/server structural/fault tests plus xorb/shard truncation tests | untrusted sizes, malformed frames, corrupt durable state, publication faults, bad content ranges, transient network failures |
 | Fuzzing | `conformance/fuzz-smoke.sh` | 11 fuzz targets spanning end-to-end transfer, chunking, hashes, subtrees, codecs, multipart, compression, and cache |
 | Matched performance | `conformance/compare-performance.sh` | Alternating optimized Go/Rust samples with identity, count, scheme, and none-size preconditions |
 | Portability and purity | OS CI matrix and `conformance/cross-compile.sh` | CGO disabled; Linux amd64/arm64/386, Windows amd64/arm64, Darwin amd64/arm64 production and test compilation |
-| Release hygiene | race, vet, golangci-lint, `check-coverage.sh`, govulncheck | Race freedom, static analysis, at least 75% aggregate statement coverage, no reachable known vulnerability on patched Go |
+| Release hygiene | race, vet, golangci-lint, `check-coverage.sh`, govulncheck | Race freedom, static analysis, at least 95% aggregate statement coverage, no reachable known vulnerability on patched Go |
 
 ## Reproduce the official gates
 

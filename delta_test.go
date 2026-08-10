@@ -3,6 +3,9 @@ package xet
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
+	"math"
 	"testing"
 
 	"github.com/jacobwoliver/xet-go/chunker"
@@ -68,7 +71,7 @@ func TestUploadDeltaReusesStableOriginalTerms(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.File.Size != uint64(len(expected)) || result.Report.Dedup.NewBytes != uint64(chunkBytes(modifiedChunks[:modifiedSplit])) ||
+	if result.File.SHA256 != nil || result.File.Size != uint64(len(expected)) || result.Report.Dedup.NewBytes != uint64(chunkBytes(modifiedChunks[:modifiedSplit])) ||
 		result.Report.Dedup.NewBytes >= result.File.Size || !result.Report.ShardUploaded {
 		t.Fatalf("unexpected delta result: %#v", result)
 	}
@@ -192,3 +195,49 @@ func TestUploadDeltaEmptyOriginalUsesFreshUpload(t *testing.T) {
 		t.Fatal("accepted a short fresh delta reader")
 	}
 }
+
+func TestDeltaHelperOverflowAndEmptyStateFailures(t *testing.T) {
+	if _, err := deltaResultSize(0, []DeltaEdit{{Original: xetcas.FileRange{Start: 0, End: 1}}}); err == nil {
+		t.Fatal("delta size underflow succeeded")
+	}
+	if _, err := deltaResultSize(math.MaxUint64, []DeltaEdit{{NewLength: 1}}); err == nil {
+		t.Fatal("delta size overflow succeeded")
+	}
+	want := errors.New("source failed")
+	if err := copyExactly(io.Discard, failingDeltaReader{err: want}, uint64(math.MaxInt64)+1); !errors.Is(err, want) {
+		t.Fatalf("large copy failure = %v", err)
+	}
+	if _, err := (&UploadBatch{}).detachLastFile(); err == nil {
+		t.Fatal("detached from empty batch")
+	}
+	client := newTestEngine(t, newMemoryProtocol())
+	if _, err := client.UploadDelta(context.Background(), FileInfo{Size: math.MaxUint64}, []DeltaEdit{{
+		Original: xetcas.FileRange{}, Reader: bytes.NewReader(nil), NewLength: 1,
+	}}); err == nil {
+		t.Fatal("delta upload result-size overflow succeeded")
+	}
+
+	nodeA := xethash.Node{Hash: xethash.Chunk([]byte("a")), Size: 1}
+	nodeB := xethash.Node{Hash: xethash.Chunk([]byte("b")), Size: 1}
+	leading := xethash.NewSubtree(true, []xethash.Node{nodeA}, false)
+	root, err := mergeDeltaHash(
+		[]*xethash.MerkleHashSubtree{leading, nil},
+		[]deltaUploadedWindow{{file: uploadedFile{chunkNodes: []xethash.Node{nodeB}}}},
+	)
+	if err != nil || root.IsZero() {
+		t.Fatalf("delta hash with leading gap = %s, %v", root, err)
+	}
+	originalTerm := xetcas.ReconstructionTerm{
+		Hash: nodeA.Hash, UnpackedLength: 1, Range: xetcas.ChunkRange{Start: 0, End: 1},
+	}
+	if _, err := composeDeltaTerms(
+		[]xetcas.ReconstructionTerm{originalTerm}, []uint64{0, 1},
+		[]deltaUploadedWindow{{start: 1, end: 1}}, nil,
+	); err == nil {
+		t.Fatal("missing pre-window verification hash succeeded")
+	}
+}
+
+type failingDeltaReader struct{ err error }
+
+func (r failingDeltaReader) Read([]byte) (int, error) { return 0, r.err }

@@ -93,7 +93,7 @@ func TestUploadLimiterBacksOffBeforeRetry(t *testing.T) {
 		}},
 	})
 	limiter = client.uploadLimiter
-	inserted, err := client.UploadXorb(context.Background(), DefaultPrefix, xethash.Zero, []byte("xorb"))
+	inserted, err := client.UploadXorb(context.Background(), DefaultXorbPrefix, xethash.Zero, []byte("xorb"))
 	if err != nil || !inserted {
 		t.Fatalf("inserted=%v error=%v", inserted, err)
 	}

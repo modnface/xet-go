@@ -29,7 +29,8 @@ type DownloadReport struct {
 }
 
 // Download reconstructs a complete file to dst and verifies its Xet identity.
-// A nonzero FileInfo.Size and nonzero SHA256 are also enforced.
+// FileInfo.Size is always enforced, including for an empty file. A non-nil
+// SHA256 is also enforced.
 func (c *Client) Download(ctx context.Context, file FileInfo, dst io.Writer) (DownloadReport, error) {
 	if dst == nil {
 		return DownloadReport{}, errors.New("xet: nil download writer")
@@ -260,13 +261,13 @@ func (c *Client) executeReconstruction(
 			return report, fmt.Errorf("xet: reconstructed file hash %s, want %s", root, file.Hash)
 		}
 		report.WholeFileHash = true
-		if file.Size != 0 && writer.written != file.Size {
+		if writer.written != file.Size {
 			return report, fmt.Errorf("xet: reconstructed %d bytes, expected %d", writer.written, file.Size)
 		}
 		var computedSHA [sha256.Size]byte
 		copy(computedSHA[:], logicalHash.Sum(nil))
-		if file.SHA256 != ([sha256.Size]byte{}) {
-			if computedSHA != file.SHA256 {
+		if file.SHA256 != nil {
+			if computedSHA != *file.SHA256 {
 				return report, errors.New("xet: reconstructed SHA-256 mismatch")
 			}
 			report.SHA256Verified = true
@@ -305,10 +306,10 @@ func (c *Client) downloadWindowed(ctx context.Context, file FileInfo, dst io.Wri
 		return report, fmt.Errorf("xet: reconstructed file hash %s, want %s", root, file.Hash)
 	}
 	report.WholeFileHash = true
-	if file.SHA256 != ([sha256.Size]byte{}) {
+	if file.SHA256 != nil {
 		var computed [sha256.Size]byte
 		copy(computed[:], verifier.sha.Sum(nil))
-		if computed != file.SHA256 {
+		if computed != *file.SHA256 {
 			return report, errors.New("xet: reconstructed SHA-256 mismatch")
 		}
 		report.SHA256Verified = true

@@ -81,6 +81,87 @@ func TestUploadRoundTripAndLayout(t *testing.T) {
 	}
 }
 
+func TestFullAndProtectedDedupEncoding(t *testing.T) {
+	value := sampleShard(t)
+	full, err := EncodeFull(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Footer == nil || decoded.Footer.FileLookupEntries != 1 || decoded.Footer.XorbLookupEntries != 1 ||
+		decoded.Footer.ChunkLookupEntries != uint64(len(value.Xorbs[0].Chunks)) ||
+		decoded.Footer.StoredBytesOnDisk != uint64(value.Xorbs[0].SerializedBytes) ||
+		decoded.Footer.StoredBytes != uint64(value.Xorbs[0].RawBytes) ||
+		decoded.Footer.MaterializedBytes != uint64(value.Files[0].Terms[0].UnpackedBytes) {
+		t.Fatalf("full footer = %#v", decoded.Footer)
+	}
+
+	key := xethash.Chunk([]byte("dedup protection key"))
+	protected, err := EncodeProtectedDedup(value, key, 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err = Decode(protected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Files) != 0 || len(decoded.Xorbs) != 1 || decoded.Footer == nil ||
+		decoded.Footer.ChunkProtectionKey != key || decoded.Footer.CreatedAtUnix != 100 || decoded.Footer.KeyExpiresAtUnix != 200 {
+		t.Fatalf("protected shard = %#v", decoded)
+	}
+	for i, chunk := range decoded.Xorbs[0].Chunks {
+		if chunk.Hash != xethash.Protect(value.Xorbs[0].Chunks[i].Hash, key) {
+			t.Fatalf("protected chunk %d = %s", i, chunk.Hash)
+		}
+	}
+	if decoded.Xorbs[0].Chunks[value.Files[0].Terms[0].Start].Flags&ChunkFlagGlobalDedup == 0 {
+		t.Fatal("file-start chunk was not marked globally eligible")
+	}
+}
+
+func TestProtectedDedupContracts(t *testing.T) {
+	value := sampleShard(t)
+	if _, err := EncodeProtectedDedup(value, xethash.Zero, 1, 2); err == nil {
+		t.Fatal("zero protection key succeeded")
+	}
+	if _, err := EncodeProtectedDedup(value, xethash.Chunk([]byte("key")), 2, 2); err == nil {
+		t.Fatal("non-increasing expiry succeeded")
+	}
+	value.Files[0].Terms[0].XorbHash = xethash.Chunk([]byte("missing"))
+	if _, err := EncodeProtectedDedup(value, xethash.Chunk([]byte("key")), 1, 2); err == nil {
+		t.Fatal("missing file-start xorb succeeded")
+	}
+}
+
+func TestXorbFromIngested(t *testing.T) {
+	object, err := xorb.Encode([][]byte{[]byte("ingested shard metadata")}, xorb.None)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingested, err := xorb.IngestNetwork(object.Body, object.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := XorbFromIngested(ingested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := XorbFromObject(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Hash != want.Hash || got.RawBytes != want.RawBytes || got.SerializedBytes != want.SerializedBytes ||
+		len(got.Chunks) != len(want.Chunks) || got.Chunks[0] != want.Chunks[0] {
+		t.Fatalf("ingested xorb metadata = %#v, want %#v", got, want)
+	}
+	if _, err := XorbFromIngested(nil); err == nil {
+		t.Fatal("nil ingested xorb succeeded")
+	}
+}
+
 func TestEncodeSortsRecordsLikeRustBTreeMap(t *testing.T) {
 	value := sampleShard(t)
 	second := value.Files[0]
@@ -109,7 +190,11 @@ func TestEncodeRejectsInvalidMetadata(t *testing.T) {
 		{"bad term range", func(s *Shard) { s.Files[0].Terms[0].End++ }},
 		{"bad chunk offset", func(s *Shard) { s.Xorbs[0].Chunks[1].Offset++ }},
 		{"bad xorb hash", func(s *Shard) { s.Xorbs[0].Hash = xethash.Chunk([]byte("wrong")) }},
-		{"zero upload serialized size", func(s *Shard) { s.Xorbs[0].SerializedBytes = 0 }},
+		{"xorb flags", func(s *Shard) { s.Xorbs[0].Flags = 1 }},
+		{"chunk flags", func(s *Shard) { s.Xorbs[0].Chunks[0].Flags = 1 }},
+		{"term flags", func(s *Shard) { s.Files[0].Terms[0].Flags = 1 }},
+		{"duplicate xorb", func(s *Shard) { s.Xorbs = append(s.Xorbs, s.Xorbs[0]) }},
+		{"duplicate file", func(s *Shard) { s.Files = append(s.Files, s.Files[0]) }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -120,6 +205,78 @@ func TestEncodeRejectsInvalidMetadata(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateRegistrationRecomputesFilesAndDedupKeys(t *testing.T) {
+	value := sampleShard(t)
+	stored := value.Xorbs[0]
+	lookup := func(hash xethash.Hash) (Xorb, bool, error) {
+		return stored, hash == stored.Hash, nil
+	}
+	registration, err := ValidateRegistration(value, lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(registration.Files) != 1 || registration.Files[0].Size != uint64(stored.RawBytes) ||
+		len(registration.Xorbs) != 1 || len(registration.GlobalDedupChunks) == 0 {
+		t.Fatalf("registration = %#v", registration)
+	}
+	first := stored.Chunks[value.Files[0].Terms[0].Start].Hash
+	if !containsHash(registration.GlobalDedupChunks, first) {
+		t.Fatalf("file-start chunk %s is not globally eligible", first)
+	}
+
+	external := value
+	external.Xorbs = nil
+	registration, err = ValidateRegistration(external, lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(registration.Files) != 1 || len(registration.Xorbs) != 0 || len(registration.GlobalDedupChunks) != 0 {
+		t.Fatalf("external registration = %#v", registration)
+	}
+}
+
+func TestValidateRegistrationRejectsStorageAndIdentityConflicts(t *testing.T) {
+	value := sampleShard(t)
+	stored := value.Xorbs[0]
+	if _, err := ValidateRegistration(value, nil); err == nil {
+		t.Fatal("nil lookup succeeded")
+	}
+	if _, err := ValidateRegistration(value, func(xethash.Hash) (Xorb, bool, error) {
+		return Xorb{}, false, nil
+	}); err == nil {
+		t.Fatal("missing xorb succeeded")
+	}
+	wantErr := errors.New("lookup failed")
+	if _, err := ValidateRegistration(value, func(xethash.Hash) (Xorb, bool, error) {
+		return Xorb{}, false, wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("lookup error = %v", err)
+	}
+	conflict := stored
+	conflict.Chunks = append([]XorbChunk(nil), stored.Chunks...)
+	conflict.Chunks[0].Hash = xethash.Chunk([]byte("different chunk"))
+	if _, err := ValidateRegistration(value, func(xethash.Hash) (Xorb, bool, error) {
+		return conflict, true, nil
+	}); err == nil {
+		t.Fatal("conflicting xorb metadata succeeded")
+	}
+	value.Files[0].Hash = xethash.Chunk([]byte("wrong file identity"))
+	if _, err := ValidateRegistration(value, func(hash xethash.Hash) (Xorb, bool, error) {
+		return stored, hash == stored.Hash, nil
+	}); err == nil {
+		t.Fatal("wrong file identity succeeded")
+	}
+}
+
+func containsHash(values []xethash.Hash, want xethash.Hash) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestMetadataValidationContracts(t *testing.T) {
@@ -205,7 +362,7 @@ func TestDecodeRejectsSemanticCorruption(t *testing.T) {
 	}
 }
 
-func TestDecodeAcceptsLegacyZeroSerializedSize(t *testing.T) {
+func TestUploadAcceptsOfficialZeroSerializedSize(t *testing.T) {
 	value := sampleShard(t)
 	data, err := EncodeUpload(value)
 	if err != nil {
@@ -222,8 +379,12 @@ func TestDecodeAcceptsLegacyZeroSerializedSize(t *testing.T) {
 	if decoded.Xorbs[0].SerializedBytes != 0 {
 		t.Fatalf("legacy serialized size = %d", decoded.Xorbs[0].SerializedBytes)
 	}
-	if _, err := EncodeUpload(*decoded); err == nil {
-		t.Fatal("legacy zero serialized size accepted for a new upload")
+	encoded, err := EncodeUpload(*decoded)
+	if err != nil {
+		t.Fatalf("official zero serialized size rejected for upload: %v", err)
+	}
+	if roundTrip, err := Decode(encoded); err != nil || roundTrip.Xorbs[0].SerializedBytes != 0 {
+		t.Fatalf("zero serialized size round trip = %#v, %v", roundTrip, err)
 	}
 }
 

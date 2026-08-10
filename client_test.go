@@ -8,11 +8,16 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jacobwoliver/xet-go/chunker"
 	"github.com/jacobwoliver/xet-go/shard"
 	"github.com/jacobwoliver/xet-go/xetcas"
 	"github.com/jacobwoliver/xet-go/xethash"
@@ -50,7 +55,7 @@ func (m *memoryProtocol) UploadXorb(
 	hash xethash.Hash,
 	body []byte,
 ) (bool, error) {
-	if prefix != xetcas.DefaultPrefix {
+	if prefix != xetcas.DefaultXorbPrefix {
 		return false, fmt.Errorf("prefix %q", prefix)
 	}
 	object, err := xorb.Decode(body)
@@ -96,7 +101,10 @@ func (m *memoryProtocol) UploadShard(_ context.Context, body []byte, _ func(xetc
 	return nil
 }
 
-func (m *memoryProtocol) QueryGlobalDedup(_ context.Context, _ string, _ xethash.Hash) ([]byte, bool, error) {
+func (m *memoryProtocol) QueryGlobalDedup(_ context.Context, prefix string, _ xethash.Hash) ([]byte, bool, error) {
+	if prefix != xetcas.DefaultDedupPrefix {
+		return nil, false, fmt.Errorf("dedup prefix %q", prefix)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.globalQueries++
@@ -299,6 +307,75 @@ func TestUploadDownloadAndRangeEndToEnd(t *testing.T) {
 	}
 }
 
+func TestDefaultUploadUsesProtocolNamespaces(t *testing.T) {
+	var mu sync.Mutex
+	requests := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Method + " " + r.URL.Path
+		mu.Lock()
+		requests[key]++
+		mu.Unlock()
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/chunks/default-merkledb/"):
+			http.NotFound(w, r)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/xorbs/default/"):
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"was_inserted":true}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/shards":
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			_, _ = io.WriteString(w, `{"type":"result"}`)
+		default:
+			http.Error(w, "unexpected route", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	endpoint, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, err := xetcas.New(xetcas.NewStaticAccess(endpoint, ""), xetcas.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewClient(transport, Options{
+		Compression: xorb.None, CompressionSet: true,
+		GlobalDedup: true, UploadConcurrency: 1, DownloadConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.UploadBytes(context.Background(), deterministicData(200_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.File.SHA256 == nil {
+		t.Fatal("upload omitted SHA-256 presence")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	var dedup, xorbs, shards int
+	for request, count := range requests {
+		switch {
+		case strings.HasPrefix(request, "GET /v1/chunks/default-merkledb/"):
+			dedup += count
+		case strings.HasPrefix(request, "POST /v1/xorbs/default/"):
+			xorbs += count
+		case request == "POST /v2/shards":
+			shards += count
+		default:
+			t.Fatalf("unexpected request %q", request)
+		}
+	}
+	if dedup == 0 || xorbs == 0 || shards != 1 {
+		t.Fatalf("requests=%v", requests)
+	}
+}
+
 func TestWholeDownloadUsesBoundedReconstructionWindows(t *testing.T) {
 	protocol := newMemoryProtocol()
 	client, err := NewClient(protocol, Options{
@@ -349,7 +426,7 @@ func TestUploadBatchSessionDeduplicatesIdenticalFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first != second {
+	if !first.Equal(second) {
 		t.Fatalf("identical files produced different metadata")
 	}
 	report, err := batch.Finalize()
@@ -467,6 +544,42 @@ func TestFragmentationTrackerMatchesRustThresholds(t *testing.T) {
 	tracker.extendRange(3)
 	if tracker.total != 9 {
 		t.Fatalf("rolling chunk total = %d, want 9", tracker.total)
+	}
+}
+
+func TestDefragPreventedSessionDedupDoesNotInflateFileSize(t *testing.T) {
+	seed := chunker.Bytes(deterministicData(1 << 20))
+	if len(seed) < 3 {
+		t.Fatal("test fixture did not produce enough chunks")
+	}
+	data := make([]byte, 0, len(seed[0].Data)*2+len(seed[1].Data)+len(seed[2].Data))
+	for _, index := range []int{0, 1, 2, 0} {
+		data = append(data, seed[index].Data...)
+	}
+	if got := chunker.Bytes(data); len(got) != 4 || !bytes.Equal(got[0].Data, got[3].Data) {
+		t.Fatalf("test fixture did not preserve the repeated chunk: %d chunks", len(got))
+	}
+
+	protocol := newMemoryProtocol()
+	client, err := NewClient(protocol, Options{
+		Compression: xorb.None, CompressionSet: true,
+		UploadConcurrency: 1, DownloadConcurrency: 1,
+		DefragWindow: 1, MinChunksPerRange: 100_000, DefragHysteresis: 0.5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.UploadBytes(context.Background(), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Dedup.DefragSkippedChunks != 1 ||
+		result.Report.Dedup.DefragSkippedBytes != uint64(len(seed[0].Data)) {
+		t.Fatalf("defrag path not exercised: %#v", result.Report.Dedup)
+	}
+	if result.File.Size != uint64(len(data)) || result.Report.Dedup.TotalBytes != uint64(len(data)) ||
+		result.Report.Dedup.NewBytes != uint64(len(data)) {
+		t.Fatalf("size/accounting mismatch: file=%d input=%d report=%#v", result.File.Size, len(data), result.Report.Dedup)
 	}
 }
 

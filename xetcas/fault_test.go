@@ -53,7 +53,7 @@ func TestCompressedBinaryAndNDJSONResponses(t *testing.T) {
 		}))
 		defer server.Close()
 		client := testClient(t, serverURL(t, server.URL), "", Options{})
-		data, found, err := client.QueryGlobalDedup(context.Background(), DefaultPrefix, xethash.Zero)
+		data, found, err := client.QueryGlobalDedup(context.Background(), DefaultDedupPrefix, xethash.Zero)
 		if err != nil || !found || string(data) != "protected-shard" {
 			t.Fatalf("data=%q found=%v error=%v", data, found, err)
 		}

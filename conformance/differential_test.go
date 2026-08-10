@@ -184,12 +184,12 @@ func TestRustDifferentialCompleteXorb(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	goBody, err := xorb.EncodeComplete(goObject, [4]byte{})
+	ingested, err := xorb.IngestNetwork(goObject.Body, goObject.Hash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(goBody, rustBody) {
-		t.Fatalf("complete xorb differs byte-for-byte: Go %d bytes, Rust %d", len(goBody), len(rustBody))
+	if !bytes.Equal(ingested.Complete, rustBody) {
+		t.Fatalf("ingested complete xorb differs byte-for-byte: Go %d bytes, Rust %d", len(ingested.Complete), len(rustBody))
 	}
 }
 
@@ -353,6 +353,23 @@ func TestRustDifferentialShard(t *testing.T) {
 	if !bytes.Equal(goBody, rustBody) {
 		t.Fatalf("upload shard differs byte-for-byte: Go %d bytes, Rust %d", len(goBody), len(rustBody))
 	}
+	goFullBody, err := shard.EncodeFull(shard.Shard{
+		Files: []shard.File{{
+			Hash: xethash.File(nodes),
+			Terms: []shard.Term{{
+				XorbHash: object.Hash, UnpackedBytes: uint32(len(data)), Start: 0, End: uint32(len(parts)),
+				Verification: xethash.Verification(hashes),
+			}},
+			SHA256: &sum,
+		}},
+		Xorbs: []shard.Xorb{xorbInfo},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(goFullBody, fullBody) {
+		t.Fatalf("full shard differs byte-for-byte: Go %d bytes, Rust %d", len(goFullBody), len(fullBody))
+	}
 	shardPath := filepath.Join(t.TempDir(), "upload.mdb")
 	if err := os.WriteFile(shardPath, goBody, 0o600); err != nil {
 		t.Fatal(err)
@@ -367,6 +384,34 @@ func TestRustDifferentialShard(t *testing.T) {
 	}
 	if decoded.Files != 1 || decoded.Xorbs != 1 || !decoded.Verification {
 		t.Fatalf("Rust decoded shard = %+v", decoded)
+	}
+	protected, err := shard.EncodeProtectedDedup(shard.Shard{
+		Files: []shard.File{{
+			Hash: xethash.File(nodes),
+			Terms: []shard.Term{{
+				XorbHash: object.Hash, UnpackedBytes: uint32(len(data)), Start: 0, End: uint32(len(parts)),
+				Verification: xethash.Verification(hashes),
+			}},
+			SHA256: &sum,
+		}},
+		Xorbs: []shard.Xorb{xorbInfo},
+	}, xethash.Chunk([]byte("rust protected shard decode key")), 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protectedPath := filepath.Join(t.TempDir(), "protected.mdb")
+	if err := os.WriteFile(protectedPath, protected, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err = exec.Command(oracle, "decode-shard", protectedPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("Rust decode of Go protected shard: %v\n%s", err, output)
+	}
+	if err := json.Unmarshal(output, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Files != 0 || decoded.Xorbs != 1 {
+		t.Fatalf("Rust decoded protected shard = %+v", decoded)
 	}
 }
 

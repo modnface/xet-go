@@ -38,8 +38,10 @@ prints one status line per object, so its destination is the documented
 The gate checks all 796 chunk boundaries and hashes, aggregate identities,
 byte-for-byte reconstruction, xorb metadata, verification hashes, all four
 shard variants, and protected global-dedup entries. The historical reference
-xorb's `XETB` terminator and zero serialized-byte shard field are accepted only
-on decode; current encoders retain the production formats documented above.
+xorb's `XETB` terminator is accepted only on decode. A zero serialized-byte
+field is also accepted and preserved in upload shards because official upload
+sessions emit it; CAS registration derives durable accounting from the
+separately validated xorb object.
 
 For black-box HTTP interoperability, build and run the official local CAS at
 the same pinned revision:
@@ -54,6 +56,16 @@ Then, from this repository:
 
 ```sh
 XET_LOCAL_CAS_ENDPOINT=http://127.0.0.1:18080 go test ./conformance -run TestOfficialRustLocalCASRoundTrip -v
+```
+
+The reverse direction uses the same pinned oracle binary as an official Rust
+RemoteClient against an in-process Go CAS, including a second fresh-client
+upload that must consume Go's protected global-dedup shard:
+
+```sh
+oracle="$(./conformance/build-rust-oracle.sh)"
+XET_RUST_ORACLE="${oracle}" \
+  go test ./conformance -run TestOfficialRustClientGoCASRoundTrip -v
 ```
 
 For matched performance measurements, run:

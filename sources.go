@@ -52,7 +52,7 @@ func (b *UploadBatch) AddSource(source UploadSource) (FileInfo, error) {
 		b.setFailure(err)
 		return FileInfo{}, err
 	}
-	if source.SHA256 != nil && info.SHA256 != *source.SHA256 {
+	if source.SHA256 != nil && (info.SHA256 == nil || *info.SHA256 != *source.SHA256) {
 		err := errors.New("xet: upload source SHA-256 mismatch")
 		b.setFailure(err)
 		return FileInfo{}, err

@@ -90,9 +90,9 @@ func TestQueryReconstructionFallsBackAndPinsV1(t *testing.T) {
 			http.Error(w, "not implemented", http.StatusNotImplemented)
 		case strings.Contains(r.URL.Path, "/v1/"):
 			v1.Add(1)
-			response := reconstructionV1{
+			response := ReconstructionV1{
 				Terms: []ReconstructionTerm{{Hash: xorbID, UnpackedLength: 3, Range: ChunkRange{Start: 2, End: 3}}},
-				FetchInfo: map[xethash.Hash][]v1FetchInfo{
+				FetchInfo: map[xethash.Hash][]V1FetchInfo{
 					xorbID: {{Range: ChunkRange{Start: 2, End: 3}, URL: serverURLForRequest(r) + "/signed", URLRange: HTTPRange{Start: 10, End: 20}}},
 				},
 			}
@@ -383,7 +383,7 @@ func TestObjectEndpoints(t *testing.T) {
 		case r.Method == http.MethodHead && r.URL.Path == "/v1/files/"+hash.String():
 			w.Header().Set("Content-Length", "1234")
 			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/chunks/default/"+hash.String():
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/chunks/default-merkledb/"+hash.String():
 			_, _ = w.Write([]byte("shard"))
 		default:
 			http.NotFound(w, r)
@@ -391,11 +391,11 @@ func TestObjectEndpoints(t *testing.T) {
 	}))
 	defer server.Close()
 	client := testClient(t, serverURL(t, server.URL), "", Options{})
-	inserted, err := client.UploadXorb(context.Background(), DefaultPrefix, hash, []byte("xorb"))
+	inserted, err := client.UploadXorb(context.Background(), DefaultXorbPrefix, hash, []byte("xorb"))
 	if err != nil || !inserted {
 		t.Fatalf("inserted=%v err=%v", inserted, err)
 	}
-	exists, err := client.XorbExists(context.Background(), DefaultPrefix, hash)
+	exists, err := client.XorbExists(context.Background(), DefaultXorbPrefix, hash)
 	if err != nil || !exists {
 		t.Fatalf("exists=%v err=%v", exists, err)
 	}
@@ -403,9 +403,43 @@ func TestObjectEndpoints(t *testing.T) {
 	if err != nil || !found || size != 1234 {
 		t.Fatalf("size=%d found=%v err=%v", size, found, err)
 	}
-	data, found, err := client.QueryGlobalDedup(context.Background(), DefaultPrefix, hash)
+	data, found, err := client.QueryGlobalDedup(context.Background(), DefaultDedupPrefix, hash)
 	if err != nil || !found || string(data) != "shard" {
 		t.Fatalf("data=%q found=%v err=%v", data, found, err)
+	}
+}
+
+func TestGlobalDedupUsesReadAccess(t *testing.T) {
+	var readCalls, writeCalls atomic.Int32
+	readServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		readCalls.Add(1)
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/v1/chunks/default-merkledb/") {
+			t.Errorf("read request = %s %s", r.Method, r.URL.Path)
+		}
+		http.NotFound(w, r)
+	}))
+	defer readServer.Close()
+	writeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeCalls.Add(1)
+		http.Error(w, "wrong authority", http.StatusForbidden)
+	}))
+	defer writeServer.Close()
+
+	provider := &StaticAccessProvider{
+		Read:  CASAccess{Endpoint: serverURL(t, readServer.URL)},
+		Write: CASAccess{Endpoint: serverURL(t, writeServer.URL)},
+	}
+	client, err := New(provider, Options{Retry: RetryPolicy{MaxAttempts: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := xethash.Chunk([]byte("dedup-read-access"))
+	data, found, err := client.QueryGlobalDedup(context.Background(), DefaultDedupPrefix, hash)
+	if err != nil || found || data != nil {
+		t.Fatalf("dedup result = %q, %v, %v", data, found, err)
+	}
+	if readCalls.Load() != 1 || writeCalls.Load() != 0 {
+		t.Fatalf("read calls=%d write calls=%d", readCalls.Load(), writeCalls.Load())
 	}
 }
 
@@ -424,7 +458,7 @@ func TestBatchReconstructionPostThenLegacyGetFallback(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&keys); err != nil {
 				t.Error(err)
 			}
-			if len(keys) != 2 || keys[0].Prefix != DefaultPrefix {
+			if len(keys) != 2 || keys[0].Prefix != DefaultFilePrefix {
 				t.Errorf("keys=%#v", keys)
 			}
 			http.Error(w, "legacy only", http.StatusMethodNotAllowed)
@@ -433,9 +467,9 @@ func TestBatchReconstructionPostThenLegacyGetFallback(t *testing.T) {
 			if got := r.URL.Query()["file_id"]; len(got) != 2 || got[0] != first.String() || got[1] != second.String() {
 				t.Errorf("file_id query=%v", got)
 			}
-			_ = json.NewEncoder(w).Encode(batchReconstructionV1{
+			_ = json.NewEncoder(w).Encode(BatchReconstructionV1{
 				Files:     map[xethash.Hash][]ReconstructionTerm{first: {}, second: {}},
-				FetchInfo: map[xethash.Hash][]v1FetchInfo{},
+				FetchInfo: map[xethash.Hash][]V1FetchInfo{},
 			})
 		default:
 			t.Errorf("method=%s", r.Method)

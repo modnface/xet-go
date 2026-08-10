@@ -11,4 +11,4 @@ const ProtocolVersion = "1.1.0"
 
 // RustReferenceCommit is the official xet-core revision used for differential
 // conformance testing.
-const RustReferenceCommit = "7a267506b77b484688654c46079e3aec35394611"
+const RustReferenceCommit = "de71453d952bd8b806edaa997c72313051a49050"

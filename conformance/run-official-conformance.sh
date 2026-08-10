@@ -13,7 +13,7 @@ oracle="$("${ROOT_DIR}/conformance/build-rust-oracle.sh")"
 (
   cd "${ROOT_DIR}"
   XET_REFERENCE_FIXTURES="${FIXTURE_DIR}" XET_RUST_ORACLE="${oracle}" \
-    go test ./conformance -run 'Test(RustDifferential|OfficialReference)' -count=1 -v
+    go test ./conformance -run 'Test(RustDifferential|OfficialReference|OfficialRustClientGoCASRoundTrip)' -count=1 -v
 )
 
 cargo +1.95.0 build \

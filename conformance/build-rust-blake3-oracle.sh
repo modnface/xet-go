@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly REFERENCE_COMMIT=7a267506b77b484688654c46079e3aec35394611
+readonly REFERENCE_COMMIT=de71453d952bd8b806edaa997c72313051a49050
 readonly RUST_TOOLCHAIN=1.95.0
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly ROOT_DIR

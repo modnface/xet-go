@@ -25,6 +25,7 @@ func TestClientOptionContracts(t *testing.T) {
 	}
 	for name, options := range map[string]Options{
 		"compression":        {CompressionSet: true, Compression: xorb.Scheme(42)},
+		"conflicting prefix": {Prefix: "legacy", XorbPrefix: "explicit"},
 		"compression retest": {CompressionRetestInterval: -1},
 		"upload workers":     {UploadConcurrency: -1},
 		"download workers":   {DownloadConcurrency: -1},
@@ -43,9 +44,17 @@ func TestClientOptionContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if client.options.Prefix != xetcas.DefaultPrefix || client.options.Compression != xorb.Auto ||
+	if client.options.XorbPrefix != xetcas.DefaultXorbPrefix ||
+		client.options.DedupPrefix != xetcas.DefaultDedupPrefix || client.options.Compression != xorb.Auto ||
 		client.options.UploadConcurrency < 1 || client.options.DownloadConcurrency < 1 {
 		t.Fatalf("defaults = %#v", client.options)
+	}
+	legacy, err := NewClient(protocol, Options{Prefix: "legacy-xorbs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.options.XorbPrefix != "legacy-xorbs" || legacy.options.DedupPrefix != xetcas.DefaultDedupPrefix {
+		t.Fatalf("legacy prefix options = %#v", legacy.options)
 	}
 }
 
@@ -91,6 +100,43 @@ func TestUploadBatchLifecycleContracts(t *testing.T) {
 	}
 }
 
+func TestFileInfoSHA256PresenceAndOwnership(t *testing.T) {
+	var zero [32]byte
+	withZero := FileInfo{SHA256: &zero}
+	if withZero.Equal(FileInfo{}) {
+		t.Fatal("present all-zero SHA-256 compared equal to absent SHA-256")
+	}
+	zeroCopy := zero
+	if !withZero.Equal(FileInfo{SHA256: &zeroCopy}) {
+		t.Fatal("equal SHA-256 values compared unequal")
+	}
+
+	protocol := newMemoryProtocol()
+	client := newTestEngine(t, protocol)
+	batch, err := client.NewUploadBatch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := batch.Add(strings.NewReader("immutable digest metadata"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.SHA256 == nil {
+		t.Fatal("upload omitted SHA-256")
+	}
+	want := *info.SHA256
+	info.SHA256[0] ^= 0xff
+	if _, err := batch.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	protocol.mu.Lock()
+	defer protocol.mu.Unlock()
+	if protocol.metadata == nil || len(protocol.metadata.Files) != 1 ||
+		protocol.metadata.Files[0].SHA256 == nil || *protocol.metadata.Files[0].SHA256 != want {
+		t.Fatalf("caller mutation changed published metadata: %#v", protocol.metadata)
+	}
+}
+
 func TestUploadBatchSessionDeduplicatesRepeatedFiles(t *testing.T) {
 	client := newTestEngine(t, newMemoryProtocol())
 	batch, err := client.NewUploadBatch(context.Background())
@@ -108,7 +154,7 @@ func TestUploadBatchSessionDeduplicatesRepeatedFiles(t *testing.T) {
 		batch.Abort(err)
 		t.Fatal(err)
 	}
-	if first != second {
+	if !first.Equal(second) {
 		batch.Abort(errors.New("identity mismatch"))
 		t.Fatalf("repeated file identities differ: %#v, %#v", first, second)
 	}

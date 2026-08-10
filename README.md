@@ -8,10 +8,12 @@ Rust or requiring a Hugging Face-specific SDK at runtime.
 The module is deliberately hosting-decoupled. Callers provide an already-issued
 Xet CAS endpoint and bearer token through `xetcas.CASAccessProvider`; repository
 lookup, host authentication, branches, and commits remain in the calling
-application.
+application. The optional `xetcas/server` package implements the other side of
+that boundary through injected blob storage, indexes, range-URL signing, and
+authorization.
 
-The implementation is verified against official `huggingface/xet-core` commit
-`7a267506b77b484688654c46079e3aec35394611` and the checksummed official
+The implementation is verified against official `huggingface/xet-core` 1.6.0
+commit `de71453d952bd8b806edaa997c72313051a49050` and the checksummed official
 reference corpus. See [CONFORMANCE.md](CONFORMANCE.md),
 [PROTOCOL_COMPATIBILITY.md](PROTOCOL_COMPATIBILITY.md), and
 [IMPLEMENTATION_SOURCES.md](IMPLEMENTATION_SOURCES.md) for the exact claims and
@@ -92,7 +94,7 @@ if err != nil {
 
 // Persist this hosting-independent metadata with the caller's object record.
 fmt.Printf("xet=%s size=%d sha256=%x\n",
-	result.File.Hash, result.File.Size, result.File.SHA256)
+	result.File.Hash, result.File.Size, *result.File.SHA256)
 ```
 
 `Upload`, `UploadBytes`, and `UploadFile` stream their input, pack chunks into
@@ -143,7 +145,7 @@ _, err := client.DownloadRange(ctx, fileInfo.Hash, requested, &data)
 ```
 
 Complete downloads verify every chunk, reconstruction-term verification hash,
-the Xet file identity, declared size, and nonzero SHA-256. Partial downloads
+the Xet file identity, declared size, and present SHA-256. Partial downloads
 verify all available structure and term data but cannot recompute a whole-file
 identity. Reconstruction is windowed and decoded bytes are kept under
 `MaxDownloadMemory`. Signed object-storage URLs never receive CAS authorization,
@@ -152,16 +154,51 @@ session, or cookie headers.
 `DownloadGroup` runs independent complete or range requests with bounded
 workers and returns one ordered result per request.
 
+## Serve Xet CAS
+
+`xetcas/server` is cloud- and hosting-neutral. A production adapter implements
+`BlobStore`, `IndexStore`, `RangeURLSigner`, and `Authorizer`; the reference
+memory store is intended for tests and local development:
+
+```go
+store := server.NewMemoryStore()
+cas, err := server.New(server.Options{
+	Blobs:      store,
+	Index:      store,
+	Authorizer: server.StaticTokenAuthorizer{Token: os.Getenv("XET_CAS_TOKEN")},
+	Signer:     objectRangeSigner,
+	// Configure a stable secret in production so protected dedup shards remain
+	// usable across process restarts.
+	DedupProtectionKey: protectionKey,
+})
+if err != nil {
+	return err
+}
+return http.ListenAndServe(":8080", cas.Handler())
+```
+
+Xorb bodies are decoded and identity-checked before canonical complete storage.
+Shard registration resolves durable xorb metadata and recomputes term and file
+identities instead of trusting client accounting. Publication writes the full
+shard and secondary indexes before exposing file reconstruction records. v2
+shard responses stream NDJSON heartbeats and a terminal result or error.
+
+The OpenAPI dedup namespace is `default-merkledb`; the server also accepts
+`default` because released official Rust clients currently reuse their xorb
+prefix for dedup requests. Repository reachability policy and S3/GCS signing
+belong in the injected adapters, not this module.
+
 ## Package map
 
 | Package | Purpose |
 |---|---|
 | `xet` | Streaming upload, reconstruction, batches, ranges, groups, delta upload, persistent cache, and replay journal |
 | `xetcas` | Access refresh, Xet CAS v1/v2 routes, signed multipart ranges, retry, response bounds, and adaptive concurrency |
+| `xetcas/server` | Storage-neutral CAS ingestion, shard registration, reconstruction/delta planning, authorization, signed range URLs, and HTTP handlers |
 | `chunker` | Streaming official GearHash content-defined chunking |
 | `xethash` | Canonical hashes, BLAKE3 domains, Merkle aggregation, and compact subtrees |
 | `xorb` | Network and complete/cache xorb codecs for none, LZ4, BG4-LZ4, and production auto selection |
-| `shard` | Footerless upload and footer-bearing cache/global-dedup shard codecs |
+| `shard` | Footerless upload, canonical full, and protected global-dedup shard codecs and registration validation |
 
 All parsers treat network bytes as untrusted: declared lengths and offsets are
 bounds-checked before allocation, compressed bodies have decoded-size caps,

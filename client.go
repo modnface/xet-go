@@ -44,6 +44,16 @@ type Progress struct {
 
 // Options controls engine behavior. Zero values select production defaults.
 type Options struct {
+	// XorbPrefix selects the xorb upload/existence namespace. The zero value
+	// selects xetcas.DefaultXorbPrefix.
+	XorbPrefix string
+	// DedupPrefix selects the global chunk-deduplication namespace. The zero
+	// value selects xetcas.DefaultDedupPrefix.
+	DedupPrefix string
+	// Prefix is the former combined namespace option. It remains an alias for
+	// XorbPrefix only; global deduplication always uses DedupPrefix.
+	//
+	// Deprecated: use XorbPrefix.
 	Prefix      string
 	Compression xorb.Scheme
 	// CompressionSet distinguishes explicit None (whose numeric value is zero)
@@ -77,8 +87,17 @@ func NewClient(protocol Protocol, options Options) (*Client, error) {
 	if protocol == nil {
 		return nil, errors.New("xet: nil CAS protocol client")
 	}
-	if options.Prefix == "" {
-		options.Prefix = xetcas.DefaultPrefix
+	if options.Prefix != "" {
+		if options.XorbPrefix != "" && options.XorbPrefix != options.Prefix {
+			return nil, errors.New("xet: conflicting Prefix and XorbPrefix options")
+		}
+		options.XorbPrefix = options.Prefix
+	}
+	if options.XorbPrefix == "" {
+		options.XorbPrefix = xetcas.DefaultXorbPrefix
+	}
+	if options.DedupPrefix == "" {
+		options.DedupPrefix = xetcas.DefaultDedupPrefix
 	}
 	if !options.CompressionSet {
 		options.Compression = xorb.Auto
@@ -126,9 +145,29 @@ func NewClient(protocol Protocol, options Options) (*Client, error) {
 
 // FileInfo is hosting-independent Xet metadata for one logical file.
 type FileInfo struct {
-	Hash   xethash.Hash
-	Size   uint64
-	SHA256 [32]byte
+	Hash xethash.Hash
+	// Size is always present. Zero denotes an empty file, not an unknown size.
+	Size uint64
+	// SHA256 is nil only when the source metadata did not include a digest.
+	// Uploads always return a non-nil value, including an all-zero digest.
+	SHA256 *[32]byte
+}
+
+// Equal reports whether two file records carry the same identities and size.
+// SHA256 pointers are compared by value, including nil presence.
+func (f FileInfo) Equal(other FileInfo) bool {
+	if f.Hash != other.Hash || f.Size != other.Size || (f.SHA256 == nil) != (other.SHA256 == nil) {
+		return false
+	}
+	return f.SHA256 == nil || *f.SHA256 == *other.SHA256
+}
+
+func cloneFileInfo(info FileInfo) FileInfo {
+	if info.SHA256 != nil {
+		sum := *info.SHA256
+		info.SHA256 = &sum
+	}
+	return info
 }
 
 // DedupReport accounts for chunks and bytes before protocol compression.

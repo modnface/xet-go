@@ -99,7 +99,7 @@ func TestOfficialRustLocalCASRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deduplicated.File != seed.File || deduplicated.Report.Xorbs != 0 ||
+	if !deduplicated.File.Equal(seed.File) || deduplicated.Report.Xorbs != 0 ||
 		deduplicated.Report.Dedup.GlobalDedupBytes != uint64(len(dedupData)) ||
 		deduplicated.Report.Dedup.NewBytes != 0 {
 		t.Fatalf("official Rust global-dedup result: %#v", deduplicated)

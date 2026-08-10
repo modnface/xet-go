@@ -68,10 +68,11 @@ type globalDedupIndex struct {
 	locations map[xethash.Hash]placement
 }
 
-type globalCandidate struct {
+type dedupCandidate struct {
 	hash      xethash.Hash
 	data      []byte
 	placement placement
+	global    bool
 }
 
 type fragmentationTracker struct {
@@ -217,7 +218,7 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 	file := uploadedFile{}
 	nextGlobalQuery := 0
 	tracker := newFragmentationTracker(b.client.options)
-	var candidates []globalCandidate
+	var candidates []dedupCandidate
 	recordPlacement := func(value placement) {
 		if len(file.placements) != 0 && placementsContinue(file.placements[len(file.placements)-1], value) {
 			tracker.extendRange(1)
@@ -226,13 +227,7 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 		}
 		file.placements = append(file.placements, value)
 	}
-	placeLocal := func(hash xethash.Hash, data []byte) error {
-		if existing, ok := b.locations[hash]; ok {
-			recordPlacement(existing)
-			b.report.Dedup.SessionDedupChunks++
-			b.report.Dedup.SessionDedupBytes += uint64(len(data))
-			return nil
-		}
+	placeNovel := func(hash xethash.Hash, data []byte) error {
 		value, err := b.addNovelChunk(data, fileSerial)
 		if err != nil {
 			return err
@@ -253,14 +248,19 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 			for _, candidate := range candidates {
 				recordPlacement(candidate.placement)
 				b.locations[candidate.hash] = candidate.placement
-				b.report.Dedup.GlobalDedupChunks++
-				b.report.Dedup.GlobalDedupBytes += uint64(len(candidate.data))
+				if candidate.global {
+					b.report.Dedup.GlobalDedupChunks++
+					b.report.Dedup.GlobalDedupBytes += uint64(len(candidate.data))
+				} else {
+					b.report.Dedup.SessionDedupChunks++
+					b.report.Dedup.SessionDedupBytes += uint64(len(candidate.data))
+				}
 			}
 		} else {
 			for _, candidate := range candidates {
 				b.report.Dedup.DefragSkippedChunks++
 				b.report.Dedup.DefragSkippedBytes += uint64(len(candidate.data))
-				if err := placeLocal(candidate.hash, candidate.data); err != nil {
+				if err := placeNovel(candidate.hash, candidate.data); err != nil {
 					return err
 				}
 			}
@@ -268,13 +268,13 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 		candidates = candidates[:0]
 		return nil
 	}
-	bufferGlobal := func(hash xethash.Hash, data []byte, value placement) error {
+	bufferCandidate := func(hash xethash.Hash, data []byte, value placement, global bool) error {
 		if len(candidates) != 0 && !placementsContinue(candidates[len(candidates)-1].placement, value) {
 			if err := flushCandidates(); err != nil {
 				return err
 			}
 		}
-		candidates = append(candidates, globalCandidate{hash: hash, data: data, placement: value})
+		candidates = append(candidates, dedupCandidate{hash: hash, data: data, placement: value, global: global})
 		return nil
 	}
 	reader := io.TeeReader(source, sha)
@@ -289,14 +289,11 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 		b.report.Dedup.TotalBytes += uint64(len(value.Data))
 		fileChunkIndex := len(file.chunkNodes) - 1
 		if existing, ok := b.locations[hash]; ok {
-			if err := flushCandidates(); err != nil {
+			if err := bufferCandidate(hash, value.Data, existing, false); err != nil {
 				return err
 			}
-			recordPlacement(existing)
-			b.report.Dedup.SessionDedupChunks++
-			b.report.Dedup.SessionDedupBytes += uint64(len(value.Data))
 		} else if existing, ok := b.lookupGlobal(hash, uint32(len(value.Data))); ok {
-			if err := bufferGlobal(hash, value.Data, existing); err != nil {
+			if err := bufferCandidate(hash, value.Data, existing, true); err != nil {
 				return err
 			}
 		} else {
@@ -305,7 +302,7 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 				nextGlobalQuery = fileChunkIndex + 256
 				b.loadGlobalShard(hash)
 				if external, found := b.lookupGlobal(hash, uint32(len(value.Data))); found {
-					if err := bufferGlobal(hash, value.Data, external); err != nil {
+					if err := bufferCandidate(hash, value.Data, external, true); err != nil {
 						return err
 					}
 					goto progress
@@ -314,7 +311,7 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 			if err := flushCandidates(); err != nil {
 				return err
 			}
-			if err := placeLocal(hash, value.Data); err != nil {
+			if err := placeNovel(hash, value.Data); err != nil {
 				return err
 			}
 		}
@@ -337,10 +334,12 @@ func (b *UploadBatch) Add(source io.Reader) (FileInfo, error) {
 	for _, node := range file.chunkNodes {
 		file.info.Size += node.Size
 	}
-	copy(file.info.SHA256[:], sha.Sum(nil))
+	var shaSum [32]byte
+	copy(shaSum[:], sha.Sum(nil))
+	file.info.SHA256 = &shaSum
 	b.files = append(b.files, file)
 	b.report.Files = len(b.files)
-	return file.info, nil
+	return cloneFileInfo(file.info), nil
 }
 
 func (b *UploadBatch) lookupGlobal(hash xethash.Hash, length uint32) (placement, bool) {
@@ -375,7 +374,7 @@ func (b *UploadBatch) loadGlobalShard(queryHash xethash.Hash) {
 		fromCache = found
 	}
 	if !found {
-		data, found, _ = b.client.protocol.QueryGlobalDedup(b.ctx, b.client.options.Prefix, queryHash)
+		data, found, _ = b.client.protocol.QueryGlobalDedup(b.ctx, b.client.options.DedupPrefix, queryHash)
 	}
 	if !found {
 		return
@@ -513,7 +512,7 @@ func (b *UploadBatch) uploadWorker() {
 			}
 			if recorded {
 				if checker, ok := b.client.protocol.(xorbExistenceProtocol); ok {
-					exists, err := checker.XorbExists(b.ctx, b.client.options.Prefix, task.object.Hash)
+					exists, err := checker.XorbExists(b.ctx, b.client.options.XorbPrefix, task.object.Hash)
 					if err != nil {
 						b.setFailure(err)
 						continue
@@ -527,7 +526,7 @@ func (b *UploadBatch) uploadWorker() {
 				}
 			}
 		}
-		inserted, err := b.client.protocol.UploadXorb(b.ctx, b.client.options.Prefix, task.object.Hash, task.object.Body)
+		inserted, err := b.client.protocol.UploadXorb(b.ctx, b.client.options.XorbPrefix, task.object.Hash, task.object.Body)
 		if err != nil {
 			b.setFailure(err)
 			continue
@@ -624,8 +623,10 @@ func buildShardFile(file uploadedFile) (shard.File, error) {
 		return shard.File{}, errors.New("xet: file chunk and placement counts differ")
 	}
 	result := shard.File{Hash: file.info.Hash}
-	shaValue := file.info.SHA256
-	result.SHA256 = &shaValue
+	if file.info.SHA256 != nil {
+		shaValue := *file.info.SHA256
+		result.SHA256 = &shaValue
+	}
 	for start := 0; start < len(file.placements); {
 		xorbHash, err := file.placements[start].xorbHash()
 		if err != nil {

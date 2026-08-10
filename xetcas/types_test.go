@@ -165,16 +165,16 @@ func TestLegacyReconstructionNormalization(t *testing.T) {
 	file := xethash.Chunk([]byte("file"))
 	xorbHash := xethash.Chunk([]byte("xorb"))
 	term := ReconstructionTerm{Hash: xorbHash, UnpackedLength: 1, Range: ChunkRange{0, 1}}
-	info := v1FetchInfo{Range: ChunkRange{0, 1}, URL: "https://storage.example/x", URLRange: HTTPRange{0, 9}}
+	info := V1FetchInfo{Range: ChunkRange{0, 1}, URL: "https://storage.example/x", URLRange: HTTPRange{0, 9}}
 
-	normalized := (reconstructionV1{OffsetIntoFirstRange: 0, Terms: []ReconstructionTerm{term}, FetchInfo: map[xethash.Hash][]v1FetchInfo{xorbHash: {info}}}).normalize()
+	normalized := (ReconstructionV1{OffsetIntoFirstRange: 0, Terms: []ReconstructionTerm{term}, FetchInfo: map[xethash.Hash][]V1FetchInfo{xorbHash: {info}}}).normalize()
 	if err := normalized.Validate(); err != nil {
 		t.Fatalf("single normalization: %v", err)
 	}
 
-	batch := batchReconstructionV1{
+	batch := BatchReconstructionV1{
 		Files:     map[xethash.Hash][]ReconstructionTerm{file: {term, term}},
-		FetchInfo: map[xethash.Hash][]v1FetchInfo{xorbHash: {info}},
+		FetchInfo: map[xethash.Hash][]V1FetchInfo{xorbHash: {info}},
 	}
 	result, err := batch.normalize()
 	if err != nil || len(result) != 1 || len(result[file].Xorbs) != 1 {
@@ -184,7 +184,7 @@ func TestLegacyReconstructionNormalization(t *testing.T) {
 	if _, err := batch.normalize(); err == nil {
 		t.Fatal("batch without fetch data normalized")
 	}
-	batch.FetchInfo = map[xethash.Hash][]v1FetchInfo{xorbHash: {{Range: ChunkRange{}, URL: "relative"}}}
+	batch.FetchInfo = map[xethash.Hash][]V1FetchInfo{xorbHash: {{Range: ChunkRange{}, URL: "relative"}}}
 	if _, err := batch.normalize(); err == nil {
 		t.Fatal("batch with invalid reconstruction normalized")
 	}

@@ -32,6 +32,9 @@ use xet_core_structures::xorb_object::{
     xorb_format_test_utils::serialize_xorb_to_stream_reference,
 };
 use xet_data::deduplication::Chunker;
+use xet_data::processing::data_client::{clean_bytes, default_config};
+use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy};
+use xet_runtime::core::XetContext;
 
 struct CountingAllocator;
 
@@ -135,6 +138,59 @@ struct SubtreeRecord {
     right: MerkleHashSubtree,
     merged: MerkleHashSubtree,
     final_hash: String,
+}
+
+#[derive(Serialize)]
+struct RemoteRoundtripRecord {
+    file_hash: String,
+    file_size: u64,
+    sha256: Option<String>,
+    downloaded_bytes: u64,
+    global_dedup_bytes: u64,
+}
+
+fn remote_roundtrip(
+    data: Vec<u8>,
+    endpoint: String,
+    token: String,
+    output_path: String,
+) -> anyhow::Result<RemoteRoundtripRecord> {
+    let ctx = XetContext::default()?;
+    let runtime = ctx.runtime.clone();
+    runtime.bridge_sync(async move {
+        let expiration = u64::MAX;
+        let upload_config = Arc::new(default_config(
+            &ctx,
+            endpoint.clone(),
+            Some((token.clone(), expiration)),
+            None,
+            None,
+        )?);
+        let upload = FileUploadSession::new(upload_config).await?;
+        let (file, _) = clean_bytes(upload.clone(), data, Sha256Policy::Compute).await?;
+        let metrics = upload.finalize().await?;
+
+        let download_config = Arc::new(default_config(
+            &ctx,
+            endpoint,
+            Some((token, expiration)),
+            None,
+            None,
+        )?);
+        let download = FileDownloadSession::new(download_config, None).await?;
+        let (_, downloaded_bytes) = download
+            .download_file(&file, std::path::Path::new(&output_path))
+            .await?;
+        download.finalize().await?;
+
+        Ok(RemoteRoundtripRecord {
+            file_hash: file.hash,
+            file_size: file.file_size.unwrap_or_default(),
+            sha256: file.sha256,
+            downloaded_bytes,
+            global_dedup_bytes: metrics.deduped_bytes_by_global_dedup,
+        })
+    })?
 }
 
 fn raw_hex(data: &[u8]) -> String {
@@ -366,7 +422,7 @@ fn main() -> ExitCode {
     let args: Vec<_> = env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "usage: xet-go-rust-oracle <corpus|bench|perf|subtree|encode-xorb|encode-xorb-complete|decode-xorb|encode-shard|decode-shard> <file> [argument]"
+            "usage: xet-go-rust-oracle <corpus|bench|perf|subtree|encode-xorb|encode-xorb-complete|decode-xorb|encode-shard|decode-shard|remote-roundtrip> <file> [argument]"
         );
         return ExitCode::from(2);
     }
@@ -378,6 +434,27 @@ fn main() -> ExitCode {
         }
     };
     match args[1].as_str() {
+        "remote-roundtrip" => {
+            let Some(endpoint) = args.get(3) else {
+                eprintln!("remote-roundtrip requires endpoint, token, and output arguments");
+                return ExitCode::from(2);
+            };
+            let Some(token) = args.get(4) else {
+                eprintln!("remote-roundtrip requires endpoint, token, and output arguments");
+                return ExitCode::from(2);
+            };
+            let Some(output) = args.get(5) else {
+                eprintln!("remote-roundtrip requires endpoint, token, and output arguments");
+                return ExitCode::from(2);
+            };
+            match remote_roundtrip(data, endpoint.clone(), token.clone(), output.clone()) {
+                Ok(record) => println!("{}", serde_json::to_string(&record).unwrap()),
+                Err(error) => {
+                    eprintln!("remote round trip: {error:#}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         "corpus" => println!("{}", serde_json::to_string(&calculate(&data)).unwrap()),
         "bench" => {
             let iterations: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(1);
