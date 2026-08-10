@@ -31,6 +31,7 @@
 | Shard progress | v2 NDJSON emits validation/commit/result or terminal error frames and periodically repeats the latest frame as a heartbeat |
 | Server work limits | Configurable file/xorb/term/chunk-reference budgets, context-aware planners, bounded compact-gap memory, and pre-buffer ingestion admission |
 | Typed reconstruction | `Service.OpenFile` streams full files or ranges directly from global physical Xorbs reached through a namespace-scoped file recipe, with chunk/length validation, optional whole-file SHA-256, backpressure, cancellation, and deterministic closure |
+| Local durable storage | Linux/macOS immutable filesystem blobs plus a pure-Go SQLite WAL index; strict file/directory barriers, process-root locking, restart persistence, and transactional shard-index publication |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
 | Credential refresh | Refresh 30 seconds before expiry, coalesce concurrent refresh, and retry exactly once after a 401 invalidation |
@@ -96,25 +97,43 @@ Compatibility is continuously checked by the requirement matrix in
   the interfaces do not create a transaction across object and index stores.
   Durable adapters must not report success before their writes are durable.
 
-## Durable backend gap list
+## Durable backend status and gap list
 
-The current server provides only the concurrency-safe memory reference store.
-Filesystem/SQLite and S3/PostgreSQL adapters still need to prove these
-invariants before production durability is claimed:
+The concurrency-safe memory store remains the semantic reference. The local
+durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
 
-1. conditional immutable object writes with identity/length verification and
-   crash-safe replacement on local filesystems;
-2. one SQL transaction for dedup, scoped SHA, and file-index publication, with
-   readers unable to observe a dangling or incomplete reconstruction root;
-3. staged-object protection and restart cleanup for a crash between object
-   publication and SQL commit;
-4. deterministic first-valid selection when duplicate file or dedup rows exist,
-   plus constraints for truly immutable xorb and SHA records;
-5. SQL constraints and queries that preserve namespace-scoped file/dedup/SHA
-   reachability while retaining global Xorb identity and the documented
-   transitive-dependency policy;
-6. paginated iteration over objects and indexes for audit, repair, migration,
-   and garbage collection without whole-bucket materialization; and
-7. cancellation-aware filesystem, SQL, S3, and signed-range operations, tested
-   with failures injected after every publication step and a real process
-   restart.
+- blobs use versioned, hash-derived paths, exact declared-length streaming,
+  immutable hard-link publication, byte-for-byte idempotence checks, and file
+  plus directory durability barriers;
+- one process owns a filesystem root at a time, startup removes only abandoned
+  temporary files older than the configured grace period, and path components
+  beneath the private root are rejected when they are symlinks;
+- SQLite is created privately, uses WAL with `synchronous=FULL`, applies safety
+  pragmas to every pooled connection, and publishes dedup, scoped SHA, and file
+  records in one immediate transaction;
+- file and dedup indexes deterministically retain their first valid source,
+  while Xorb and scoped SHA identities reject immutable conflicts; and
+- the same backend contract suite runs against memory/filesystem and
+  memory/SQLite, including cancellation, namespace isolation, concurrent
+  publication, injected publication failures, close/reopen, and full
+  reconstruction after restart.
+
+Strict directory durability is currently implemented only on Linux and macOS.
+Other platforms return `ErrDurabilityUnsupported` before changing the requested
+filesystem or SQLite path. The local backend assumes a filesystem with truthful
+`fsync`, hard-link, and advisory-lock semantics; concurrent mutation by another
+process running as the service identity is outside its threat model.
+
+Remaining production storage boundaries are:
+
+1. staged-object protection, pins/leases, and grace-based cleanup for a crash
+   between immutable blob publication and SQL commit;
+2. bounded paginated iteration over blobs, Xorbs, file identities, dedup, SHA,
+   staged records, and reachability roots;
+3. audit, repair, resumable mark-and-sweep, and guarded garbage collection built
+   on those iteration and protection primitives;
+4. S3-compatible immutable/conditional blob publication and signed range reads;
+5. PostgreSQL migrations and an index implementation with the same atomic and
+   namespace-scoped contract as SQLite; and
+6. MinIO/PostgreSQL multi-process, restart, and fault-injection evidence for the
+   remote profile.

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"os"
 	"testing"
 )
 
@@ -57,6 +58,10 @@ func TestRunAndErrors(t *testing.T) {
 	if got := implementationName("stream_reuse"); got != "go-unified-blake3-fork" {
 		t.Fatalf("streaming implementation = %q", got)
 	}
+	previousArgs := os.Args
+	t.Cleanup(func() { os.Args = previousArgs })
+	os.Args = []string{"blake3-perf", "perf", "one_shot", "1", "1", "1"}
+	main()
 	for _, args := range [][]string{
 		nil,
 		{"perf", "unknown", "64", "1", "1"},

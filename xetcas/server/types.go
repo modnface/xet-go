@@ -16,13 +16,14 @@ import (
 )
 
 var (
-	ErrNotFound     = errors.New("xet CAS server: not found")
-	ErrUnauthorized = errors.New("xet CAS server: unauthorized")
-	ErrForbidden    = errors.New("xet CAS server: forbidden")
-	ErrConflict     = errors.New("xet CAS server: immutable value conflict")
-	ErrTooLarge     = errors.New("xet CAS server: request body too large")
-	ErrInvalid      = errors.New("xet CAS server: invalid request")
-	ErrCorrupt      = errors.New("xet CAS server: corrupt content")
+	ErrNotFound              = errors.New("xet CAS server: not found")
+	ErrUnauthorized          = errors.New("xet CAS server: unauthorized")
+	ErrForbidden             = errors.New("xet CAS server: forbidden")
+	ErrConflict              = errors.New("xet CAS server: immutable value conflict")
+	ErrTooLarge              = errors.New("xet CAS server: request body too large")
+	ErrInvalid               = errors.New("xet CAS server: invalid request")
+	ErrCorrupt               = errors.New("xet CAS server: corrupt content")
+	ErrDurabilityUnsupported = errors.New("xet CAS server: strict filesystem durability is unsupported")
 )
 
 type BlobKind string

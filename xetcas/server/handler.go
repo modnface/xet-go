@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -147,17 +148,26 @@ func (s *Service) handleShardV2(w http.ResponseWriter, r *http.Request, credenti
 		result ShardResult
 		err    error
 	}
+	publicationContext, cancelPublication := context.WithCancel(r.Context())
 	completed := make(chan outcome, 1)
 	go func() {
 		defer release()
-		result, err := s.publishShard(r.Context(), grant, data)
+		result, err := s.publishShard(publicationContext, grant, data)
 		completed <- outcome{result: result, err: err}
+	}()
+	publicationFinished := false
+	defer func() {
+		cancelPublication()
+		if !publicationFinished {
+			<-completed
+		}
 	}()
 	ticker := time.NewTicker(s.shardHeartbeat)
 	defer ticker.Stop()
 	for {
 		select {
 		case value := <-completed:
+			publicationFinished = true
 			if value.err != nil {
 				_ = encoder.Encode(xetcas.ShardUploadEvent{
 					Type: "error", Message: http.StatusText(serverErrorStatus(value.err)),

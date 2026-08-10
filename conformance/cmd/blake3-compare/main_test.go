@@ -97,6 +97,10 @@ func TestRunAndCompare(t *testing.T) {
 	if err != nil || parallel.Samples != 2 {
 		t.Fatalf("parallel compare = %+v, %v", parallel, err)
 	}
+	previousArgs := os.Args
+	t.Cleanup(func() { os.Args = previousArgs })
+	os.Args = append([]string{"blake3-compare"}, args...)
+	main()
 }
 
 func TestRunErrors(t *testing.T) {

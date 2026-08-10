@@ -243,6 +243,10 @@ func TestRunValidatesArgumentsAndPublishesReports(t *testing.T) {
 	if stdout.String() != jsonPath+"\n"+markdownPath+"\n" {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
+	previousArgs := os.Args
+	t.Cleanup(func() { os.Args = previousArgs })
+	os.Args = append([]string{"perf-compare"}, args...)
+	main()
 	if err := run(args, failingWriter{}); err == nil {
 		t.Fatal("command output failure succeeded")
 	}

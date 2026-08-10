@@ -513,7 +513,7 @@ func TestReconstructionGroupsCoalesceAdjacentTerms(t *testing.T) {
 	}
 	_ = closedWriter.Close()
 	unusedReader, unusedWriter := io.Pipe()
-	defer unusedReader.Close()
+	defer func() { _ = unusedReader.Close() }()
 	if err := service.streamReconstruction(ctx, unusedWriter, groups, uint64(len(objectContents(none)))+1, 0, false, nil); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("unconsumed reconstruction bytes = %v", err)
 	}

@@ -44,11 +44,14 @@ func NewMemoryStore() *MemoryStore {
 	}
 }
 
-func (s *MemoryStore) PutIfAbsent(_ context.Context, key BlobKey, body io.Reader, size int64) (bool, error) {
+func (s *MemoryStore) PutIfAbsent(ctx context.Context, key BlobKey, body io.Reader, size int64) (bool, error) {
 	if body == nil || size < 0 {
 		return false, errorsf("invalid blob body or size")
 	}
-	data, err := io.ReadAll(io.LimitReader(body, size+1))
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	data, err := io.ReadAll(io.LimitReader(&contextReader{ctx: ctx, r: body}, size+1))
 	if err != nil {
 		return false, err
 	}
@@ -57,6 +60,9 @@ func (s *MemoryStore) PutIfAbsent(_ context.Context, key BlobKey, body io.Reader
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if previous, ok := s.blobs[key]; ok {
 		if !bytes.Equal(previous, data) {
 			return false, ErrConflict
@@ -67,20 +73,36 @@ func (s *MemoryStore) PutIfAbsent(_ context.Context, key BlobKey, body io.Reader
 	return true, nil
 }
 
-func (s *MemoryStore) Head(_ context.Context, key BlobKey) (BlobInfo, bool, error) {
+func (s *MemoryStore) Head(ctx context.Context, key BlobKey) (BlobInfo, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return BlobInfo{}, false, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return BlobInfo{}, false, err
+	}
 	value, ok := s.blobs[key]
 	return BlobInfo{Size: int64(len(value))}, ok, nil
 }
 
-func (s *MemoryStore) Get(_ context.Context, key BlobKey, wanted *xetcas.HTTPRange) (io.ReadCloser, error) {
+func (s *MemoryStore) Get(ctx context.Context, key BlobKey, wanted *xetcas.HTTPRange) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
+	if err := ctx.Err(); err != nil {
+		s.mu.RUnlock()
+		return nil, err
+	}
 	value, ok := s.blobs[key]
 	if ok {
 		value = append([]byte(nil), value...)
 	}
 	s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, ErrNotFound
 	}
@@ -90,19 +112,32 @@ func (s *MemoryStore) Get(_ context.Context, key BlobKey, wanted *xetcas.HTTPRan
 		}
 		value = value[wanted.Start : wanted.End+1]
 	}
-	return io.NopCloser(bytes.NewReader(value)), nil
+	reader := io.NopCloser(bytes.NewReader(value))
+	return &contextReadCloser{ctx: ctx, Reader: reader, close: reader}, nil
 }
 
-func (s *MemoryStore) GetXorb(_ context.Context, hash xethash.Hash) (XorbRecord, bool, error) {
+func (s *MemoryStore) GetXorb(ctx context.Context, hash xethash.Hash) (XorbRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return XorbRecord{}, false, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return XorbRecord{}, false, err
+	}
 	value, ok := s.xorbs[hash]
 	return cloneXorbRecord(value), ok, nil
 }
 
-func (s *MemoryStore) PutXorb(_ context.Context, value XorbRecord) error {
+func (s *MemoryStore) PutXorb(ctx context.Context, value XorbRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if previous, ok := s.xorbs[value.Layout.Hash]; ok && !reflect.DeepEqual(previous, value) {
 		return ErrConflict
 	}
@@ -110,17 +145,29 @@ func (s *MemoryStore) PutXorb(_ context.Context, value XorbRecord) error {
 	return nil
 }
 
-func (s *MemoryStore) GetFile(_ context.Context, namespace string, hash xethash.Hash) (FileRecord, bool, error) {
+func (s *MemoryStore) GetFile(ctx context.Context, namespace string, hash xethash.Hash) (FileRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return FileRecord{}, false, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return FileRecord{}, false, err
+	}
 	value, ok := s.files[scopedHash{namespace: namespace, hash: hash}]
 	return cloneFileRecord(value), ok, nil
 }
 
-func (s *MemoryStore) PutFile(_ context.Context, namespace string, value FileRecord) error {
+func (s *MemoryStore) PutFile(ctx context.Context, namespace string, value FileRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	key := scopedHash{namespace: namespace, hash: value.File.File.Hash}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, ok := s.files[key]; ok {
 		// A file identity authenticates the logical chunk sequence, not one
 		// particular shard recipe or the presence of optional SHA metadata.
@@ -131,17 +178,29 @@ func (s *MemoryStore) PutFile(_ context.Context, namespace string, value FileRec
 	return nil
 }
 
-func (s *MemoryStore) GetDedup(_ context.Context, namespace string, hash xethash.Hash) (DedupRecord, bool, error) {
+func (s *MemoryStore) GetDedup(ctx context.Context, namespace string, hash xethash.Hash) (DedupRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return DedupRecord{}, false, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return DedupRecord{}, false, err
+	}
 	value, ok := s.dedup[scopedHash{namespace: namespace, hash: hash}]
 	return value, ok, nil
 }
 
-func (s *MemoryStore) PutDedup(_ context.Context, namespace string, hash xethash.Hash, value DedupRecord) error {
+func (s *MemoryStore) PutDedup(ctx context.Context, namespace string, hash xethash.Hash, value DedupRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	key := scopedHash{namespace: namespace, hash: hash}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, ok := s.dedup[key]; ok {
 		// A chunk may legitimately occur in many shards. Keep the first durable
 		// source; replacing it is unnecessary and a different source is not an
@@ -152,17 +211,29 @@ func (s *MemoryStore) PutDedup(_ context.Context, namespace string, hash xethash
 	return nil
 }
 
-func (s *MemoryStore) ResolveSHA256(_ context.Context, namespace string, sum [32]byte, size uint64) (xethash.Hash, bool, error) {
+func (s *MemoryStore) ResolveSHA256(ctx context.Context, namespace string, sum [32]byte, size uint64) (xethash.Hash, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return xethash.Hash{}, false, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return xethash.Hash{}, false, err
+	}
 	value, ok := s.sha256[shaKey{namespace: namespace, sum: sum, size: size}]
 	return value, ok, nil
 }
 
-func (s *MemoryStore) PutSHA256(_ context.Context, namespace string, sum [32]byte, size uint64, hash xethash.Hash) error {
+func (s *MemoryStore) PutSHA256(ctx context.Context, namespace string, sum [32]byte, size uint64, hash xethash.Hash) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	key := shaKey{namespace: namespace, sum: sum, size: size}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if previous, ok := s.sha256[key]; ok && previous != hash {
 		return ErrConflict
 	}
@@ -176,6 +247,9 @@ func (s *MemoryStore) PublishShard(ctx context.Context, publication ShardPublica
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Preflight every immutable SHA association before changing any map. File
 	// and dedup records deliberately retain their first already-valid source.
 	pendingSHA := make(map[shaKey]xethash.Hash, len(publication.SHA256))

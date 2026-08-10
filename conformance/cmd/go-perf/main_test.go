@@ -32,6 +32,10 @@ func TestRun(t *testing.T) {
 	if record.Operation != "chunk_hash" || record.InputSize != 30_000 || record.Identity == "" {
 		t.Fatalf("unexpected record: %+v", record)
 	}
+	previousArgs := os.Args
+	t.Cleanup(func() { os.Args = previousArgs })
+	os.Args = []string{"go-perf", "perf", input, "chunk_hash", "1"}
+	main()
 }
 
 func TestRunRejectsInvalidInputs(t *testing.T) {

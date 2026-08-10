@@ -590,9 +590,27 @@ func TestFooterValidation(t *testing.T) {
 	if decoded.Footer == nil || decoded.Footer.Offset != footerStart {
 		t.Fatalf("footer = %+v", decoded.Footer)
 	}
-	full[len(full)-1] ^= 1
-	if _, err := Decode(full); err == nil {
-		t.Fatal("accepted corrupt footer offset")
+	tests := map[string]func([]byte){
+		"file lookup overflow": func(data []byte) {
+			binary.LittleEndian.PutUint64(data[footerStart+24:footerStart+32], ^uint64(0)-1)
+			binary.LittleEndian.PutUint64(data[footerStart+32:footerStart+40], 2)
+		},
+		"xorb lookup overlap": func(data []byte) {
+			binary.LittleEndian.PutUint64(data[footerStart+40:footerStart+48], 0)
+		},
+		"chunk lookup overlap": func(data []byte) {
+			binary.LittleEndian.PutUint64(data[footerStart+56:footerStart+64], 0)
+		},
+		"footer offset": func(data []byte) { data[len(data)-1] ^= 1 },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			corrupt := append([]byte(nil), full...)
+			mutate(corrupt)
+			if _, err := Decode(corrupt); err == nil {
+				t.Fatal("accepted corrupt footer")
+			}
+		})
 	}
 }
 

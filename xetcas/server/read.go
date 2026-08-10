@@ -254,7 +254,7 @@ func (s *Service) OpenFile(
 	}()
 	result := &OpenedFile{
 		Hash: hash, FileSize: file.File.Size, Range: selected, Size: selected.Len(),
-		Body: &cancelReadCloser{PipeReader: reader, ctx: streamContext, cancel: cancel},
+		Body: &cancelReadCloser{PipeReader: reader, ctx: streamContext, cancel: cancel, done: done},
 	}
 	if file.File.File.SHA256 != nil {
 		sum := *file.File.File.SHA256
@@ -267,7 +267,9 @@ type cancelReadCloser struct {
 	*io.PipeReader
 	ctx    context.Context
 	cancel context.CancelFunc
+	done   <-chan struct{}
 	once   sync.Once
+	err    error
 }
 
 func (r *cancelReadCloser) Read(data []byte) (int, error) {
@@ -279,8 +281,12 @@ func (r *cancelReadCloser) Read(data []byte) (int, error) {
 }
 
 func (r *cancelReadCloser) Close() error {
-	r.once.Do(r.cancel)
-	return r.PipeReader.Close()
+	r.once.Do(func() {
+		r.cancel()
+		r.err = r.PipeReader.Close()
+		<-r.done
+	})
+	return r.err
 }
 
 type onceReadCloser struct {

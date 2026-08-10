@@ -32,8 +32,9 @@ source baseline.
 go get github.com/jmwoliver/xet-go
 ```
 
-The release library has no C or Rust dependency. Its only direct dependencies
-are pure-Go BLAKE3, LZ4, and compressed-response codec implementations.
+The release library has no C or Rust dependency. Its direct dependencies are
+pure-Go BLAKE3, LZ4, compressed-response codecs, pure-Go SQLite, and the Go
+platform syscall package used for strict local-filesystem locking.
 
 ## Connect to Xet CAS
 
@@ -157,8 +158,8 @@ workers and returns one ordered result per request.
 ## Serve Xet CAS
 
 `xetcas/server` is cloud- and hosting-neutral. A production adapter implements
-`BlobStore`, `IndexStore`, `RangeURLSigner`, and `Authorizer`; the reference
-memory store is intended for tests and local development:
+`BlobStore`, `IndexStore`, `RangeURLSigner`, and `Authorizer`. The reference
+memory store is intended for tests and ephemeral development:
 
 ```go
 store := server.NewMemoryStore()
@@ -178,6 +179,35 @@ if err != nil {
 }
 return http.ListenAndServe(":8080", cas.Handler())
 ```
+
+For a durable single-node CAS on Linux or macOS, pair the immutable filesystem
+blob store with the transactional SQLite index:
+
+```go
+blobs, err := server.NewFilesystemBlobStore("/var/lib/my-service/xet/blobs")
+if err != nil {
+	return err
+}
+index, err := server.OpenSQLiteIndexStore("/var/lib/my-service/xet/index.db")
+if err != nil {
+	_ = blobs.Close()
+	return err
+}
+cas, err := server.New(server.Options{
+	Blobs: blobs, Index: index,
+	Authorizer: authorizer, Signer: objectRangeSigner,
+	DedupProtectionKey: protectionKey,
+})
+```
+
+Filesystem writes use exact-length temporary files, file sync, non-replacing
+hard-link publication, and directory durability barriers. SQLite uses WAL,
+`synchronous=FULL`, immediate write transactions, and one atomic
+`PublishShard` transaction. Both constructors reject symlinked leaf paths and
+return `ErrDurabilityUnsupported` without modifying their target on platforms
+where strict directory durability is not implemented. Cross-store staging and
+garbage collection are not yet implemented: a failed SQL publication can leave
+an unreachable immutable blob, but cannot expose a partial logical file.
 
 Embedders can stream reconstructed content without interpreting protocol JSON
 or making an internal HTTP request:

@@ -75,6 +75,10 @@ func TestRun(t *testing.T) {
 	if len(data) != 128 || !bytes.HasPrefix(data, []byte("xet-go deterministic")) {
 		t.Fatalf("unexpected fixture: size=%d prefix=%q", len(data), data[:min(len(data), 20)])
 	}
+	previousArgs := os.Args
+	t.Cleanup(func() { os.Args = previousArgs })
+	os.Args = []string{"perf-fixture", "-size", "1", "-pattern", "zero", "-output", filepath.Join(t.TempDir(), "main.bin")}
+	main()
 }
 
 func TestRunRejectsInvalidInputs(t *testing.T) {
