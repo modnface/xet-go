@@ -173,23 +173,29 @@ func (s *SQLiteIndexStore) initialize(ctx context.Context) error {
 
 func configureSQLiteWAL(ctx context.Context, db *sql.DB) (string, error) {
 	const retryWindow = 5 * time.Second
+	return retrySQLiteBusy(ctx, retryWindow, func() (string, error) {
+		var journalMode string
+		err := db.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&journalMode)
+		return journalMode, err
+	})
+}
+
+func retrySQLiteBusy(
+	ctx context.Context,
+	retryWindow time.Duration,
+	operation func() (string, error),
+) (string, error) {
 	deadline := time.Now().Add(retryWindow)
 	delay := time.Millisecond
 	for {
-		var journalMode string
-		err := db.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&journalMode)
+		value, err := operation()
 		if err == nil || !isSQLiteBusy(err) || time.Now().Add(delay).After(deadline) {
-			return journalMode, err
+			return value, err
 		}
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+			timer.Stop()
 			return "", ctx.Err()
 		case <-timer.C:
 		}

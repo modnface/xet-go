@@ -34,6 +34,11 @@ type cancelAfterCheckContext struct {
 	after  int
 }
 
+type sqliteCodeTestError struct{ code int }
+
+func (e sqliteCodeTestError) Error() string { return fmt.Sprintf("SQLite test error %d", e.code) }
+func (e sqliteCodeTestError) Code() int     { return e.code }
+
 func (c *cancelAfterCheckContext) Err() error {
 	c.checks++
 	if c.checks >= c.after {
@@ -1578,6 +1583,16 @@ func runProtectionExpiryStoreContract(t *testing.T, store protectionExpiryTestSt
 		if _, err := store.ListExpiredFileLeases(ctx, invalidCutoff, PageRequest{}); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("%s expiry cutoff = %v", name, err)
 		}
+		if _, err := store.DeleteExpiredBlobStage(
+			ctx, "alpha", testProtectionID(9), invalidCutoff,
+		); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s stage deletion cutoff = %v", name, err)
+		}
+		if _, err := store.DeleteExpiredFileLease(
+			ctx, "alpha", testProtectionID(9), invalidCutoff,
+		); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s lease deletion cutoff = %v", name, err)
+		}
 	}
 
 	if deleted, err := store.DeleteExpiredBlobStage(ctx, "missing", testProtectionID(500), cutoff); err != nil || deleted {
@@ -1870,6 +1885,49 @@ func TestSQLiteProtectionExpiryQueryPlans(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRetrySQLiteBusy(t *testing.T) {
+	ctx := context.Background()
+	busy := sqliteCodeTestError{code: 5 | 1<<8}
+	attempts := 0
+	value, err := retrySQLiteBusy(ctx, time.Second, func() (string, error) {
+		attempts++
+		if attempts < 3 {
+			return "", busy
+		}
+		return "wal", nil
+	})
+	if err != nil || value != "wal" || attempts != 3 {
+		t.Fatalf("transient SQLite busy retry = %q, %v after %d attempts", value, err, attempts)
+	}
+
+	sentinel := errors.New("not busy")
+	attempts = 0
+	if _, err := retrySQLiteBusy(ctx, time.Second, func() (string, error) {
+		attempts++
+		return "", sentinel
+	}); !errors.Is(err, sentinel) || attempts != 1 {
+		t.Fatalf("non-busy SQLite error = %v after %d attempts", err, attempts)
+	}
+
+	attempts = 0
+	if _, err := retrySQLiteBusy(ctx, 0, func() (string, error) {
+		attempts++
+		return "", busy
+	}); !errors.Is(err, busy) || attempts != 1 {
+		t.Fatalf("expired SQLite retry window = %v after %d attempts", err, attempts)
+	}
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	attempts = 0
+	if _, err := retrySQLiteBusy(canceled, time.Second, func() (string, error) {
+		attempts++
+		return "", busy
+	}); !errors.Is(err, context.Canceled) || attempts != 1 {
+		t.Fatalf("canceled SQLite retry = %v after %d attempts", err, attempts)
 	}
 }
 
