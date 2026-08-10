@@ -128,6 +128,12 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
 - memory and SQLite conditionally delete expired stage/lease metadata in the
   same atomic comparison as deletion, so a stale scan cannot remove a renewed
   protection; this never deletes payloads or authorizes physical collection;
+- the CAS service can reconcile expired stages after restart without tenant
+  credentials or new blob writes: canonical complete Xorbs and full shards are
+  exactly revalidated, shard registration is recomputed from durable Xorb
+  metadata, logical indexes are replayed idempotently, and only then is the
+  original stage conditionally removed; missing, corrupt, blocked, conflicting,
+  and backend-failed stages remain protected;
 - filesystem pages seek the hash-prefix tree without collecting the whole
   store (one four-hex-character leaf remains the minimum sorted work unit); and
 - the same backend contract suite runs against memory/filesystem and
@@ -143,9 +149,9 @@ process running as the service identity is outside its threat model.
 
 Remaining production storage boundaries are:
 
-1. publication recovery, expired-stage classification, and grace-based cleanup
-   built on the bounded expiry scans (expiration or protection deletion alone
-   never authorizes object deletion);
+1. operator policy and grace-based cleanup for missing, corrupt, or persistently
+   blocked recovery stages (expiration or protection deletion alone never
+   authorizes object deletion);
 2. catalog reachability roots and read/maintenance epochs for destructive work;
 3. audit, repair, resumable mark-and-sweep, and guarded garbage collection built
    on the current blob/index/protection iteration plus those root primitives;

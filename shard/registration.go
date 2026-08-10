@@ -44,6 +44,12 @@ var (
 	// ErrXorbLookup marks a backing-index failure while resolving a referenced
 	// xorb, as distinct from invalid or missing client metadata.
 	ErrXorbLookup = errors.New("shard: xorb lookup failed")
+	// ErrXorbNotFound identifies a shard whose durable xorb dependency has not
+	// been published yet.
+	ErrXorbNotFound = errors.New("shard: referenced xorb not found")
+	// ErrXorbConflict identifies metadata that disagrees with the durable xorb
+	// registered under the same identity.
+	ErrXorbConflict = errors.New("shard: xorb metadata conflict")
 )
 
 // ValidateRegistration verifies an upload shard against already-ingested xorb
@@ -129,7 +135,7 @@ func ValidateRegistrationContext(
 			return Xorb{}, fmt.Errorf("%w: resolve %s: %w", ErrXorbLookup, hash, err)
 		}
 		if !found {
-			return Xorb{}, fmt.Errorf("shard: referenced xorb %s not found", hash)
+			return Xorb{}, fmt.Errorf("%w: %s", ErrXorbNotFound, hash)
 		}
 		if err := validateContext(ctx, &Shard{Xorbs: []Xorb{value}}, true); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -138,7 +144,7 @@ func ValidateRegistrationContext(
 			return Xorb{}, fmt.Errorf("%w: stored xorb %s is invalid: %v", ErrXorbLookup, hash, err)
 		}
 		if value.Hash != hash {
-			return Xorb{}, fmt.Errorf("%w: xorb lookup returned %s for %s", ErrXorbLookup, value.Hash, hash)
+			return Xorb{}, fmt.Errorf("%w: %w: lookup returned %s for %s", ErrXorbLookup, ErrXorbConflict, value.Hash, hash)
 		}
 		resolved[hash] = value
 		return value, nil
@@ -157,7 +163,7 @@ func ValidateRegistrationContext(
 			return nil, err
 		}
 		if !sameXorbMetadata(claimed, stored) {
-			return nil, fmt.Errorf("shard: xorb %d metadata conflicts with stored xorb %s", i, claimed.Hash)
+			return nil, fmt.Errorf("%w: shard xorb %d disagrees with stored xorb %s", ErrXorbConflict, i, claimed.Hash)
 		}
 		canonical := stored
 		canonical.Chunks = append([]XorbChunk(nil), stored.Chunks...)

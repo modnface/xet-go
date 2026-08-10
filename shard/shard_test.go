@@ -402,8 +402,8 @@ func TestValidateRegistrationRejectsInvalidExternalRecipesAndStoredXorbs(t *test
 	external.Xorbs = nil
 	if _, err := ValidateRegistration(external, func(xethash.Hash) (Xorb, bool, error) {
 		return Xorb{}, false, nil
-	}); err == nil {
-		t.Fatal("missing external xorb succeeded")
+	}); !errors.Is(err, ErrXorbNotFound) {
+		t.Fatalf("missing external xorb error = %v", err)
 	}
 
 	eligible := sampleShard(t)

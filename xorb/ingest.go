@@ -7,9 +7,14 @@ import (
 	"github.com/jmwoliver/xet-go/xethash"
 )
 
-// MaxNetworkSize is the largest canonical footerless xorb emitted by the
-// protocol encoder: the maximum raw payload plus one header per chunk.
-const MaxNetworkSize = MaxRawSize + MaxChunks*HeaderSize
+const (
+	// MaxNetworkSize is the largest canonical footerless xorb emitted by the
+	// protocol encoder: the maximum raw payload plus one header per chunk.
+	MaxNetworkSize = MaxRawSize + MaxChunks*HeaderSize
+	// MaxCompleteSize adds the largest canonical V1 metadata footer to a
+	// MaxNetworkSize content section.
+	MaxCompleteSize = MaxNetworkSize + footerV1BaseSize + 40*MaxChunks + 4
+)
 
 // IngestedChunk is the storage metadata derived from one validated network
 // xorb chunk. Serialized ranges address the footerless/complete xorb content

@@ -434,14 +434,7 @@ func (s *Service) publishShard(ctx context.Context, grant Grant, data []byte) (S
 }
 
 func (s *Service) registerShard(ctx context.Context, value shard.Shard) (*shard.Registration, error) {
-	registration, err := shard.ValidateRegistrationContext(ctx, value, func(hash xethash.Hash) (shard.Xorb, bool, error) {
-		record, found, err := s.index.GetXorb(ctx, hash)
-		if err != nil || !found {
-			return shard.Xorb{}, found, err
-		}
-		value, err := shard.XorbFromIngested(&record.Layout)
-		return value, err == nil, err
-	}, s.registration)
+	registration, err := s.validateShardRegistration(ctx, value)
 	if err != nil {
 		if errors.Is(err, shard.ErrRegistrationLimit) {
 			return nil, fmt.Errorf("%w: %v", ErrTooLarge, err)
@@ -455,6 +448,17 @@ func (s *Service) registerShard(ctx context.Context, value shard.Shard) (*shard.
 		return nil, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
 	return registration, nil
+}
+
+func (s *Service) validateShardRegistration(ctx context.Context, value shard.Shard) (*shard.Registration, error) {
+	return shard.ValidateRegistrationContext(ctx, value, func(hash xethash.Hash) (shard.Xorb, bool, error) {
+		record, found, err := s.index.GetXorb(ctx, hash)
+		if err != nil || !found {
+			return shard.Xorb{}, found, err
+		}
+		value, err := shard.XorbFromIngested(&record.Layout)
+		return value, err == nil, err
+	}, s.registration)
 }
 
 func makeShardPublication(

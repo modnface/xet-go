@@ -19,14 +19,15 @@ import (
 )
 
 var (
-	ErrNotFound              = errors.New("xet CAS server: not found")
-	ErrUnauthorized          = errors.New("xet CAS server: unauthorized")
-	ErrForbidden             = errors.New("xet CAS server: forbidden")
-	ErrConflict              = errors.New("xet CAS server: immutable value conflict")
-	ErrTooLarge              = errors.New("xet CAS server: request body too large")
-	ErrInvalid               = errors.New("xet CAS server: invalid request")
-	ErrCorrupt               = errors.New("xet CAS server: corrupt content")
-	ErrDurabilityUnsupported = errors.New("xet CAS server: strict filesystem durability is unsupported")
+	ErrNotFound                    = errors.New("xet CAS server: not found")
+	ErrUnauthorized                = errors.New("xet CAS server: unauthorized")
+	ErrForbidden                   = errors.New("xet CAS server: forbidden")
+	ErrConflict                    = errors.New("xet CAS server: immutable value conflict")
+	ErrTooLarge                    = errors.New("xet CAS server: request body too large")
+	ErrInvalid                     = errors.New("xet CAS server: invalid request")
+	ErrCorrupt                     = errors.New("xet CAS server: corrupt content")
+	ErrDurabilityUnsupported       = errors.New("xet CAS server: strict filesystem durability is unsupported")
+	ErrProtectionExpiryUnsupported = errors.New("xet CAS server: protection expiry operations are unsupported")
 )
 
 type BlobKind string
@@ -164,6 +165,48 @@ type BlobStage struct {
 
 type BlobStagePage struct {
 	Items      []BlobStage
+	NextCursor string
+}
+
+// BlobStageRecoveryStatus is the durable disposition of one expired stage
+// inspection. Only published-removed releases protection metadata. A
+// published-not-removed result indicates a harmless renewal or duplicate-worker
+// race; all other non-published results leave the original stage intact.
+type BlobStageRecoveryStatus string
+
+const (
+	BlobStageRecoveryMissing               BlobStageRecoveryStatus = "missing"
+	BlobStageRecoveryCorrupt               BlobStageRecoveryStatus = "corrupt"
+	BlobStageRecoveryBlocked               BlobStageRecoveryStatus = "blocked"
+	BlobStageRecoveryConflict              BlobStageRecoveryStatus = "conflict"
+	BlobStageRecoveryFailed                BlobStageRecoveryStatus = "failed"
+	BlobStageRecoveryPublishedRemoved      BlobStageRecoveryStatus = "published-removed"
+	BlobStageRecoveryPublishedNotRemoved   BlobStageRecoveryStatus = "published-not-removed"
+	BlobStageRecoveryPublishedDeleteFailed BlobStageRecoveryStatus = "published-delete-failed"
+)
+
+type BlobStageRecoveryPhase string
+
+const (
+	BlobStageRecoveryHead     BlobStageRecoveryPhase = "head"
+	BlobStageRecoveryRead     BlobStageRecoveryPhase = "read"
+	BlobStageRecoveryValidate BlobStageRecoveryPhase = "validate"
+	BlobStageRecoveryResolve  BlobStageRecoveryPhase = "resolve-xorbs"
+	BlobStageRecoveryPublish  BlobStageRecoveryPhase = "publish"
+	BlobStageRecoveryDelete   BlobStageRecoveryPhase = "delete-stage"
+)
+
+type BlobStageRecoveryResult struct {
+	Stage  BlobStage
+	Status BlobStageRecoveryStatus
+	Phase  BlobStageRecoveryPhase
+	// Err is nil for missing and successful outcomes. Callers can use errors.Is
+	// with ErrCorrupt, ErrConflict, context cancellation, and backend errors.
+	Err error
+}
+
+type BlobStageRecoveryPage struct {
+	Items      []BlobStageRecoveryResult
 	NextCursor string
 }
 

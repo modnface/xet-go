@@ -226,6 +226,18 @@ payloads: an expired or removed stage must not be treated as permission to
 delete bytes without the documented classification, age/grace, and reachability
 checks.
 
+`Service.RecoverExpiredBlobStages` is the restart-safe publication reconciler.
+It reads one expiry page at a stable cutoff, exactly and boundedly reads each
+present object, requires the canonical complete Xorb or full-shard encoding,
+reruns shard registration against durable Xorb metadata, and idempotently
+replays the same logical index publication used by uploads. Only successful
+publication is followed by cutoff-bound conditional stage deletion. Missing,
+corrupt, dependency-blocked, conflicting, and backend-failed stages remain for
+a later pass or operator decision. Recovery is administrative: it does not call
+the tenant authorizer, create replacement stages, write blobs, or delete blob
+payloads. A canceled partial page has no continuation cursor and is safe to
+retry from the original request.
+
 Stores may additionally implement `BlobLister`, `IndexLister`,
 `ProtectionStore`, and `ProtectionExpiryStore` for bounded, keyset-paginated
 operational scans and lifecycle roots. Memory and SQLite implement expiry scans

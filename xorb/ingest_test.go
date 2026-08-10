@@ -43,6 +43,10 @@ func TestIngestNetworkCanonicalizesAndDescribesXorb(t *testing.T) {
 	if !bytes.Equal(ingested.Complete[:ingested.NetworkBytes], object.Body) {
 		t.Fatal("complete object changed the uploaded content section")
 	}
+	if len(ingested.Complete) > MaxCompleteSize ||
+		MaxCompleteSize != MaxNetworkSize+footerV1BaseSize+40*MaxChunks+4 {
+		t.Fatalf("complete size/bound = %d/%d", len(ingested.Complete), MaxCompleteSize)
+	}
 }
 
 func TestIngestNetworkRejectsWrongIdentityAndNonNetworkForms(t *testing.T) {
