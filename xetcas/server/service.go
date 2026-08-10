@@ -395,25 +395,9 @@ func (s *Service) publishShard(ctx context.Context, grant Grant, data []byte) (S
 	if upload.Footer != nil {
 		return ShardResult{}, fmt.Errorf("%w: shard upload must be footerless", ErrInvalid)
 	}
-	registration, err := shard.ValidateRegistrationContext(ctx, *upload, func(hash xethash.Hash) (shard.Xorb, bool, error) {
-		record, found, err := s.index.GetXorb(ctx, hash)
-		if err != nil || !found {
-			return shard.Xorb{}, found, err
-		}
-		value, err := shard.XorbFromIngested(&record.Layout)
-		return value, err == nil, err
-	}, s.registration)
+	registration, err := s.registerShard(ctx, *upload)
 	if err != nil {
-		if errors.Is(err, shard.ErrRegistrationLimit) {
-			return ShardResult{}, fmt.Errorf("%w: %v", ErrTooLarge, err)
-		}
-		if errors.Is(err, shard.ErrXorbLookup) {
-			return ShardResult{}, err
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return ShardResult{}, err
-		}
-		return ShardResult{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+		return ShardResult{}, err
 	}
 	canonical := shard.Shard{Files: make([]shard.File, len(registration.Files)), Xorbs: registration.Xorbs}
 	for i := range registration.Files {
@@ -434,8 +418,52 @@ func (s *Service) publishShard(ctx context.Context, grant Grant, data []byte) (S
 	if err != nil {
 		return ShardResult{}, errors.Join(err, s.releaseBlobStage(stage, false))
 	}
+	if err := s.index.PublishShard(
+		publicationContext, makeShardPublication(grant.Namespace, shardKey, registration),
+	); err != nil {
+		publicationError := fmt.Errorf("xet CAS server: publish shard indexes: %w", err)
+		return ShardResult{}, errors.Join(publicationError, s.releaseBlobStage(stage, false))
+	}
+	if err := s.releaseBlobStage(stage, true); err != nil {
+		return ShardResult{}, err
+	}
+	return ShardResult{
+		Shard: shardKey, Inserted: inserted, Files: len(registration.Files),
+		GlobalDedupChunks: len(registration.GlobalDedupChunks),
+	}, nil
+}
+
+func (s *Service) registerShard(ctx context.Context, value shard.Shard) (*shard.Registration, error) {
+	registration, err := shard.ValidateRegistrationContext(ctx, value, func(hash xethash.Hash) (shard.Xorb, bool, error) {
+		record, found, err := s.index.GetXorb(ctx, hash)
+		if err != nil || !found {
+			return shard.Xorb{}, found, err
+		}
+		value, err := shard.XorbFromIngested(&record.Layout)
+		return value, err == nil, err
+	}, s.registration)
+	if err != nil {
+		if errors.Is(err, shard.ErrRegistrationLimit) {
+			return nil, fmt.Errorf("%w: %v", ErrTooLarge, err)
+		}
+		if errors.Is(err, shard.ErrXorbLookup) {
+			return nil, err
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	return registration, nil
+}
+
+func makeShardPublication(
+	namespace string,
+	shardKey BlobKey,
+	registration *shard.Registration,
+) ShardPublication {
 	publication := ShardPublication{
-		Namespace: grant.Namespace,
+		Namespace: namespace,
 		Dedup:     make([]DedupAssociation, 0, len(registration.GlobalDedupChunks)),
 		SHA256:    make([]SHA256Association, 0, len(registration.Files)),
 		Files:     make([]FileRecord, 0, len(registration.Files)),
@@ -451,17 +479,7 @@ func (s *Service) publishShard(ctx context.Context, grant Grant, data []byte) (S
 		}
 		publication.Files = append(publication.Files, FileRecord{File: file, Shard: shardKey})
 	}
-	if err := s.index.PublishShard(publicationContext, publication); err != nil {
-		publicationError := fmt.Errorf("xet CAS server: publish shard indexes: %w", err)
-		return ShardResult{}, errors.Join(publicationError, s.releaseBlobStage(stage, false))
-	}
-	if err := s.releaseBlobStage(stage, true); err != nil {
-		return ShardResult{}, err
-	}
-	return ShardResult{
-		Shard: shardKey, Inserted: inserted, Files: len(registration.Files),
-		GlobalDedupChunks: len(registration.GlobalDedupChunks),
-	}, nil
+	return publication
 }
 
 func readBounded(body io.Reader, declared, limit int64) ([]byte, error) {
