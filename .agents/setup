@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly GO_VERSION="1.25.12"
+readonly RUST_TOOLCHAIN="1.95.0"
+readonly GOLANGCI_LINT_VERSION="v2.12.2"
+readonly GO_ROOT="$HOME/.local/share/go/$GO_VERSION"
+
+install_system_packages() {
+	local packages=(ca-certificates curl git build-essential jq)
+	local missing=()
+	local package
+	for package in "${packages[@]}"; do
+		if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -Fq 'install ok installed'; then
+			missing+=("$package")
+		fi
+	done
+	if ((${#missing[@]})); then
+		sudo apt-get update
+		sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+	fi
+}
+
+install_go() {
+	if [[ -x "$GO_ROOT/bin/go" ]] && [[ "$($GO_ROOT/bin/go version)" == "go version go${GO_VERSION} "* ]]; then
+		return
+	fi
+	local go_arch
+	case "$(uname -m)" in
+		x86_64) go_arch="amd64" ;;
+		aarch64|arm64) go_arch="arm64" ;;
+		*) echo "unsupported Go architecture: $(uname -m)" >&2; return 1 ;;
+	esac
+	local archive="go${GO_VERSION}.linux-${go_arch}.tar.gz"
+	local temporary
+	temporary="$(mktemp -d)"
+	trap 'rm -rf "$temporary"' RETURN
+	curl --fail --location --retry 3 --silent --show-error \
+		"https://go.dev/dl/?mode=json&include=all" -o "$temporary/releases.json"
+	local expected
+	expected="$(jq -er --arg name "$archive" '.[] | .files[] | select(.filename == $name) | .sha256' "$temporary/releases.json")"
+	curl --fail --location --retry 3 --silent --show-error \
+		"https://go.dev/dl/$archive" -o "$temporary/$archive"
+	echo "$expected  $temporary/$archive" | sha256sum --check --status
+	mkdir -p "$(dirname "$GO_ROOT")"
+	rm -rf "$GO_ROOT.tmp"
+	mkdir "$GO_ROOT.tmp"
+	tar -xzf "$temporary/$archive" --strip-components=1 -C "$GO_ROOT.tmp"
+	rm -rf "$GO_ROOT"
+	mv "$GO_ROOT.tmp" "$GO_ROOT"
+	trap - RETURN
+	rm -rf "$temporary"
+}
+
+persist_path() {
+	local marker="# xet-go orb toolchains"
+	if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+		cat >> "$HOME/.bash_profile" <<'EOF'
+
+# xet-go orb toolchains
+export PATH="$HOME/.local/share/go/1.25.12/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+EOF
+	fi
+	export PATH="$GO_ROOT/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+}
+
+install_rust() {
+	if ! command -v rustup >/dev/null 2>&1; then
+		curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+			https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+		export PATH="$HOME/.cargo/bin:$PATH"
+	fi
+	if ! rustup toolchain list | grep -Eq "^${RUST_TOOLCHAIN}(-|[[:space:]])"; then
+		rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+	fi
+}
+
+install_golangci_lint() {
+	if command -v golangci-lint >/dev/null 2>&1 && \
+		golangci-lint version 2>/dev/null | grep -Fq "${GOLANGCI_LINT_VERSION#v}"; then
+		return
+	fi
+	GOBIN="$HOME/.local/bin" "$GO_ROOT/bin/go" install \
+		github.com/golangci/golangci-lint/v2/cmd/golangci-lint@"$GOLANGCI_LINT_VERSION"
+}
+
+echo "xet-go orb setup: system packages"
+install_system_packages
+echo "xet-go orb setup: Go $GO_VERSION"
+install_go
+persist_path
+echo "xet-go orb setup: Rust $RUST_TOOLCHAIN"
+install_rust
+echo "xet-go orb setup: golangci-lint $GOLANGCI_LINT_VERSION"
+install_golangci_lint
+echo "xet-go orb setup: complete"
