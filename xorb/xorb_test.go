@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"math/rand"
 	"strings"
 	"testing"
@@ -54,6 +55,44 @@ func TestSchemesRoundTrip(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestReadChunkStreamsOneOwnedChunkAtATime(t *testing.T) {
+	inputs := [][]byte{
+		bytes.Repeat([]byte("first stream chunk"), 1_000),
+		bytes.Repeat([]byte("second stream chunk"), 2_000),
+	}
+	object, err := Encode(inputs, LZ4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bytes.NewReader(object.Body)
+	for i, want := range inputs {
+		chunk, err := ReadChunk(reader)
+		if err != nil {
+			t.Fatalf("chunk %d: %v", i, err)
+		}
+		if !bytes.Equal(chunk.Data, want) || chunk.Hash != xethash.Chunk(want) ||
+			chunk.SerializedLength != object.Chunks[i].SerializedLength || chunk.UncompressedLength != uint32(len(want)) {
+			t.Fatalf("chunk %d = %#v", i, chunk)
+		}
+		want[0] ^= 0xff
+		if bytes.Equal(chunk.Data, want) {
+			t.Fatalf("chunk %d retained caller input", i)
+		}
+	}
+	if _, err := ReadChunk(reader); !errors.Is(err, io.EOF) {
+		t.Fatalf("read beyond stream = %v", err)
+	}
+	if _, err := ReadChunk(nil); err == nil {
+		t.Fatal("nil chunk reader succeeded")
+	}
+	if _, err := ReadChunk(bytes.NewReader(object.Body[:HeaderSize+1])); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated chunk = %v", err)
+	}
+	if _, err := ReadChunk(bytes.NewReader(make([]byte, HeaderSize))); err == nil {
+		t.Fatal("zero-length chunk header succeeded")
 	}
 }
 

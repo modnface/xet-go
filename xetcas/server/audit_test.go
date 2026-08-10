@@ -33,6 +33,19 @@ type controlledReadCloser struct {
 
 func (r controlledReadCloser) Close() error { return r.closeErr }
 
+type terminalErrorReader struct {
+	io.Reader
+	err error
+}
+
+func (r terminalErrorReader) Read(data []byte) (int, error) {
+	n, err := r.Reader.Read(data)
+	if errors.Is(err, io.EOF) {
+		return n, r.err
+	}
+	return n, err
+}
+
 type faultBlobStore struct {
 	BlobStore
 	putErr error
@@ -186,21 +199,21 @@ func TestMemoryStoreBlobContractsAndClonesIndexes(t *testing.T) {
 	fileRecord := FileRecord{File: shard.RegisteredFile{File: shard.File{
 		Hash: fileHash, SHA256: &sum, Terms: []shard.Term{{XorbHash: key.Hash, Start: 0, End: 1}},
 	}, Size: 5}}
-	if err := store.PutFile(ctx, fileRecord); err != nil {
+	if err := store.PutFile(ctx, "scope", fileRecord); err != nil {
 		t.Fatal(err)
 	}
 	fileRecord.File.File.Terms[0].End = 2
 	*fileRecord.File.File.SHA256 = [32]byte{9}
-	gotFile, found, err := store.GetFile(ctx, fileHash)
+	gotFile, found, err := store.GetFile(ctx, "scope", fileHash)
 	if err != nil || !found || gotFile.File.File.Terms[0].End != 1 || *gotFile.File.File.SHA256 != ([32]byte{7}) {
 		t.Fatalf("cloned file = %#v, %v, %v", gotFile, found, err)
 	}
 	conflictingFile := gotFile
 	conflictingFile.File.Size++
-	if err := store.PutFile(ctx, conflictingFile); err != nil {
+	if err := store.PutFile(ctx, "scope", conflictingFile); err != nil {
 		t.Fatalf("alternative file record = %v", err)
 	}
-	retained, found, err := store.GetFile(ctx, fileHash)
+	retained, found, err := store.GetFile(ctx, "scope", fileHash)
 	if err != nil || !found || !reflect.DeepEqual(retained, gotFile) {
 		t.Fatalf("retained file = %#v, %v, %v; want %#v", retained, found, err, gotFile)
 	}
@@ -464,7 +477,7 @@ func TestGlobalDedupRejectsBrokenDurableStateAndClock(t *testing.T) {
 	if _, err := service.UploadShard(ctx, "", bytes.NewReader(uploadBody), int64(len(uploadBody))); err != nil {
 		t.Fatal(err)
 	}
-	dedup, found, err := store.GetDedup(ctx, none.Chunks[0].Hash)
+	dedup, found, err := store.GetDedup(ctx, "tenant-a", none.Chunks[0].Hash)
 	if err != nil || !found {
 		t.Fatalf("dedup record = %#v, %v, %v", dedup, found, err)
 	}

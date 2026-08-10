@@ -7,7 +7,7 @@
 **Primary consumer:** Miniface
 
 **Status:** implementation charter and acceptance plan
-**Last reviewed:** 2026-08-09
+**Last reviewed:** 2026-08-10
 
 ## 1. Assignment
 
@@ -152,7 +152,12 @@ An implementation agent must verify this list against the worktree rather than r
 - in-memory CAS stores and HTTP tests;
 - official fixture and Rust differential harnesses;
 - Go-client-to-official-Rust-server tests; and
-- official-Rust-client-to-Go-server tests.
+- official-Rust-client-to-Go-server tests;
+- namespace-scoped file, dedup, and SHA reachability over globally deduplicated
+  physical Xorbs; and
+- typed full/range reconstruction streaming through `Service.OpenFile`, sharing
+  the wire planner and enforcing backpressure, cancellation, closure, lengths,
+  chunk hashes, and optional whole-file SHA-256.
 
 ### Important current interfaces
 
@@ -167,18 +172,17 @@ Preserve this separation unless a concrete correctness issue requires a change.
 
 ### Known areas requiring stabilization
 
-Before expanding the surface area, review the current uncommitted CAS work for:
+The namespace-safe read model and typed reconstruction stream were completed
+and revalidated in both official Rust interoperability directions on
+2026-08-10. Remaining CAS stabilization work is:
 
 - atomic publication order and failure recovery;
-- namespace scoping of every file, SHA, dedup, and read lookup;
 - durable persistence of global-dedup protection records;
 - bounded memory use during Xorb and shard validation;
 - safe handling of duplicate/non-unique file and dedup index rows;
 - consistent protocol error taxonomy and HTTP mappings;
-- cancellation propagation and stream closure;
 - malformed range and integer-overflow handling;
 - exact behavior of legacy storage prefixes;
-- typed full-file streaming, not only reconstruction descriptors;
 - iteration primitives needed by audit and garbage collection; and
 - migration from in-memory semantics to transactional SQL semantics.
 
@@ -515,13 +519,19 @@ The CAS layer is the foundation. Stabilize it before adding broad compatibility 
 
 ### P0: namespace-safe read model
 
-The current SHA association is scoped, while some file identity lookups may be globally addressed. Decide and encode how an authorized repository maps to a CAS storage namespace. Every externally reachable file read must pass through this scope.
+**Completed for the memory/reference implementation.** `Grant.Namespace` now
+scopes file recipes, dedup records, and SHA associations. Xorb metadata and
+bytes remain global content-addressed objects. Every file and dedup read first
+resolves a scoped logical record; publishing a validated shard establishes its
+grant namespace's own transitive links to global Xorbs.
 
 Content may be physically deduplicated globally, but authorization and reachability are logical and scoped.
 
 ### P0: typed reconstruction stream
 
-Add an internal/public service operation that opens an arbitrary byte range of a file by Xet file identity without requiring a caller to interpret reconstruction JSON. It should:
+**Completed for Xet-backed CAS files.** `Service.OpenFile` opens an arbitrary
+byte range by Xet file identity without requiring a caller to interpret
+reconstruction JSON. It:
 
 - validate requested bounds;
 - plan spans without loading the entire file;
@@ -532,7 +542,9 @@ Add an internal/public service operation that opens an arbitrary byte range of a
 - close all underlying readers; and
 - expose deterministic errors for missing/corrupt Xorbs or shards.
 
-The HTTP CAS reconstruction routes and model-file `GET` should share the same planner and validation logic.
+The HTTP CAS reconstruction routes and typed stream share the same planner.
+The future model-file `GET` must delegate to this typed stream rather than
+reimplement reconstruction.
 
 ### P0: durable indexes
 

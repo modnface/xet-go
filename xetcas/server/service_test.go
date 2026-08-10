@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -75,7 +76,7 @@ func uploadFixture(t testing.TB) (*xorb.Object, *xorb.Object, shard.Shard, []byt
 		nodes[i] = xethash.Node{Hash: hashes[i], Size: uint64(len(chunk))}
 		contents = append(contents, chunk...)
 	}
-	sum := [32]byte{1, 2, 3, 4}
+	sum := sha256.Sum256(contents)
 	value := shard.Shard{
 		Files: []shard.File{{
 			Hash: xethash.File(nodes),
@@ -92,6 +93,14 @@ func uploadFixture(t testing.TB) (*xorb.Object, *xorb.Object, shard.Shard, []byt
 		t.Fatal(err)
 	}
 	return none, compressed, value, body
+}
+
+func objectContents(object *xorb.Object) []byte {
+	var result []byte
+	for _, chunk := range object.Chunks {
+		result = append(result, chunk.Data...)
+	}
+	return result
 }
 
 func TestServiceUploadPublicationAndReadPlanning(t *testing.T) {
@@ -176,6 +185,390 @@ func TestServiceUploadPublicationAndReadPlanning(t *testing.T) {
 	}
 }
 
+func TestServiceOpenFileStreamsFullAndRange(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	service := testService(t, store, nil)
+	none, _, value, shardBody := uploadFixture(t)
+	if _, err := service.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UploadShard(ctx, "", bytes.NewReader(shardBody), int64(len(shardBody))); err != nil {
+		t.Fatal(err)
+	}
+	want := objectContents(none)
+	fileHash := value.Files[0].Hash
+
+	opened, err := service.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, readErr := io.ReadAll(opened.Body)
+	closeErr := opened.Body.Close()
+	if readErr != nil || closeErr != nil || !bytes.Equal(got, want) {
+		t.Fatalf("whole stream = %d bytes, read %v, close %v", len(got), readErr, closeErr)
+	}
+	if opened.Hash != fileHash || opened.FileSize != uint64(len(want)) || opened.Size != uint64(len(want)) ||
+		opened.Range != (xetcas.FileRange{Start: 0, End: uint64(len(want))}) || opened.SHA256 == nil ||
+		*opened.SHA256 != sha256.Sum256(want) {
+		t.Fatalf("whole stream metadata = %#v", opened)
+	}
+
+	wanted := xetcas.FileRange{Start: 17, End: uint64(len(want)) + 10_000}
+	opened, err = service.OpenFile(ctx, "", fileHash, &wanted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, readErr = io.ReadAll(opened.Body)
+	closeErr = opened.Body.Close()
+	if readErr != nil || closeErr != nil || !bytes.Equal(got, want[wanted.Start:]) {
+		t.Fatalf("range stream = %d bytes, read %v, close %v", len(got), readErr, closeErr)
+	}
+	if opened.Range != (xetcas.FileRange{Start: wanted.Start, End: uint64(len(want))}) ||
+		opened.Size != uint64(len(want))-wanted.Start {
+		t.Fatalf("range metadata = %#v", opened)
+	}
+
+	// An explicit range that covers the complete file receives the same SHA
+	// verification guarantee as a nil whole-file range.
+	explicitFull := xetcas.FileRange{Start: 0, End: uint64(len(want)) + 1}
+	opened, err = service.OpenFile(ctx, "", fileHash, &explicitFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, readErr = io.ReadAll(opened.Body)
+	_ = opened.Body.Close()
+	if readErr != nil || !bytes.Equal(got, want) {
+		t.Fatalf("explicit whole stream = %d bytes, %v", len(got), readErr)
+	}
+	store.mu.Lock()
+	key := scopedHash{namespace: "tenant-a", hash: fileHash}
+	record := store.files[key]
+	record.File.File.SHA256 = &[32]byte{1}
+	store.files[key] = record
+	store.mu.Unlock()
+	opened, err = service.OpenFile(ctx, "", fileHash, &explicitFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(opened.Body); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("explicit whole SHA mismatch = %v", err)
+	}
+	_ = opened.Body.Close()
+	partial := xetcas.FileRange{Start: 1, End: 2}
+	opened, err = service.OpenFile(ctx, "", fileHash, &partial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := io.ReadAll(opened.Body); err != nil || !bytes.Equal(got, want[1:2]) {
+		t.Fatalf("partial stream with untrusted whole-file SHA = %x, %v", got, err)
+	}
+	_ = opened.Body.Close()
+	afterFirstChunk := xetcas.FileRange{Start: uint64(len(none.Chunks[0].Data)) + 1, End: uint64(len(want))}
+	opened, err = service.OpenFile(ctx, "", fileHash, &afterFirstChunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := io.ReadAll(opened.Body); err != nil || !bytes.Equal(got, want[afterFirstChunk.Start:]) {
+		t.Fatalf("whole-chunk cropped stream = %d bytes, %v", len(got), err)
+	}
+	_ = opened.Body.Close()
+
+	invalid := xetcas.FileRange{Start: uint64(len(want)), End: uint64(len(want)) + 1}
+	if _, err := service.OpenFile(ctx, "", fileHash, &invalid); !errors.Is(err, xetcas.ErrRangeNotSatisfiable) {
+		t.Fatalf("range at EOF = %v", err)
+	}
+	if _, err := service.OpenFile(nil, "", fileHash, nil); err == nil { //nolint:staticcheck // Verify nil-context rejection.
+		t.Fatal("nil-context open succeeded")
+	}
+}
+
+func TestServiceOpenFileCancellationAndCorruption(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	service := testService(t, store, nil)
+	none, _, value, shardBody := uploadFixture(t)
+	if _, err := service.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UploadShard(ctx, "", bytes.NewReader(shardBody), int64(len(shardBody))); err != nil {
+		t.Fatal(err)
+	}
+	fileHash := value.Files[0].Hash
+
+	canceled, cancel := context.WithCancel(ctx)
+	opened, err := service.OpenFile(canceled, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if _, err := io.ReadAll(opened.Body); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled stream = %v", err)
+	}
+	_ = opened.Body.Close()
+
+	backendFailure := errors.New("backend unavailable")
+	service.blobs = faultBlobStore{BlobStore: store, getErr: backendFailure}
+	opened, err = service.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(opened.Body); !errors.Is(err, backendFailure) || errors.Is(err, ErrCorrupt) {
+		t.Fatalf("backend get failure = %v", err)
+	}
+	_ = opened.Body.Close()
+	readFailure := errors.New("backend stream failed")
+	service.blobs = faultBlobStore{
+		BlobStore: store,
+		reader:    controlledReadCloser{Reader: failingReader{err: readFailure}},
+	}
+	opened, err = service.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(opened.Body); !errors.Is(err, readFailure) || errors.Is(err, ErrCorrupt) {
+		t.Fatalf("backend stream failure = %v", err)
+	}
+	_ = opened.Body.Close()
+	closeFailure := errors.New("backend close failed")
+	service.blobs = faultBlobStore{
+		BlobStore: store,
+		reader:    controlledReadCloser{Reader: bytes.NewReader(none.Body), closeErr: closeFailure},
+	}
+	opened, err = service.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(opened.Body); !errors.Is(err, closeFailure) {
+		t.Fatalf("backend close failure = %v", err)
+	}
+	_ = opened.Body.Close()
+	terminalFailure := errors.New("backend terminal read failed")
+	service.blobs = faultBlobStore{
+		BlobStore: store,
+		reader: controlledReadCloser{Reader: terminalErrorReader{
+			Reader: bytes.NewReader(none.Body), err: terminalFailure,
+		}},
+	}
+	opened, err = service.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(opened.Body); !errors.Is(err, terminalFailure) {
+		t.Fatalf("backend terminal failure = %v", err)
+	}
+	_ = opened.Body.Close()
+	service.blobs = faultBlobStore{
+		BlobStore: store,
+		reader:    io.NopCloser(bytes.NewReader(append(append([]byte(nil), none.Body...), 0))),
+	}
+	opened, err = service.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(opened.Body); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("overlong backend range = %v", err)
+	}
+	_ = opened.Body.Close()
+	service.blobs = store
+
+	key := BlobKey{Kind: BlobXorb, Hash: none.Hash}
+	store.mu.Lock()
+	original := append([]byte(nil), store.blobs[key]...)
+	store.blobs[key][xorb.HeaderSize] ^= 0xff
+	store.mu.Unlock()
+	opened, err = service.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(opened.Body); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("corrupt xorb stream = %v", err)
+	}
+	_ = opened.Body.Close()
+
+	store.mu.Lock()
+	store.blobs[key] = original
+	delete(store.blobs, key)
+	store.mu.Unlock()
+	opened, err = service.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(opened.Body); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("missing xorb stream = %v", err)
+	}
+	_ = opened.Body.Close()
+}
+
+func TestServiceOpenEmptyFileMatchesReconstructionRangeSemantics(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	service := testService(t, store, nil)
+	emptySHA := sha256.Sum256(nil)
+	body, err := shard.EncodeUpload(shard.Shard{Files: []shard.File{{Hash: xethash.Zero, SHA256: &emptySHA}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UploadShard(ctx, "", bytes.NewReader(body), int64(len(body))); err != nil {
+		t.Fatal(err)
+	}
+	for name, wanted := range map[string]*xetcas.FileRange{
+		"whole":                nil,
+		"official empty range": {Start: 0, End: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			opened, err := service.OpenFile(ctx, "", xethash.Zero, wanted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, readErr := io.ReadAll(opened.Body)
+			closeErr := opened.Body.Close()
+			if readErr != nil || closeErr != nil || len(got) != 0 || opened.FileSize != 0 || opened.Size != 0 ||
+				opened.Range != (xetcas.FileRange{}) {
+				t.Fatalf("empty stream = %#v, %q, %v, %v", opened, got, readErr, closeErr)
+			}
+		})
+	}
+}
+
+func TestServiceNamespaceScopesLogicalReachability(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	tenantA := testService(t, store, nil)
+	none, _, value, shardBody := uploadFixture(t)
+	if _, err := tenantA.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tenantA.UploadShard(ctx, "", bytes.NewReader(shardBody), int64(len(shardBody))); err != nil {
+		t.Fatal(err)
+	}
+	tenantB, err := New(Options{
+		Blobs: store, Index: store,
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
+			return "https://storage.example/object", nil
+		}),
+		Authorizer:         AllowAllAuthorizer{Namespace: "tenant-b"},
+		DedupProtectionKey: xethash.Chunk([]byte("namespace test key")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileHash := value.Files[0].Hash
+	if _, err := tenantB.File(ctx, "", fileHash); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-namespace file read = %v", err)
+	}
+	if _, err := tenantB.OpenFile(ctx, "", fileHash, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-namespace stream = %v", err)
+	}
+	if _, err := tenantB.GlobalDedup(ctx, "", xetcas.DefaultDedupPrefix, none.Chunks[0].Hash); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-namespace dedup read = %v", err)
+	}
+	if found, err := tenantB.XorbExists(ctx, "", xetcas.DefaultXorbPrefix, none.Hash); err != nil || !found {
+		t.Fatalf("global physical xorb existence = %v, %v", found, err)
+	}
+	// Publishing a validated shard establishes tenant B's own logical links to
+	// the already-durable, globally deduplicated xorb.
+	if _, err := tenantB.UploadShard(ctx, "", bytes.NewReader(shardBody), int64(len(shardBody))); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := tenantB.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(opened.Body)
+	_ = opened.Body.Close()
+	if err != nil || !bytes.Equal(got, objectContents(none)) {
+		t.Fatalf("tenant B stream after publication = %d bytes, %v", len(got), err)
+	}
+}
+
+func TestReconstructionGroupsCoalesceAdjacentTerms(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	service := testService(t, store, nil)
+	none, _, _, _ := uploadFixture(t)
+	if _, err := service.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err != nil {
+		t.Fatal(err)
+	}
+	plan := &xetcas.ReconstructionPlan{Terms: []xetcas.ReconstructionTerm{
+		{Hash: none.Hash, Range: xetcas.ChunkRange{Start: 0, End: 1}, UnpackedLength: uint32(len(none.Chunks[0].Data))},
+		{Hash: none.Hash, Range: xetcas.ChunkRange{Start: 1, End: 3}, UnpackedLength: uint32(len(none.Chunks[1].Data) + len(none.Chunks[2].Data))},
+	}}
+	groups, err := service.reconstructionGroups(ctx, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || len(groups[0].chunks) != 3 || groups[0].bytes.Start != 0 ||
+		groups[0].bytes.End+1 != uint64(len(none.Body)) {
+		t.Fatalf("coalesced groups = %#v", groups)
+	}
+	closedReader, closedWriter := io.Pipe()
+	_ = closedReader.Close()
+	if err := service.streamReconstruction(ctx, closedWriter, groups, 0, uint64(len(objectContents(none))), false, nil); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("closed destination = %v", err)
+	}
+	_ = closedWriter.Close()
+	unusedReader, unusedWriter := io.Pipe()
+	defer unusedReader.Close()
+	if err := service.streamReconstruction(ctx, unusedWriter, groups, uint64(len(objectContents(none)))+1, 0, false, nil); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("unconsumed reconstruction bytes = %v", err)
+	}
+	_ = unusedWriter.Close()
+}
+
+func TestReconstructionGroupsRejectBrokenLayouts(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	service := testService(t, store, nil)
+	none, _, _, _ := uploadFixture(t)
+	if _, err := service.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err != nil {
+		t.Fatal(err)
+	}
+	term := xetcas.ReconstructionTerm{
+		Hash: none.Hash, Range: xetcas.ChunkRange{Start: 0, End: 1},
+		UnpackedLength: uint32(len(none.Chunks[0].Data)),
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := service.reconstructionGroups(canceled, &xetcas.ReconstructionPlan{Terms: []xetcas.ReconstructionTerm{term}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled group planning = %v", err)
+	}
+	faults := &faultIndex{IndexStore: store, failAt: "get-xorb"}
+	service.index = faults
+	if _, err := service.reconstructionGroups(ctx, &xetcas.ReconstructionPlan{Terms: []xetcas.ReconstructionTerm{term}}); err == nil {
+		t.Fatal("xorb index failure succeeded")
+	}
+	service.index = store
+	missing := term
+	missing.Hash = xethash.Chunk([]byte("missing xorb"))
+	if _, err := service.reconstructionGroups(ctx, &xetcas.ReconstructionPlan{Terms: []xetcas.ReconstructionTerm{missing}}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("missing layout = %v", err)
+	}
+	invalid := term
+	invalid.Range.End = uint32(len(none.Chunks)) + 1
+	if _, err := service.reconstructionGroups(ctx, &xetcas.ReconstructionPlan{Terms: []xetcas.ReconstructionTerm{invalid}}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("invalid layout range = %v", err)
+	}
+	wrongSize := term
+	wrongSize.UnpackedLength++
+	if _, err := service.reconstructionGroups(ctx, &xetcas.ReconstructionPlan{Terms: []xetcas.ReconstructionTerm{wrongSize}}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("wrong term size = %v", err)
+	}
+	store.mu.Lock()
+	record := store.xorbs[none.Hash]
+	record.Layout.NetworkBytes = 1
+	store.xorbs[none.Hash] = record
+	store.mu.Unlock()
+	if _, err := service.reconstructionGroups(ctx, &xetcas.ReconstructionPlan{Terms: []xetcas.ReconstructionTerm{term}}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("out-of-bounds serialized layout = %v", err)
+	}
+}
+
 func TestServiceAuthLimitsAndExistence(t *testing.T) {
 	store := NewMemoryStore()
 	service, err := New(Options{
@@ -229,7 +622,7 @@ func TestServiceRejectsAmplifiedShardBeforePublication(t *testing.T) {
 	if _, err := service.UploadShard(ctx, "", bytes.NewReader(body), int64(len(body))); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("amplified shard error = %v", err)
 	}
-	if _, found, err := store.GetFile(ctx, value.Files[0].Hash); err != nil || found {
+	if _, found, err := store.GetFile(ctx, "", value.Files[0].Hash); err != nil || found {
 		t.Fatalf("over-budget file publication = %v, %v", found, err)
 	}
 }
@@ -247,7 +640,7 @@ func TestReadPlanningRejectsAmplifiedStoredRecipe(t *testing.T) {
 		t.Fatal(err)
 	}
 	reader, err := New(Options{
-		Blobs: store, Index: store, Authorizer: AllowAllAuthorizer{},
+		Blobs: store, Index: store, Authorizer: AllowAllAuthorizer{Namespace: "tenant-a"},
 		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
 			return "https://storage.example/object", nil
 		}),
@@ -335,23 +728,23 @@ func (f *faultIndex) GetXorb(ctx context.Context, hash xethash.Hash) (XorbRecord
 	}
 	return f.IndexStore.GetXorb(ctx, hash)
 }
-func (f *faultIndex) GetFile(ctx context.Context, hash xethash.Hash) (FileRecord, bool, error) {
+func (f *faultIndex) GetFile(ctx context.Context, namespace string, hash xethash.Hash) (FileRecord, bool, error) {
 	if err := f.take("get-file"); err != nil {
 		return FileRecord{}, false, err
 	}
-	return f.IndexStore.GetFile(ctx, hash)
+	return f.IndexStore.GetFile(ctx, namespace, hash)
 }
-func (f *faultIndex) GetDedup(ctx context.Context, hash xethash.Hash) (DedupRecord, bool, error) {
+func (f *faultIndex) GetDedup(ctx context.Context, namespace string, hash xethash.Hash) (DedupRecord, bool, error) {
 	if err := f.take("get-dedup"); err != nil {
 		return DedupRecord{}, false, err
 	}
-	return f.IndexStore.GetDedup(ctx, hash)
+	return f.IndexStore.GetDedup(ctx, namespace, hash)
 }
-func (f *faultIndex) PutDedup(ctx context.Context, hash xethash.Hash, value DedupRecord) error {
+func (f *faultIndex) PutDedup(ctx context.Context, namespace string, hash xethash.Hash, value DedupRecord) error {
 	if err := f.take("dedup"); err != nil {
 		return err
 	}
-	return f.IndexStore.PutDedup(ctx, hash, value)
+	return f.IndexStore.PutDedup(ctx, namespace, hash, value)
 }
 func (f *faultIndex) PutSHA256(ctx context.Context, namespace string, sum [32]byte, size uint64, hash xethash.Hash) error {
 	if err := f.take("sha"); err != nil {
@@ -359,11 +752,11 @@ func (f *faultIndex) PutSHA256(ctx context.Context, namespace string, sum [32]by
 	}
 	return f.IndexStore.PutSHA256(ctx, namespace, sum, size, hash)
 }
-func (f *faultIndex) PutFile(ctx context.Context, value FileRecord) error {
+func (f *faultIndex) PutFile(ctx context.Context, namespace string, value FileRecord) error {
 	if err := f.take("file"); err != nil {
 		return err
 	}
-	return f.IndexStore.PutFile(ctx, value)
+	return f.IndexStore.PutFile(ctx, namespace, value)
 }
 
 func TestServiceRepairsLostPublicationResponses(t *testing.T) {
@@ -389,7 +782,7 @@ func TestServiceRepairsLostPublicationResponses(t *testing.T) {
 	if _, err := service.UploadShard(ctx, "", bytes.NewReader(shardBody), int64(len(shardBody))); err == nil {
 		t.Fatal("injected SHA publication failure succeeded")
 	}
-	if _, found, err := store.GetFile(ctx, value.Files[0].Hash); err != nil || found {
+	if _, found, err := store.GetFile(ctx, "tenant-a", value.Files[0].Hash); err != nil || found {
 		t.Fatalf("file published before SHA association = %v, %v", found, err)
 	}
 	if _, err := service.UploadShard(ctx, "", bytes.NewReader(shardBody), int64(len(shardBody))); err != nil {
@@ -412,13 +805,13 @@ func TestMemoryStoreDedupIndexKeepsAValidExistingSource(t *testing.T) {
 	chunk := xethash.Chunk([]byte("shared chunk"))
 	first := DedupRecord{Shard: BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("first shard"))}}
 	second := DedupRecord{Shard: BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("second shard"))}}
-	if err := store.PutDedup(context.Background(), chunk, first); err != nil {
+	if err := store.PutDedup(context.Background(), "scope", chunk, first); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutDedup(context.Background(), chunk, second); err != nil {
+	if err := store.PutDedup(context.Background(), "scope", chunk, second); err != nil {
 		t.Fatalf("second valid dedup source conflicted: %v", err)
 	}
-	got, found, err := store.GetDedup(context.Background(), chunk)
+	got, found, err := store.GetDedup(context.Background(), "scope", chunk)
 	if err != nil || !found || got != first {
 		t.Fatalf("dedup source = %#v, %v, %v; want first source", got, found, err)
 	}
@@ -434,13 +827,13 @@ func TestMemoryStoreFileIndexKeepsAValidExistingRecipe(t *testing.T) {
 	second := first
 	second.Shard.Hash = xethash.Chunk([]byte("second shard"))
 	second.File.File.SHA256 = &[32]byte{1}
-	if err := store.PutFile(context.Background(), first); err != nil {
+	if err := store.PutFile(context.Background(), "scope", first); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutFile(context.Background(), second); err != nil {
+	if err := store.PutFile(context.Background(), "scope", second); err != nil {
 		t.Fatalf("second valid file recipe conflicted: %v", err)
 	}
-	got, found, err := store.GetFile(context.Background(), hash)
+	got, found, err := store.GetFile(context.Background(), "scope", hash)
 	if err != nil || !found || !reflect.DeepEqual(got, first) {
 		t.Fatalf("file record = %#v, %v, %v; want first recipe %#v", got, found, err, first)
 	}

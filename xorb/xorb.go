@@ -362,6 +362,40 @@ func Decode(body []byte) (*Object, error) {
 	return object, nil
 }
 
+// ReadChunk reads and validates exactly one serialized network-xorb chunk
+// from reader. It is intended for bounded reconstruction streams that fetch a
+// complete chunk-aligned object range without buffering the rest of the xorb.
+// The returned Chunk owns its decoded Data. Any bytes after the chunk remain
+// unread for the next call.
+func ReadChunk(reader io.Reader) (Chunk, error) {
+	if reader == nil {
+		return Chunk{}, errors.New("xorb: nil serialized chunk reader")
+	}
+	serialized := make([]byte, HeaderSize)
+	if _, err := io.ReadFull(reader, serialized); err != nil {
+		return Chunk{}, fmt.Errorf("xorb: read serialized chunk header: %w", err)
+	}
+	compressedLen := int(getUint24(serialized[1:4]))
+	if compressedLen == 0 || compressedLen > 2*chunker.MaxSize {
+		// Decode the header through the canonical parser so callers receive the
+		// same FormatError taxonomy as whole-xorb decoding.
+		_, err := decodeContent(serialized)
+		return Chunk{}, err
+	}
+	serialized = append(serialized, make([]byte, compressedLen)...)
+	if _, err := io.ReadFull(reader, serialized[HeaderSize:]); err != nil {
+		return Chunk{}, fmt.Errorf("xorb: read serialized chunk payload: %w", err)
+	}
+	object, err := decodeContent(serialized)
+	if err != nil {
+		return Chunk{}, err
+	}
+	if len(object.Chunks) != 1 {
+		return Chunk{}, errors.New("xorb: serialized chunk decoded to an unexpected chunk count")
+	}
+	return object.Chunks[0], nil
+}
+
 func decodeContent(body []byte) (*Object, error) {
 	if len(body) == 0 {
 		return nil, &FormatError{Reason: "empty content section"}

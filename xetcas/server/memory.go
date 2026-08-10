@@ -20,21 +20,26 @@ type shaKey struct {
 	size      uint64
 }
 
+type scopedHash struct {
+	namespace string
+	hash      xethash.Hash
+}
+
 // MemoryStore is a concurrency-safe reference BlobStore and IndexStore. It is
 // intended for tests, local development, and protocol interoperability suites.
 type MemoryStore struct {
 	mu     sync.RWMutex
 	blobs  map[BlobKey][]byte
 	xorbs  map[xethash.Hash]XorbRecord
-	files  map[xethash.Hash]FileRecord
-	dedup  map[xethash.Hash]DedupRecord
+	files  map[scopedHash]FileRecord
+	dedup  map[scopedHash]DedupRecord
 	sha256 map[shaKey]xethash.Hash
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		blobs: make(map[BlobKey][]byte), xorbs: make(map[xethash.Hash]XorbRecord),
-		files: make(map[xethash.Hash]FileRecord), dedup: make(map[xethash.Hash]DedupRecord),
+		files: make(map[scopedHash]FileRecord), dedup: make(map[scopedHash]DedupRecord),
 		sha256: make(map[shaKey]xethash.Hash),
 	}
 }
@@ -105,44 +110,45 @@ func (s *MemoryStore) PutXorb(_ context.Context, value XorbRecord) error {
 	return nil
 }
 
-func (s *MemoryStore) GetFile(_ context.Context, hash xethash.Hash) (FileRecord, bool, error) {
+func (s *MemoryStore) GetFile(_ context.Context, namespace string, hash xethash.Hash) (FileRecord, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	value, ok := s.files[hash]
+	value, ok := s.files[scopedHash{namespace: namespace, hash: hash}]
 	return cloneFileRecord(value), ok, nil
 }
 
-func (s *MemoryStore) PutFile(_ context.Context, value FileRecord) error {
-	hash := value.File.File.Hash
+func (s *MemoryStore) PutFile(_ context.Context, namespace string, value FileRecord) error {
+	key := scopedHash{namespace: namespace, hash: value.File.File.Hash}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.files[hash]; ok {
+	if _, ok := s.files[key]; ok {
 		// A file identity authenticates the logical chunk sequence, not one
 		// particular shard recipe or the presence of optional SHA metadata.
 		// Keep the first durable, already validated reconstruction source.
 		return nil
 	}
-	s.files[hash] = cloneFileRecord(value)
+	s.files[key] = cloneFileRecord(value)
 	return nil
 }
 
-func (s *MemoryStore) GetDedup(_ context.Context, hash xethash.Hash) (DedupRecord, bool, error) {
+func (s *MemoryStore) GetDedup(_ context.Context, namespace string, hash xethash.Hash) (DedupRecord, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	value, ok := s.dedup[hash]
+	value, ok := s.dedup[scopedHash{namespace: namespace, hash: hash}]
 	return value, ok, nil
 }
 
-func (s *MemoryStore) PutDedup(_ context.Context, hash xethash.Hash, value DedupRecord) error {
+func (s *MemoryStore) PutDedup(_ context.Context, namespace string, hash xethash.Hash, value DedupRecord) error {
+	key := scopedHash{namespace: namespace, hash: hash}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.dedup[hash]; ok {
+	if _, ok := s.dedup[key]; ok {
 		// A chunk may legitimately occur in many shards. Keep the first durable
 		// source; replacing it is unnecessary and a different source is not an
 		// immutable-value conflict.
 		return nil
 	}
-	s.dedup[hash] = value
+	s.dedup[key] = value
 	return nil
 }
 

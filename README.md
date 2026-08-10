@@ -165,7 +165,9 @@ store := server.NewMemoryStore()
 cas, err := server.New(server.Options{
 	Blobs:      store,
 	Index:      store,
-	Authorizer: server.StaticTokenAuthorizer{Token: os.Getenv("XET_CAS_TOKEN")},
+	Authorizer: server.StaticTokenAuthorizer{
+		Token: os.Getenv("XET_CAS_TOKEN"), Namespace: "local",
+	},
 	Signer:     objectRangeSigner,
 	// Optional: each protected shard embeds the key needed by clients, so key
 	// rotation does not invalidate shards already issued within their TTL.
@@ -176,6 +178,23 @@ if err != nil {
 }
 return http.ListenAndServe(":8080", cas.Handler())
 ```
+
+Embedders can stream reconstructed content without interpreting protocol JSON
+or making an internal HTTP request:
+
+```go
+opened, err := cas.OpenFile(ctx, token, fileID, requestedRange)
+if err != nil {
+	return err
+}
+defer opened.Body.Close()
+_, err = io.Copy(destination, opened.Body)
+```
+
+`OpenFile` uses the same bounded reconstruction planner as the wire routes,
+coalesces safe adjacent Xorb reads, validates every decoded chunk and length,
+verifies a present SHA-256 for complete coverage, and propagates cancellation
+while closing active backend readers.
 
 Xorb bodies are decoded and identity-checked before canonical complete storage.
 Shard registration resolves durable xorb metadata and recomputes term and file
@@ -188,10 +207,10 @@ budgets; ingestion admission is bounded before request bodies are buffered.
 The OpenAPI dedup namespace is `default-merkledb`; the server also accepts
 `default` because released official Rust clients currently reuse their xorb
 prefix for dedup requests. Repository reachability policy and S3/GCS signing
-belong in the injected adapters, not this module. File, xorb, and dedup indexes
-are physically global: an `Authorizer` must scope every hash-bearing request by
-repository reachability. `Grant.Namespace` scopes only SHA-256 associations and
-is not by itself a file-read authorization boundary.
+belong in the injected adapters, not this module. Xorb layout metadata and
+bytes are physically global for content deduplication. File recipes, dedup
+records, and SHA-256 associations are keyed by `Grant.Namespace`; every logical
+read resolves one of those scoped records before reaching physical content.
 
 ## Package map
 

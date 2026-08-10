@@ -133,7 +133,7 @@ func TestHTTPHandlerGoClientEndToEnd(t *testing.T) {
 	if err != nil || !found || size != uint64(len(data)) {
 		t.Fatalf("file HEAD = %d, %v, %v", size, found, err)
 	}
-	fileRecord, _, _ := store.GetFile(ctx, upload.File.Hash)
+	fileRecord, _, _ := store.GetFile(ctx, "e2e", upload.File.Hash)
 	xorbRecord, _, _ := store.GetXorb(ctx, fileRecord.File.File.Terms[0].XorbHash)
 	exists, err := transport.XorbExists(ctx, xetcas.DefaultXorbPrefix, xorbRecord.Layout.Hash)
 	if err != nil || !exists {

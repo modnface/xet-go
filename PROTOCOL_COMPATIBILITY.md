@@ -27,9 +27,10 @@
 | Global protection hash | Keyed BLAKE3, despite historical “HMAC” naming |
 | Upload shard accounting | Zero serialized-xorb size is accepted and preserved because released xet-core upload sessions emit it; durable size/layout come from the independently validated xorb |
 | CAS server | Storage-neutral blob/index/signer/authorizer interfaces; canonical xorb and shard publication; v1/v2, batch, dedup, HEAD, and sparse-delta routes |
-| Shard publication | Canonical blob, non-unique dedup indexes, scoped SHA-256, then first-valid reconstructable file records; in-process tests prove idempotent replay after partial failure, not cross-store atomicity |
+| Shard publication | Canonical blob, namespace-scoped non-unique dedup indexes and SHA-256, then namespace-scoped first-valid reconstructable file records; in-process tests prove idempotent replay after partial failure, not cross-store atomicity |
 | Shard progress | v2 NDJSON emits validation/commit/result or terminal error frames and periodically repeats the latest frame as a heartbeat |
 | Server work limits | Configurable file/xorb/term/chunk-reference budgets, context-aware planners, bounded compact-gap memory, and pre-buffer ingestion admission |
+| Typed reconstruction | `Service.OpenFile` streams full files or ranges directly from global physical Xorbs reached through a namespace-scoped file recipe, with chunk/length validation, optional whole-file SHA-256, backpressure, cancellation, and deterministic closure |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
 | Credential refresh | Refresh 30 seconds before expiry, coalesce concurrent refresh, and retry exactly once after a 401 invalidation |
@@ -55,8 +56,9 @@ module boundary because they do not alter the protocol.
 
 The core and server APIs contain no Hugging Face repository, revision, path,
 user token, commit, Git, S3, or LFS concepts. They accept only generic Xet CAS
-credentials, storage capabilities, scopes, and protocol identities. Repository
-reachability and cloud-specific signing remain adapter responsibilities.
+credentials, storage capabilities, logical storage namespaces, and protocol
+identities. Mapping repository policy to a grant namespace and cloud-specific
+signing remain adapter responsibilities.
 
 Compatibility is continuously checked by the requirement matrix in
 [CONFORMANCE.md](CONFORMANCE.md).
@@ -67,14 +69,22 @@ Compatibility is continuously checked by the requirement matrix in
   not authorization. `Authorizer.Authorize` runs before every externally
   reachable file, xorb, dedup, and shard operation and must enforce the
   credential's repository/storage reachability.
+- `Grant.Namespace` scopes file recipes, dedup records, and `(SHA-256, size) ->
+  Xet file` associations. All file, reconstruction, chunk-hash, and dedup reads
+  resolve those scoped records before they can reach global physical objects.
+- Xorb layout metadata and bytes remain global content-addressed identities.
+  Xorb existence can therefore be reused across namespaces without copying
+  bytes, but it does not expose file bytes or a dedup shard. Publishing a
+  validated shard under `OperationWriteShard` creates that grant namespace's
+  own logical file and dedup links to its transitive Xorbs.
 - File reconstruction and shard registration authorize their top-level
-  operation once; underlying global Xorb lookups inherit that grant. An
-  `OperationWriteShard` grant therefore must be allowed to reference the
-  service's entire Xorb storage domain unless the injected index is itself
-  partitioned. The current interface does not authorize each referenced Xorb.
-- `Grant.Namespace` scopes `(SHA-256, size) -> Xet file` associations only.
-  File, xorb, and dedup index keys are global protocol identities; a static
-  all-operations token is suitable only for a single-scope deployment.
+  operation once; transitive Xorb lookups inherit the enclosing scoped file or
+  shard-write grant. The interface deliberately does not authorize each
+  content-addressed Xorb a second time.
+- `Service.OpenFile` and the v1/v2 HTTP reconstruction routes share the same
+  bounded planner. The typed stream additionally reads chunk-aligned physical
+  ranges, coalesces adjacent reads in logical order, and validates decoded
+  chunks before returning bytes.
 - Xorb publication stores canonical immutable bytes before publishing layout
   metadata. Shard publication stores the canonical shard before dedup and SHA
   secondary indexes and publishes reconstructable file records last.
@@ -99,8 +109,9 @@ invariants before production durability is claimed:
    publication and SQL commit;
 4. deterministic first-valid selection when duplicate file or dedup rows exist,
    plus constraints for truly immutable xorb and SHA records;
-5. repository-aware authorization or partitioning for global identities,
-   including an explicit policy for transitive Xorb dependencies;
+5. SQL constraints and queries that preserve namespace-scoped file/dedup/SHA
+   reachability while retaining global Xorb identity and the documented
+   transitive-dependency policy;
 6. paginated iteration over objects and indexes for audit, repair, migration,
    and garbage collection without whole-bucket materialization; and
 7. cancellation-aware filesystem, SQL, S3, and signed-range operations, tested

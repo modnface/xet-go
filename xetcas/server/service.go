@@ -300,7 +300,7 @@ func (s *Service) publishShard(ctx context.Context, grant Grant, data []byte) (S
 		return ShardResult{}, err
 	}
 	for _, hash := range registration.GlobalDedupChunks {
-		if err := s.index.PutDedup(ctx, hash, DedupRecord{Shard: shardKey}); err != nil {
+		if err := s.index.PutDedup(ctx, grant.Namespace, hash, DedupRecord{Shard: shardKey}); err != nil {
 			return ShardResult{}, fmt.Errorf("xet CAS server: publish dedup chunk %s: %w", hash, err)
 		}
 	}
@@ -312,7 +312,7 @@ func (s *Service) publishShard(ctx context.Context, grant Grant, data []byte) (S
 		}
 	}
 	for _, file := range registration.Files {
-		if err := s.index.PutFile(ctx, FileRecord{File: file, Shard: shardKey}); err != nil {
+		if err := s.index.PutFile(ctx, grant.Namespace, FileRecord{File: file, Shard: shardKey}); err != nil {
 			return ShardResult{}, fmt.Errorf("xet CAS server: publish file %s: %w", file.File.Hash, err)
 		}
 	}

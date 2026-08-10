@@ -407,7 +407,7 @@ func writeServerError(w http.ResponseWriter, r *http.Request, err error) {
 
 func serverErrorStatus(err error) int {
 	switch {
-	case errors.Is(err, shard.ErrXorbLookup):
+	case errors.Is(err, shard.ErrXorbLookup), errors.Is(err, ErrCorrupt):
 		return http.StatusInternalServerError
 	case errors.Is(err, ErrUnauthorized):
 		return http.StatusUnauthorized

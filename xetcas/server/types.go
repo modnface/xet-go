@@ -22,6 +22,7 @@ var (
 	ErrConflict     = errors.New("xet CAS server: immutable value conflict")
 	ErrTooLarge     = errors.New("xet CAS server: request body too large")
 	ErrInvalid      = errors.New("xet CAS server: invalid request")
+	ErrCorrupt      = errors.New("xet CAS server: corrupt content")
 )
 
 type BlobKind string
@@ -62,20 +63,21 @@ type DedupRecord struct {
 	Shard BlobKey
 }
 
-// IndexStore xorb and SHA values are immutable and every Put operation must be
-// idempotent. File and dedup keys are non-unique secondary indexes: the same
-// logical content can have more than one valid shard recipe. PutFile and
-// PutDedup must retain either an existing valid record or the supplied valid
-// record without returning a conflict. The Service validates supplied records
-// and orders calls so file records, the public reconstruction point, are
-// written last.
+// IndexStore keeps physical xorb metadata global while scoping every logical
+// file, dedup, and SHA association to an authorized storage namespace. File
+// and dedup keys are non-unique secondary indexes: the same logical content
+// can have more than one valid shard recipe. PutFile and PutDedup must retain
+// either an existing valid record or the supplied valid record without
+// returning a conflict. Every Put operation is idempotent. The Service
+// validates supplied records and orders calls so scoped file records, the
+// public reconstruction point, are written last.
 type IndexStore interface {
 	GetXorb(context.Context, xethash.Hash) (XorbRecord, bool, error)
 	PutXorb(context.Context, XorbRecord) error
-	GetFile(context.Context, xethash.Hash) (FileRecord, bool, error)
-	PutFile(context.Context, FileRecord) error
-	GetDedup(context.Context, xethash.Hash) (DedupRecord, bool, error)
-	PutDedup(context.Context, xethash.Hash, DedupRecord) error
+	GetFile(context.Context, string, xethash.Hash) (FileRecord, bool, error)
+	PutFile(context.Context, string, FileRecord) error
+	GetDedup(context.Context, string, xethash.Hash) (DedupRecord, bool, error)
+	PutDedup(context.Context, string, xethash.Hash, DedupRecord) error
 	ResolveSHA256(context.Context, string, [32]byte, uint64) (xethash.Hash, bool, error)
 	PutSHA256(context.Context, string, [32]byte, uint64, xethash.Hash) error
 }
@@ -96,8 +98,9 @@ type AccessRequest struct {
 	Hash      xethash.Hash
 }
 
-// Grant contains storage-index scope derived from a generic CAS credential.
-// Namespace is used only for scoped SHA-256 associations.
+// Grant contains the logical storage-index scope derived from a generic CAS
+// credential. Physical content may be deduplicated globally, but file, dedup,
+// and SHA reachability is always evaluated within Namespace.
 type Grant struct{ Namespace string }
 
 type Authorizer interface {
@@ -134,4 +137,18 @@ type ShardResult struct {
 	Inserted          bool
 	Files             int
 	GlobalDedupChunks int
+}
+
+// OpenedFile is a typed, streaming reconstruction result. FileSize is the
+// complete logical file size, while Range and Size describe the returned
+// half-open logical range. Body verifies every decoded chunk against durable
+// xorb metadata and, for whole-file reads, verifies optional SHA-256 metadata.
+// The caller must close Body; closing it cancels outstanding storage reads.
+type OpenedFile struct {
+	Hash     xethash.Hash
+	FileSize uint64
+	Range    xetcas.FileRange
+	Size     uint64
+	SHA256   *[32]byte
+	Body     io.ReadCloser
 }
