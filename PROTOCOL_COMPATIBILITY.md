@@ -27,11 +27,11 @@
 | Global protection hash | Keyed BLAKE3, despite historical “HMAC” naming |
 | Upload shard accounting | Zero serialized-xorb size is accepted and preserved because released xet-core upload sessions emit it; durable size/layout come from the independently validated xorb |
 | CAS server | Storage-neutral blob/index/signer/authorizer interfaces; canonical xorb and shard publication; v1/v2, batch, dedup, HEAD, and sparse-delta routes |
-| Shard publication | Canonical blob followed by one atomic namespace-scoped `PublishShard` for non-unique dedup, immutable SHA-256, and first-valid file records; object/index cross-store atomicity still requires staged recovery |
+| Shard publication | Renewable namespace-scoped stage, canonical blob, then one atomic `PublishShard` for non-unique dedup, immutable SHA-256, and first-valid file records; failed/ambiguous publication retains the stage |
 | Shard progress | v2 NDJSON emits validation/commit/result or terminal error frames and periodically repeats the latest frame as a heartbeat |
 | Server work limits | Configurable file/xorb/term/chunk-reference budgets, context-aware planners, bounded compact-gap memory, and pre-buffer ingestion admission |
 | Typed reconstruction | `Service.OpenFile` streams full files or ranges directly from global physical Xorbs reached through a namespace-scoped file recipe, with chunk/length validation, optional whole-file SHA-256, backpressure, cancellation, and deterministic closure |
-| Local durable storage | Linux/macOS immutable filesystem blobs plus a pure-Go SQLite WAL index; strict file/directory barriers, process-root locking, restart persistence, and transactional shard-index publication |
+| Local durable storage | Linux/macOS immutable filesystem blobs plus a pure-Go SQLite WAL index; strict file/directory barriers, process-root locking, restart persistence, transactional shard-index publication, and schema-v3 lifecycle protections |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
 | Credential refresh | Refresh 30 seconds before expiry, coalesce concurrent refresh, and retry exactly once after a 401 invalidation |
@@ -86,16 +86,22 @@ Compatibility is continuously checked by the requirement matrix in
   bounded planner. The typed stream additionally reads chunk-aligned physical
   ranges, coalesces adjacent reads in logical order, and validates decoded
   chunks before returning bytes.
+- Reconstruction publishes a namespace-scoped file lease before the first file
+  or Xorb-index lookup. Active typed streams renew that lease until settlement;
+  signed reconstruction descriptors retain it through the signer's maximum
+  declared URL expiration plus the configured read-lease grace interval.
 - Xorb publication stores canonical immutable bytes before publishing layout
-  metadata. Shard publication stores the canonical shard before atomically
-  publishing all namespace-scoped dedup, SHA, and reconstructable file records
-  through one index-store call.
+  metadata. When `ProtectionStore` is present, Xorb and shard publication first
+  creates and renews a durable namespace-scoped stage. Shard publication then
+  atomically publishes all namespace-scoped dedup, SHA, and reconstructable
+  file records through one index-store call before releasing its stage.
 - Every index write is idempotent. File and dedup indexes are non-unique
   secondary indexes and may retain any already-valid durable source. A SHA key
   is immutable within its namespace.
-- The service's publication order makes retry after a lost response safe, but
-  the interfaces do not create a transaction across object and index stores.
-  Durable adapters must not report success before their writes are durable.
+- The service's publication order makes retry after a lost response safe.
+  Object and index stores still do not share a transaction: failed or ambiguous
+  index publication retains the durable stage as a recovery/GC root. Durable
+  adapters must not report success before their writes are durable.
 
 ## Durable backend status and gap list
 
@@ -110,13 +116,14 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
   beneath the private root are rejected when they are symlinks;
 - SQLite is created privately, uses WAL with `synchronous=FULL`, applies safety
   pragmas to every pooled connection, enforces key storage classes and lengths
-  through schema version 2, and publishes dedup, scoped SHA, and file records in
-  one immediate transaction;
+  through schema version 3, publishes dedup, scoped SHA, and file records in one
+  immediate transaction, and persists renewable blob stages and file leases;
 - file and dedup indexes deterministically retain their first valid source,
   while Xorb and scoped SHA identities reject immutable conflicts;
 - optional operational listers provide opaque, operation- and filter-specific
-  keyset cursors for blobs, Xorbs, scoped file and dedup records, and scoped SHA
-  associations; SQLite query-plan tests prove composite-primary-key seeks, and
+  keyset cursors for blobs, Xorbs, scoped file and dedup records, scoped SHA
+  associations, blob stages, and file leases; SQLite query-plan tests prove
+  composite-primary-key seeks, and
   filesystem pages seek the hash-prefix tree without collecting the whole
   store (one four-hex-character leaf remains the minimum sorted work unit); and
 - the same backend contract suite runs against memory/filesystem and
@@ -132,13 +139,14 @@ process running as the service identity is outside its threat model.
 
 Remaining production storage boundaries are:
 
-1. staged-object protection, pins/leases, and grace-based cleanup for a crash
-   between immutable blob publication and SQL commit;
-2. paginated iteration for future staged records and catalog reachability roots;
+1. expiry scanning, publication recovery, and grace-based cleanup built on the
+   current durable stages and leases (expiration alone never authorizes object
+   deletion);
+2. catalog reachability roots and read/maintenance epochs for destructive work;
 3. audit, repair, resumable mark-and-sweep, and guarded garbage collection built
-   on the current blob/index iteration plus those protection and root primitives;
+   on the current blob/index/protection iteration plus those root primitives;
 4. S3-compatible immutable/conditional blob publication and signed range reads;
-5. PostgreSQL migrations and an index implementation with the same atomic and
-   namespace-scoped contract as SQLite; and
+5. PostgreSQL migrations and an index/protection implementation with the same
+   atomic and namespace-scoped contract as SQLite; and
 6. MinIO/PostgreSQL multi-process, restart, and fault-injection evidence for the
    remote profile.

@@ -72,8 +72,8 @@ func TestHTTPHandlerGoClientEndToEnd(t *testing.T) {
 
 	service, err := New(Options{
 		Blobs: store, Index: store,
-		Signer: RangeURLSignerFunc(func(_ context.Context, key BlobKey, _ xetcas.HTTPRange) (string, error) {
-			return storageServer.URL + "/" + string(key.Kind) + "/" + key.Hash.String() + "?signed=1", nil
+		Signer: RangeURLSignerFunc(func(_ context.Context, key BlobKey, _ xetcas.HTTPRange) (SignedRange, error) {
+			return signedTestRange(storageServer.URL + "/" + string(key.Kind) + "/" + key.Hash.String() + "?signed=1"), nil
 		}),
 		Authorizer:         StaticTokenAuthorizer{Token: "cas-secret", Namespace: "e2e"},
 		DedupProtectionKey: xethash.Chunk([]byte("HTTP handler dedup key")),
@@ -192,8 +192,8 @@ func TestHTTPHandlerRejectsMalformedAuthorityAndRanges(t *testing.T) {
 	store := NewMemoryStore()
 	service, err := New(Options{
 		Blobs: store, Index: store,
-		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
-			return "https://storage.example/object", nil
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+			return signedTestRange("https://storage.example/object"), nil
 		}),
 		Authorizer: StaticTokenAuthorizer{Token: "secret"},
 	})

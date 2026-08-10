@@ -23,6 +23,9 @@ const (
 	defaultMaxRegistrationTerms     = 250_000
 	defaultMaxRegistrationChunkRefs = 4_000_000
 	defaultMaxConcurrentIngests     = 2
+	defaultStagingProtectionTTL     = 24 * time.Hour
+	defaultReadLeaseTTL             = 15 * time.Minute
+	minimumProtectionTTL            = 3 * time.Second
 )
 
 type Service struct {
@@ -38,6 +41,9 @@ type Service struct {
 	registration   shard.RegistrationLimits
 	ingestSlots    chan struct{}
 	shardHeartbeat time.Duration
+	protections    ProtectionStore
+	stagingTTL     time.Duration
+	readLeaseTTL   time.Duration
 }
 
 func New(options Options) (*Service, error) {
@@ -92,11 +98,27 @@ func New(options Options) (*Service, error) {
 	if maxConcurrentIngests < 1 {
 		return nil, errors.New("xet CAS server: maximum concurrent ingests must be positive")
 	}
+	protections, hasProtections := options.Index.(ProtectionStore)
+	stagingTTL := options.StagingProtectionTTL
+	if stagingTTL == 0 {
+		stagingTTL = defaultStagingProtectionTTL
+	}
+	readLeaseTTL := options.ReadLeaseTTL
+	if readLeaseTTL == 0 {
+		readLeaseTTL = defaultReadLeaseTTL
+	}
+	if stagingTTL < minimumProtectionTTL || readLeaseTTL < minimumProtectionTTL {
+		return nil, fmt.Errorf("xet CAS server: protection TTLs must be at least %s", minimumProtectionTTL)
+	}
+	if !hasProtections && (options.StagingProtectionTTL != 0 || options.ReadLeaseTTL != 0) {
+		return nil, errors.New("xet CAS server: protection TTLs require an index implementing ProtectionStore")
+	}
 	return &Service{
 		blobs: options.Blobs, index: options.Index, signer: options.Signer, authorizer: options.Authorizer,
 		now: now, dedupKey: dedupKey, dedupTTL: dedupTTL, maxXorb: maxXorb, maxShard: maxShard,
 		registration: registration, ingestSlots: make(chan struct{}, maxConcurrentIngests),
-		shardHeartbeat: defaultShardHeartbeat,
+		shardHeartbeat: defaultShardHeartbeat, protections: protections,
+		stagingTTL: stagingTTL, readLeaseTTL: readLeaseTTL,
 	}, nil
 }
 
@@ -117,6 +139,101 @@ func (s *Service) acquireIngest(ctx context.Context) (func(), error) {
 	}
 }
 
+func newProtectionID() (ProtectionID, error) {
+	var id ProtectionID
+	if _, err := rand.Read(id[:]); err != nil {
+		return ProtectionID{}, fmt.Errorf("xet CAS server: generate protection ID: %w", err)
+	}
+	return id, nil
+}
+
+type activeBlobStage struct {
+	store        ProtectionStore
+	namespace    string
+	id           ProtectionID
+	expiresAt    time.Time
+	ttl          time.Duration
+	now          func() time.Time
+	cancelRenew  context.CancelFunc
+	done         <-chan struct{}
+	renewalError error
+}
+
+func (s *Service) stageBlob(
+	ctx context.Context,
+	failPublication context.CancelCauseFunc,
+	namespace string,
+	blob BlobKey,
+) (*activeBlobStage, error) {
+	if s.protections == nil {
+		return nil, nil
+	}
+	id, err := newProtectionID()
+	if err != nil {
+		return nil, err
+	}
+	createdAt := s.now()
+	stage := BlobStage{
+		ID: id, Namespace: namespace, Blob: blob,
+		CreatedAt: createdAt, ExpiresAt: createdAt.Add(s.stagingTTL),
+	}
+	if err := s.protections.PutBlobStage(ctx, stage); err != nil {
+		return nil, fmt.Errorf("xet CAS server: stage blob publication: %w", err)
+	}
+	renewContext, cancelRenew := context.WithCancel(ctx)
+	done := make(chan struct{})
+	active := &activeBlobStage{
+		store: s.protections, namespace: namespace, id: id, expiresAt: stage.ExpiresAt,
+		ttl: s.stagingTTL, now: s.now, cancelRenew: cancelRenew, done: done,
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(s.stagingTTL / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewContext.Done():
+				return
+			case <-ticker.C:
+				expiresAt := active.now().Add(active.ttl)
+				if !expiresAt.After(active.expiresAt) {
+					expiresAt = active.expiresAt.Add(active.ttl / 3)
+				}
+				if err := active.store.RenewBlobStage(
+					renewContext, active.namespace, active.id, expiresAt,
+				); err != nil {
+					if renewContext.Err() != nil {
+						return
+					}
+					active.renewalError = fmt.Errorf("xet CAS server: renew blob stage: %w", err)
+					failPublication(active.renewalError)
+					return
+				}
+				active.expiresAt = expiresAt
+			}
+		}
+	}()
+	return active, nil
+}
+
+func (s *Service) releaseBlobStage(stage *activeBlobStage, published bool) error {
+	if stage == nil {
+		return nil
+	}
+	stage.cancelRenew()
+	<-stage.done
+	if !published {
+		return stage.renewalError
+	}
+	releaseContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var releaseError error
+	if err := stage.store.DeleteBlobStage(releaseContext, stage.namespace, stage.id); err != nil {
+		releaseError = fmt.Errorf("xet CAS server: release blob stage: %w", err)
+	}
+	return errors.Join(stage.renewalError, releaseError)
+}
+
 // UploadXorb validates a footerless body, stores its canonical complete form,
 // and publishes its layout index only after the blob is durable.
 func (s *Service) UploadXorb(
@@ -129,9 +246,10 @@ func (s *Service) UploadXorb(
 	if prefix != xetcas.DefaultXorbPrefix {
 		return false, ErrNotFound
 	}
-	if _, err := s.authorize(ctx, credential, AccessRequest{
+	grant, err := s.authorize(ctx, credential, AccessRequest{
 		Operation: OperationWriteXorb, Prefix: prefix, Hash: expected,
-	}); err != nil {
+	})
+	if err != nil {
 		return false, err
 	}
 	release, err := s.acquireIngest(ctx)
@@ -157,20 +275,31 @@ func (s *Service) UploadXorb(
 	}
 
 	key := BlobKey{Kind: BlobXorb, Hash: expected}
-	inserted, err := s.blobs.PutIfAbsent(ctx, key, bytes.NewReader(ingested.Complete), int64(len(ingested.Complete)))
+	publicationContext, cancelPublication := context.WithCancelCause(ctx)
+	defer cancelPublication(nil)
+	stage, err := s.stageBlob(publicationContext, cancelPublication, grant.Namespace, key)
+	if err != nil {
+		return false, err
+	}
+	inserted, err := s.blobs.PutIfAbsent(
+		publicationContext, key, bytes.NewReader(ingested.Complete), int64(len(ingested.Complete)),
+	)
 	if errors.Is(err, ErrConflict) {
 		// The xorb identity covers uncompressed chunks, not a particular valid
 		// compression byte stream. Preserve the first representation and repair
 		// its index after a lost response or concurrent equivalent upload.
-		ingested, err = s.layoutFromStoredXorb(ctx, key, expected)
+		ingested, err = s.layoutFromStoredXorb(publicationContext, key, expected)
 		inserted = false
 	}
 	if err != nil {
-		return false, err
+		return false, errors.Join(err, s.releaseBlobStage(stage, false))
 	}
 	record := XorbRecord{Blob: key, Layout: *ingested}
 	record.Layout.Complete = nil
-	if err := s.index.PutXorb(ctx, record); err != nil {
+	if err := s.index.PutXorb(publicationContext, record); err != nil {
+		return false, errors.Join(err, s.releaseBlobStage(stage, false))
+	}
+	if err := s.releaseBlobStage(stage, true); err != nil {
 		return false, err
 	}
 	return inserted, nil
@@ -295,9 +424,15 @@ func (s *Service) publishShard(ctx context.Context, grant Grant, data []byte) (S
 		return ShardResult{}, err
 	}
 	shardKey := BlobKey{Kind: BlobShard, Hash: xethash.Chunk(full)}
-	inserted, err := s.blobs.PutIfAbsent(ctx, shardKey, bytes.NewReader(full), int64(len(full)))
+	publicationContext, cancelPublication := context.WithCancelCause(ctx)
+	defer cancelPublication(nil)
+	stage, err := s.stageBlob(publicationContext, cancelPublication, grant.Namespace, shardKey)
 	if err != nil {
 		return ShardResult{}, err
+	}
+	inserted, err := s.blobs.PutIfAbsent(publicationContext, shardKey, bytes.NewReader(full), int64(len(full)))
+	if err != nil {
+		return ShardResult{}, errors.Join(err, s.releaseBlobStage(stage, false))
 	}
 	publication := ShardPublication{
 		Namespace: grant.Namespace,
@@ -316,8 +451,12 @@ func (s *Service) publishShard(ctx context.Context, grant Grant, data []byte) (S
 		}
 		publication.Files = append(publication.Files, FileRecord{File: file, Shard: shardKey})
 	}
-	if err := s.index.PublishShard(ctx, publication); err != nil {
-		return ShardResult{}, fmt.Errorf("xet CAS server: publish shard indexes: %w", err)
+	if err := s.index.PublishShard(publicationContext, publication); err != nil {
+		publicationError := fmt.Errorf("xet CAS server: publish shard indexes: %w", err)
+		return ShardResult{}, errors.Join(publicationError, s.releaseBlobStage(stage, false))
+	}
+	if err := s.releaseBlobStage(stage, true); err != nil {
+		return ShardResult{}, err
 	}
 	return ShardResult{
 		Shard: shardKey, Inserted: inserted, Files: len(registration.Files),

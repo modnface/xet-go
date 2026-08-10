@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/url"
 	"reflect"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +27,10 @@ func (f authorizerFunc) Authorize(ctx context.Context, credential string, reques
 	return f(ctx, credential, request)
 }
 
+func signedTestRange(url string) SignedRange {
+	return SignedRange{URL: url, ExpiresAt: time.Unix(2_000_000_000, 0)}
+}
+
 func testService(t testing.TB, store *MemoryStore, index IndexStore) *Service {
 	t.Helper()
 	if index == nil {
@@ -32,8 +38,8 @@ func testService(t testing.TB, store *MemoryStore, index IndexStore) *Service {
 	}
 	service, err := New(Options{
 		Blobs: store, Index: index,
-		Signer: RangeURLSignerFunc(func(_ context.Context, key BlobKey, value xetcas.HTTPRange) (string, error) {
-			return fmt.Sprintf("https://storage.example/%s/%s?range=%s", key.Kind, key.Hash, value.String()), nil
+		Signer: RangeURLSignerFunc(func(_ context.Context, key BlobKey, value xetcas.HTTPRange) (SignedRange, error) {
+			return signedTestRange(fmt.Sprintf("https://storage.example/%s/%s?range=%s", key.Kind, key.Hash, value.String())), nil
 		}),
 		Authorizer:         AllowAllAuthorizer{Namespace: "tenant-a"},
 		Now:                func() time.Time { return time.Unix(1_000, 0) },
@@ -447,8 +453,8 @@ func TestServiceNamespaceScopesLogicalReachability(t *testing.T) {
 	}
 	tenantB, err := New(Options{
 		Blobs: store, Index: store,
-		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
-			return "https://storage.example/object", nil
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+			return signedTestRange("https://storage.example/object"), nil
 		}),
 		Authorizer:         AllowAllAuthorizer{Namespace: "tenant-b"},
 		DedupProtectionKey: xethash.Chunk([]byte("namespace test key")),
@@ -573,8 +579,8 @@ func TestServiceAuthLimitsAndExistence(t *testing.T) {
 	store := NewMemoryStore()
 	service, err := New(Options{
 		Blobs: store, Index: store,
-		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
-			return "https://storage.example/object", nil
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+			return signedTestRange("https://storage.example/object"), nil
 		}),
 		Authorizer:  StaticTokenAuthorizer{Token: "secret", Namespace: "scope"},
 		MaxXorbBody: 64,
@@ -602,8 +608,8 @@ func TestServiceRejectsAmplifiedShardBeforePublication(t *testing.T) {
 	store := NewMemoryStore()
 	service, err := New(Options{
 		Blobs: store, Index: store,
-		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
-			return "https://storage.example/object", nil
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+			return signedTestRange("https://storage.example/object"), nil
 		}),
 		Authorizer: AllowAllAuthorizer{},
 		RegistrationLimits: shard.RegistrationLimits{
@@ -641,8 +647,8 @@ func TestReadPlanningRejectsAmplifiedStoredRecipe(t *testing.T) {
 	}
 	reader, err := New(Options{
 		Blobs: store, Index: store, Authorizer: AllowAllAuthorizer{Namespace: "tenant-a"},
-		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
-			return "https://storage.example/object", nil
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+			return signedTestRange("https://storage.example/object"), nil
 		}),
 		RegistrationLimits: shard.RegistrationLimits{MaxChunkReferences: 2},
 	})
@@ -678,8 +684,8 @@ func TestGlobalFileIndexStillRequiresScopedReadAuthorization(t *testing.T) {
 	var authorized AccessRequest
 	reader, err := New(Options{
 		Blobs: store, Index: store,
-		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
-			return "https://storage.example/object", nil
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+			return signedTestRange("https://storage.example/object"), nil
 		}),
 		Authorizer: authorizerFunc(func(_ context.Context, credential string, request AccessRequest) (Grant, error) {
 			authorized = request
@@ -704,6 +710,453 @@ type faultIndex struct {
 	IndexStore
 	mu     sync.Mutex
 	failAt string
+}
+
+type protectionFaultIndex struct {
+	*MemoryStore
+	mu                sync.Mutex
+	failAt            string
+	stageRenewalCount int
+	requireReadLease  bool
+}
+
+type blockingLeaseFinalizationIndex struct {
+	*MemoryStore
+	once     sync.Once
+	started  chan struct{}
+	release  chan struct{}
+	renewals atomic.Int32
+}
+
+func (s *blockingLeaseFinalizationIndex) RenewFileLease(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+	expiresAt time.Time,
+) error {
+	first := false
+	s.once.Do(func() {
+		first = true
+		close(s.started)
+	})
+	if first {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	s.renewals.Add(1)
+	return s.MemoryStore.RenewFileLease(ctx, namespace, id, expiresAt)
+}
+
+func (f *protectionFaultIndex) take(name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failAt == name {
+		f.failAt = ""
+		return errors.New("injected " + name + " failure")
+	}
+	return nil
+}
+
+func (f *protectionFaultIndex) PutXorb(ctx context.Context, record XorbRecord) error {
+	if err := f.take("xorb"); err != nil {
+		return err
+	}
+	return f.MemoryStore.PutXorb(ctx, record)
+}
+
+func (f *protectionFaultIndex) requireLeaseBeforeRead() error {
+	f.mu.Lock()
+	required := f.requireReadLease
+	f.mu.Unlock()
+	if !required {
+		return nil
+	}
+	f.MemoryStore.mu.RLock()
+	defer f.MemoryStore.mu.RUnlock()
+	if len(f.leases) == 0 {
+		return errors.New("read graph traversed before file lease publication")
+	}
+	return nil
+}
+
+func (f *protectionFaultIndex) GetFile(
+	ctx context.Context,
+	namespace string,
+	hash xethash.Hash,
+) (FileRecord, bool, error) {
+	if err := f.requireLeaseBeforeRead(); err != nil {
+		return FileRecord{}, false, err
+	}
+	return f.MemoryStore.GetFile(ctx, namespace, hash)
+}
+
+func (f *protectionFaultIndex) GetXorb(ctx context.Context, hash xethash.Hash) (XorbRecord, bool, error) {
+	if err := f.requireLeaseBeforeRead(); err != nil {
+		return XorbRecord{}, false, err
+	}
+	return f.MemoryStore.GetXorb(ctx, hash)
+}
+
+func (f *protectionFaultIndex) PublishShard(ctx context.Context, publication ShardPublication) error {
+	if err := f.take("shard"); err != nil {
+		return err
+	}
+	return f.MemoryStore.PublishShard(ctx, publication)
+}
+
+func (f *protectionFaultIndex) PutBlobStage(ctx context.Context, stage BlobStage) error {
+	if err := f.take("put-stage"); err != nil {
+		return err
+	}
+	return f.MemoryStore.PutBlobStage(ctx, stage)
+}
+
+func (f *protectionFaultIndex) DeleteBlobStage(ctx context.Context, namespace string, id ProtectionID) error {
+	if err := f.take("delete-stage"); err != nil {
+		return err
+	}
+	return f.MemoryStore.DeleteBlobStage(ctx, namespace, id)
+}
+
+func (f *protectionFaultIndex) RenewBlobStage(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+	expiresAt time.Time,
+) error {
+	f.mu.Lock()
+	f.stageRenewalCount++
+	f.mu.Unlock()
+	if err := f.take("renew-stage"); err != nil {
+		return err
+	}
+	return f.MemoryStore.RenewBlobStage(ctx, namespace, id, expiresAt)
+}
+
+func (f *protectionFaultIndex) PutFileLease(ctx context.Context, lease FileLease) error {
+	if err := f.take("put-lease"); err != nil {
+		return err
+	}
+	return f.MemoryStore.PutFileLease(ctx, lease)
+}
+
+func (f *protectionFaultIndex) RenewFileLease(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+	expiresAt time.Time,
+) error {
+	if err := f.take("renew-lease"); err != nil {
+		return err
+	}
+	return f.MemoryStore.RenewFileLease(ctx, namespace, id, expiresAt)
+}
+
+func (f *protectionFaultIndex) DeleteFileLease(ctx context.Context, namespace string, id ProtectionID) error {
+	if err := f.take("delete-lease"); err != nil {
+		return err
+	}
+	return f.MemoryStore.DeleteFileLease(ctx, namespace, id)
+}
+
+func TestServicePublicationStagesAndReadLeases(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	faults := &protectionFaultIndex{MemoryStore: store, failAt: "xorb"}
+	service := testService(t, store, faults)
+	none, _, value, shardBody := uploadFixture(t)
+
+	if _, err := service.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err == nil {
+		t.Fatal("injected Xorb publication failure succeeded")
+	}
+	stages, err := store.ListBlobStages(ctx, nil, PageRequest{})
+	if err != nil || len(stages.Items) != 1 || stages.Items[0].Blob != (BlobKey{Kind: BlobXorb, Hash: none.Hash}) ||
+		stages.Items[0].Namespace != "tenant-a" {
+		t.Fatalf("failed Xorb stages = %#v, %v", stages, err)
+	}
+	if _, found, err := store.Head(ctx, stages.Items[0].Blob); err != nil || !found {
+		t.Fatalf("staged Xorb blob = %v, %v", found, err)
+	}
+	if _, err := service.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err != nil {
+		t.Fatal(err)
+	}
+	stages, err = store.ListBlobStages(ctx, nil, PageRequest{})
+	if err != nil || len(stages.Items) != 1 {
+		t.Fatalf("repaired Xorb stages = %#v, %v", stages, err)
+	}
+	if err := store.DeleteBlobStage(ctx, stages.Items[0].Namespace, stages.Items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	service.stagingTTL = 15 * time.Millisecond
+	service.now = time.Now
+	service.blobs = faultBlobStore{BlobStore: store, delay: 25 * time.Millisecond}
+	renewedBody, err := shard.EncodeUpload(shard.Shard{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UploadShard(ctx, "", bytes.NewReader(renewedBody), int64(len(renewedBody))); err != nil {
+		t.Fatalf("publication with a renewed stage = %v", err)
+	}
+	faults.mu.Lock()
+	renewalCount := faults.stageRenewalCount
+	faults.mu.Unlock()
+	if renewalCount == 0 {
+		t.Fatal("slow publication did not renew its stage")
+	}
+	faults.failAt = "renew-stage"
+	if _, err := service.UploadShard(ctx, "", bytes.NewReader(renewedBody), int64(len(renewedBody))); err == nil ||
+		!strings.Contains(err.Error(), "renew blob stage") {
+		t.Fatalf("publication after stage renewal failure = %v", err)
+	}
+	service.blobs = store
+	service.stagingTTL = defaultStagingProtectionTTL
+	service.now = func() time.Time { return time.Unix(1_000, 0) }
+	stages, err = store.ListBlobStages(ctx, nil, PageRequest{})
+	if err != nil || len(stages.Items) != 1 {
+		t.Fatalf("stage after renewal failure = %#v, %v", stages, err)
+	}
+	if err := store.DeleteBlobStage(ctx, stages.Items[0].Namespace, stages.Items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	faults.failAt = "shard"
+	if _, err := service.UploadShard(ctx, "", bytes.NewReader(shardBody), int64(len(shardBody))); err == nil {
+		t.Fatal("injected shard publication failure succeeded")
+	}
+	stages, err = store.ListBlobStages(ctx, nil, PageRequest{})
+	if err != nil || len(stages.Items) != 1 || stages.Items[0].Blob.Kind != BlobShard {
+		t.Fatalf("failed shard stages = %#v, %v", stages, err)
+	}
+	if _, err := service.UploadShard(ctx, "", bytes.NewReader(shardBody), int64(len(shardBody))); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteBlobStage(ctx, stages.Items[0].Namespace, stages.Items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	faults.failAt = "put-stage"
+	unstaged, err := xorb.Encode([][]byte{[]byte("must not publish without a stage")}, xorb.None)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, unstaged.Hash,
+		bytes.NewReader(unstaged.Body), int64(len(unstaged.Body))); err == nil {
+		t.Fatal("upload without durable stage succeeded")
+	}
+	if _, found, err := store.Head(ctx, BlobKey{Kind: BlobXorb, Hash: unstaged.Hash}); err != nil || found {
+		t.Fatalf("blob after failed staging = %v, %v", found, err)
+	}
+	faults.failAt = "delete-stage"
+	stale, err := xorb.Encode([][]byte{[]byte("published with stale stage")}, xorb.None)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, stale.Hash,
+		bytes.NewReader(stale.Body), int64(len(stale.Body))); err == nil {
+		t.Fatal("upload with failed stage release succeeded")
+	}
+	if found, err := service.XorbExists(ctx, "", xetcas.DefaultXorbPrefix, stale.Hash); err != nil || !found {
+		t.Fatalf("indexed Xorb after failed stage release = %v, %v", found, err)
+	}
+	stages, err = store.ListBlobStages(ctx, nil, PageRequest{})
+	if err != nil || len(stages.Items) != 1 || stages.Items[0].Blob.Hash != stale.Hash {
+		t.Fatalf("stage after failed release = %#v, %v", stages, err)
+	}
+	if err := store.DeleteBlobStage(ctx, stages.Items[0].Namespace, stages.Items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	fileHash := value.Files[0].Hash
+	faults.mu.Lock()
+	faults.requireReadLease = true
+	faults.mu.Unlock()
+	signedExpiry := service.now().Add(5 * time.Minute)
+	service.signer = RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+		return SignedRange{
+			URL:       "https://storage.example/object",
+			ExpiresAt: time.Unix(0, int64(^uint64(0)>>1)).Add(-time.Minute),
+		}, nil
+	})
+	if _, err := service.ReconstructionV2(ctx, "", fileHash, nil); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("signed URL whose lease grace overflows = %v", err)
+	}
+	service.signer = RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+		if err := faults.requireLeaseBeforeRead(); err != nil {
+			return SignedRange{}, err
+		}
+		return SignedRange{URL: "https://storage.example/object", ExpiresAt: signedExpiry}, nil
+	})
+	if _, err := service.ReconstructionV2(ctx, "", fileHash, nil); err != nil {
+		t.Fatal(err)
+	}
+	leases, err := store.ListFileLeases(ctx, nil, PageRequest{})
+	if err != nil || len(leases.Items) != 1 || leases.Items[0].Namespace != "tenant-a" || leases.Items[0].File != fileHash {
+		t.Fatalf("detached reconstruction leases = %#v, %v", leases, err)
+	}
+	if want := signedExpiry.Add(service.readLeaseTTL); !leases.Items[0].ExpiresAt.Equal(want) {
+		t.Fatalf("signed reconstruction lease expires at %v, want %v", leases.Items[0].ExpiresAt, want)
+	}
+	if err := store.DeleteFileLease(ctx, leases.Items[0].Namespace, leases.Items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ReconstructionV2(ctx, "", xethash.Chunk([]byte("missing protected file")), nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing file reconstruction = %v", err)
+	}
+	if _, err := service.OpenFile(ctx, "", xethash.Chunk([]byte("missing protected stream")), nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing file stream = %v", err)
+	}
+	leases, err = store.ListFileLeases(ctx, nil, PageRequest{})
+	if err != nil || len(leases.Items) != 0 {
+		t.Fatalf("provisional leases after failed planning = %#v, %v", leases, err)
+	}
+	if _, err := service.FileChunkHashes(ctx, "", fileHash, []xetcas.FileRange{{Start: 0, End: 1}}); err != nil {
+		t.Fatalf("protected chunk-hash plan = %v", err)
+	}
+	leases, err = store.ListFileLeases(ctx, nil, PageRequest{})
+	if err != nil || len(leases.Items) != 0 {
+		t.Fatalf("leases after chunk-hash planning = %#v, %v", leases, err)
+	}
+	faults.failAt = "delete-lease"
+	if _, err := service.FileChunkHashes(ctx, "", fileHash, []xetcas.FileRange{{Start: 0, End: 1}}); err == nil ||
+		!strings.Contains(err.Error(), "release file read lease") {
+		t.Fatalf("chunk-hash lease cleanup failure = %v", err)
+	}
+	leases, err = store.ListFileLeases(ctx, nil, PageRequest{})
+	if err != nil || len(leases.Items) != 1 {
+		t.Fatalf("lease after failed chunk-hash cleanup = %#v, %v", leases, err)
+	}
+	if err := store.DeleteFileLease(ctx, leases.Items[0].Namespace, leases.Items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := service.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leases, err = store.ListFileLeases(ctx, nil, PageRequest{})
+	if err != nil || len(leases.Items) != 1 {
+		t.Fatalf("active read leases = %#v, %v", leases, err)
+	}
+	if err := opened.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	leases, err = store.ListFileLeases(ctx, nil, PageRequest{})
+	if err != nil || len(leases.Items) != 0 {
+		t.Fatalf("leases after active read close = %#v, %v", leases, err)
+	}
+
+	faults.failAt = "put-lease"
+	if _, err := service.ReconstructionV1(ctx, "", fileHash, nil); err == nil {
+		t.Fatal("signed reconstruction without lease succeeded")
+	}
+	faults.failAt = "put-lease"
+	if _, err := service.OpenFile(ctx, "", fileHash, nil); err == nil {
+		t.Fatal("typed stream without lease succeeded")
+	}
+	faults.failAt = "renew-lease"
+	if _, err := service.ReconstructionV1(ctx, "", fileHash, nil); err == nil ||
+		!strings.Contains(err.Error(), "finalize signed reconstruction lease") {
+		t.Fatalf("signed reconstruction after final lease renewal failure = %v", err)
+	}
+	leases, err = store.ListFileLeases(ctx, nil, PageRequest{})
+	if err != nil || len(leases.Items) != 0 {
+		t.Fatalf("leases after failed signed-lease finalization = %#v, %v", leases, err)
+	}
+	faults.failAt = "delete-lease"
+	opened, err = service.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(opened.Body); err == nil {
+		t.Fatal("read with failed lease release succeeded")
+	}
+	_ = opened.Body.Close()
+	faults.failAt = "delete-lease"
+	opened, err = service.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Body.Close(); err == nil || !strings.Contains(err.Error(), "release file read lease") {
+		t.Fatalf("early close after failed lease release = %v", err)
+	}
+
+	faults.failAt = "renew-lease"
+	service.readLeaseTTL = 30 * time.Millisecond
+	opened, err = service.OpenFile(ctx, "", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if _, err := io.ReadAll(opened.Body); err == nil || !strings.Contains(err.Error(), "renew file read lease") {
+		t.Fatalf("read after lease renewal failure = %v", err)
+	}
+	_ = opened.Body.Close()
+}
+
+func TestSignedLeaseFinalizationKeepsHeartbeatActive(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	index := &blockingLeaseFinalizationIndex{
+		MemoryStore: store, started: make(chan struct{}), release: make(chan struct{}),
+	}
+	service := testService(t, store, index)
+	service.readLeaseTTL = 30 * time.Millisecond
+	service.now = time.Now
+	none, _, value, shardBody := uploadFixture(t)
+	if _, err := service.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UploadShard(ctx, "", bytes.NewReader(shardBody), int64(len(shardBody))); err != nil {
+		t.Fatal(err)
+	}
+	service.signer = RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+		return SignedRange{URL: "https://storage.example/object", ExpiresAt: time.Now().Add(time.Minute)}, nil
+	})
+	result := make(chan error, 1)
+	go func() {
+		_, err := service.ReconstructionV2(ctx, "", value.Files[0].Hash, nil)
+		result <- err
+	}()
+	select {
+	case <-index.started:
+	case <-time.After(time.Second):
+		t.Fatal("signed lease finalization did not start")
+	}
+	time.Sleep(45 * time.Millisecond)
+	leases, err := store.ListFileLeases(ctx, nil, PageRequest{})
+	if err != nil || len(leases.Items) != 1 || !leases.Items[0].ExpiresAt.After(time.Now()) || index.renewals.Load() == 0 {
+		t.Fatalf("lease while finalization blocked = %#v, renewals %d, %v", leases, index.renewals.Load(), err)
+	}
+	close(index.release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	leases, err = store.ListFileLeases(ctx, nil, PageRequest{})
+	if err != nil || len(leases.Items) != 1 {
+		t.Fatalf("detached lease after finalization = %#v, %v", leases, err)
+	}
+	if err := store.DeleteFileLease(ctx, leases.Items[0].Namespace, leases.Items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCancelReadCloserReturnsSettledStreamError(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer writer.Close() //nolint:errcheck // Test cleanup.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	settlement := &openFileSettlement{done: make(chan struct{})}
+	streamError := fmt.Errorf("%w: settled before close", ErrCorrupt)
+	settlement.finish(streamError, nil)
+	body := &cancelReadCloser{PipeReader: reader, ctx: ctx, cancel: cancel, settlement: settlement}
+	if err := body.Close(); !errors.Is(err, streamError) {
+		t.Fatalf("close after settled stream error = %v", err)
+	}
 }
 
 func (f *faultIndex) take(name string) error {

@@ -93,8 +93,11 @@ func TestOfficialRustClientGoCASRoundTrip(t *testing.T) {
 	service, err := cas_server.New(cas_server.Options{
 		Blobs: store,
 		Index: store,
-		Signer: cas_server.RangeURLSignerFunc(func(_ context.Context, key cas_server.BlobKey, _ xetcas.HTTPRange) (string, error) {
-			return storage.URL + "/" + string(key.Kind) + "/" + key.Hash.String() + "?signed=1", nil
+		Signer: cas_server.RangeURLSignerFunc(func(_ context.Context, key cas_server.BlobKey, _ xetcas.HTTPRange) (cas_server.SignedRange, error) {
+			return cas_server.SignedRange{
+				URL:       storage.URL + "/" + string(key.Kind) + "/" + key.Hash.String() + "?signed=1",
+				ExpiresAt: time.Unix(2_000_003_600, 0),
+			}, nil
 		}),
 		Authorizer:         cas_server.StaticTokenAuthorizer{Token: "official-rust-token", Namespace: "rust-client"},
 		DedupProtectionKey: xethash.Chunk([]byte("official Rust client test key")),

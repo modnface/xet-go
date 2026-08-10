@@ -1111,6 +1111,466 @@ func TestSQLiteIndexListerQueryPlans(t *testing.T) {
 	}
 }
 
+func testProtectionID(value uint16) ProtectionID {
+	var id ProtectionID
+	id[len(id)-2], id[len(id)-1] = byte(value>>8), byte(value)
+	return id
+}
+
+func runProtectionStoreContract(t *testing.T, store ProtectionStore) {
+	t.Helper()
+	ctx := context.Background()
+	createdAt := time.Date(2026, time.August, 10, 12, 0, 0, 123, time.FixedZone("test", 3600))
+	expiresAt := createdAt.Add(time.Hour)
+	if err := store.PutBlobStage(ctx, BlobStage{}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid blob stage = %v", err)
+	}
+	if err := store.PutFileLease(ctx, FileLease{}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid file lease = %v", err)
+	}
+	for name, invalid := range map[string]BlobStage{
+		"kind": {
+			ID: testProtectionID(910), Blob: BlobKey{Kind: "invalid"},
+			CreatedAt: createdAt, ExpiresAt: expiresAt,
+		},
+		"creation": {
+			ID: testProtectionID(911), Blob: BlobKey{Kind: BlobXorb}, ExpiresAt: expiresAt,
+		},
+		"expiration": {
+			ID: testProtectionID(912), Blob: BlobKey{Kind: BlobXorb}, CreatedAt: createdAt,
+		},
+		"reversed": {
+			ID: testProtectionID(913), Blob: BlobKey{Kind: BlobXorb},
+			CreatedAt: createdAt, ExpiresAt: createdAt.Add(-time.Second),
+		},
+	} {
+		if err := store.PutBlobStage(ctx, invalid); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("invalid blob stage %s = %v", name, err)
+		}
+	}
+	for name, invalid := range map[string]FileLease{
+		"creation":   {ID: testProtectionID(920), ExpiresAt: expiresAt},
+		"expiration": {ID: testProtectionID(921), CreatedAt: createdAt},
+		"reversed": {
+			ID: testProtectionID(922), CreatedAt: createdAt, ExpiresAt: createdAt.Add(-time.Second),
+		},
+	} {
+		if err := store.PutFileLease(ctx, invalid); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("invalid file lease %s = %v", name, err)
+		}
+	}
+	outOfRange := time.Date(3000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	if err := store.PutBlobStage(ctx, BlobStage{
+		ID: testProtectionID(900), Blob: BlobKey{Kind: BlobXorb},
+		CreatedAt: createdAt, ExpiresAt: outOfRange,
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("out-of-range blob stage = %v", err)
+	}
+	if err := store.PutFileLease(ctx, FileLease{
+		ID: testProtectionID(901), CreatedAt: createdAt, ExpiresAt: outOfRange,
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("out-of-range file lease = %v", err)
+	}
+
+	namespaces := []string{"", "alpha", "beta"}
+	wantStages, wantLeases := 0, 0
+	for namespaceIndex, namespace := range namespaces {
+		for i := range 3 {
+			value := uint16(namespaceIndex*10 + i + 1)
+			id := testProtectionID(value)
+			hash := xethash.Chunk([]byte(fmt.Sprintf("protection %s %d", namespace, i)))
+			stage := BlobStage{
+				ID: id, Namespace: namespace, Blob: BlobKey{Kind: BlobXorb, Hash: hash},
+				CreatedAt: createdAt, ExpiresAt: expiresAt,
+			}
+			if err := store.PutBlobStage(ctx, stage); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.PutBlobStage(ctx, stage); err != nil {
+				t.Fatalf("idempotent blob stage = %v", err)
+			}
+			lease := FileLease{
+				ID: id, Namespace: namespace, File: hash,
+				CreatedAt: createdAt, ExpiresAt: expiresAt,
+			}
+			if err := store.PutFileLease(ctx, lease); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.PutFileLease(ctx, lease); err != nil {
+				t.Fatalf("idempotent file lease = %v", err)
+			}
+			wantStages++
+			wantLeases++
+		}
+	}
+
+	conflictingStage := BlobStage{
+		ID: testProtectionID(1), Blob: BlobKey{Kind: BlobShard}, CreatedAt: createdAt, ExpiresAt: expiresAt,
+	}
+	if err := store.PutBlobStage(ctx, conflictingStage); !errors.Is(err, ErrConflict) {
+		t.Fatalf("retargeted blob stage = %v", err)
+	}
+	conflictingLease := FileLease{
+		ID: testProtectionID(1), File: xethash.Chunk([]byte("retargeted lease")),
+		CreatedAt: createdAt, ExpiresAt: expiresAt,
+	}
+	if err := store.PutFileLease(ctx, conflictingLease); !errors.Is(err, ErrConflict) {
+		t.Fatalf("retargeted file lease = %v", err)
+	}
+	if err := store.RenewBlobStage(ctx, "", testProtectionID(1), expiresAt.Add(-time.Minute)); err != nil {
+		t.Fatalf("shortening stage renewal = %v", err)
+	}
+	extendedStage := expiresAt.Add(30 * time.Minute)
+	if err := store.RenewBlobStage(ctx, "", testProtectionID(1), extendedStage); err != nil {
+		t.Fatalf("extending stage renewal = %v", err)
+	}
+	if err := store.RenewBlobStage(ctx, "missing", testProtectionID(500), extendedStage); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing stage renewal = %v", err)
+	}
+	if err := store.RenewFileLease(ctx, "", testProtectionID(1), expiresAt.Add(-time.Minute)); err != nil {
+		t.Fatalf("shortening renewal = %v", err)
+	}
+	extended := expiresAt.Add(time.Hour)
+	if err := store.RenewFileLease(ctx, "", testProtectionID(1), extended); err != nil {
+		t.Fatalf("extending renewal = %v", err)
+	}
+	if err := store.RenewFileLease(ctx, "missing", testProtectionID(500), extended); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing renewal = %v", err)
+	}
+
+	countStages := func(namespace *string) (int, map[ProtectionID]BlobStage, string) {
+		t.Helper()
+		count, cursor := 0, ""
+		records := make(map[ProtectionID]BlobStage)
+		for {
+			page, err := store.ListBlobStages(ctx, namespace, PageRequest{Cursor: cursor, Limit: 2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, stage := range page.Items {
+				records[stage.ID] = stage
+			}
+			count += len(page.Items)
+			if page.NextCursor == "" {
+				return count, records, cursor
+			}
+			cursor = page.NextCursor
+		}
+	}
+	countLeases := func(namespace *string) (int, map[ProtectionID]FileLease, string) {
+		t.Helper()
+		count, cursor := 0, ""
+		records := make(map[ProtectionID]FileLease)
+		for {
+			page, err := store.ListFileLeases(ctx, namespace, PageRequest{Cursor: cursor, Limit: 2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, lease := range page.Items {
+				records[lease.ID] = lease
+			}
+			count += len(page.Items)
+			if page.NextCursor == "" {
+				return count, records, cursor
+			}
+			cursor = page.NextCursor
+		}
+	}
+	stageCount, stages, stageCursor := countStages(nil)
+	leaseCount, leases, leaseCursor := countLeases(nil)
+	if stageCount != wantStages || leaseCount != wantLeases {
+		t.Fatalf("stage/lease counts = %d/%d, want %d/%d", stageCount, leaseCount, wantStages, wantLeases)
+	}
+	if got := leases[testProtectionID(1)].ExpiresAt; !got.Equal(extended) {
+		t.Fatalf("renewed lease expiration = %v, want %v", got, extended)
+	}
+	if got := stages[testProtectionID(1)].ExpiresAt; !got.Equal(extendedStage) {
+		t.Fatalf("renewed stage expiration = %v, want %v", got, extendedStage)
+	}
+	for _, namespace := range namespaces {
+		if count, _, _ := countStages(&namespace); count != 3 {
+			t.Fatalf("namespace %q stage count = %d", namespace, count)
+		}
+		if count, _, _ := countLeases(&namespace); count != 3 {
+			t.Fatalf("namespace %q lease count = %d", namespace, count)
+		}
+	}
+	if _, err := store.ListFileLeases(ctx, nil, PageRequest{Cursor: stageCursor, Limit: 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cross-method protection cursor = %v", err)
+	}
+	alpha := "alpha"
+	if _, err := store.ListFileLeases(ctx, &alpha, PageRequest{Cursor: leaseCursor, Limit: 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cross-filter protection cursor = %v", err)
+	}
+	if _, err := store.ListBlobStages(ctx, nil, PageRequest{Cursor: "bad"}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("malformed stage cursor = %v", err)
+	}
+	if _, err := store.ListFileLeases(ctx, nil, PageRequest{Limit: MaxPageSize + 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("oversized lease page = %v", err)
+	}
+
+	if err := store.DeleteBlobStage(ctx, "", testProtectionID(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteBlobStage(ctx, "", testProtectionID(1)); err != nil {
+		t.Fatalf("idempotent stage delete = %v", err)
+	}
+	if err := store.DeleteFileLease(ctx, "", testProtectionID(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteFileLease(ctx, "", testProtectionID(1)); err != nil {
+		t.Fatalf("idempotent lease delete = %v", err)
+	}
+	if count, _, _ := countStages(nil); count != wantStages-1 {
+		t.Fatalf("stage count after delete = %d", count)
+	}
+	if count, _, _ := countLeases(nil); count != wantLeases-1 {
+		t.Fatalf("lease count after delete = %d", count)
+	}
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	validStage := BlobStage{
+		ID: testProtectionID(930), Blob: BlobKey{Kind: BlobXorb},
+		CreatedAt: createdAt, ExpiresAt: expiresAt,
+	}
+	validLease := FileLease{
+		ID: testProtectionID(931), CreatedAt: createdAt, ExpiresAt: expiresAt,
+	}
+	for name, call := range map[string]func() error{
+		"put stage":    func() error { return store.PutBlobStage(canceled, validStage) },
+		"renew stage":  func() error { return store.RenewBlobStage(canceled, "", testProtectionID(2), extended) },
+		"delete stage": func() error { return store.DeleteBlobStage(canceled, "", testProtectionID(2)) },
+		"put lease":    func() error { return store.PutFileLease(canceled, validLease) },
+		"renew lease":  func() error { return store.RenewFileLease(canceled, "", testProtectionID(2), extended) },
+		"delete lease": func() error { return store.DeleteFileLease(canceled, "", testProtectionID(2)) },
+	} {
+		if err := call(); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled %s = %v", name, err)
+		}
+	}
+	if err := store.RenewBlobStage(ctx, "", testProtectionID(2), time.Time{}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid stage renewal time = %v", err)
+	}
+	if err := store.RenewFileLease(ctx, "", testProtectionID(2), time.Time{}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid lease renewal time = %v", err)
+	}
+	if _, err := store.ListBlobStages(canceled, nil, PageRequest{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled stage list = %v", err)
+	}
+	if _, err := store.ListFileLeases(canceled, nil, PageRequest{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled lease list = %v", err)
+	}
+	if memory, ok := store.(*MemoryStore); ok {
+		if err := memory.PutBlobStage(
+			&cancelAfterCheckContext{Context: ctx, after: 2}, validStage,
+		); !errors.Is(err, context.Canceled) {
+			t.Fatalf("blob-stage cancellation after lock = %v", err)
+		}
+		if err := memory.PutFileLease(
+			&cancelAfterCheckContext{Context: ctx, after: 2}, validLease,
+		); !errors.Is(err, context.Canceled) {
+			t.Fatalf("file-lease cancellation after lock = %v", err)
+		}
+		if err := memory.RenewBlobStage(
+			&cancelAfterCheckContext{Context: ctx, after: 2}, "", testProtectionID(2), extended,
+		); !errors.Is(err, context.Canceled) {
+			t.Fatalf("blob-stage renewal cancellation after lock = %v", err)
+		}
+		if err := memory.DeleteBlobStage(
+			&cancelAfterCheckContext{Context: ctx, after: 2}, "", testProtectionID(2),
+		); !errors.Is(err, context.Canceled) {
+			t.Fatalf("blob-stage deletion cancellation after lock = %v", err)
+		}
+		if err := memory.RenewFileLease(
+			&cancelAfterCheckContext{Context: ctx, after: 2}, "", testProtectionID(2), extended,
+		); !errors.Is(err, context.Canceled) {
+			t.Fatalf("file-lease renewal cancellation after lock = %v", err)
+		}
+		if err := memory.DeleteFileLease(
+			&cancelAfterCheckContext{Context: ctx, after: 2}, "", testProtectionID(2),
+		); !errors.Is(err, context.Canceled) {
+			t.Fatalf("file-lease deletion cancellation after lock = %v", err)
+		}
+		if _, err := memory.ListBlobStages(
+			&cancelAfterCheckContext{Context: ctx, after: 2}, nil, PageRequest{},
+		); !errors.Is(err, context.Canceled) {
+			t.Fatalf("blob-stage cancellation during scan = %v", err)
+		}
+		if _, err := memory.ListFileLeases(
+			&cancelAfterCheckContext{Context: ctx, after: 2}, nil, PageRequest{},
+		); !errors.Is(err, context.Canceled) {
+			t.Fatalf("file-lease cancellation during scan = %v", err)
+		}
+	}
+}
+
+func TestProtectionStoreContracts(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		runProtectionStoreContract(t, NewMemoryStore())
+	})
+	t.Run("sqlite", func(t *testing.T) {
+		requireLocalDurability(t)
+		store, err := OpenSQLiteIndexStore(filepath.Join(t.TempDir(), "index.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close() //nolint:errcheck // Test cleanup.
+		runProtectionStoreContract(t, store)
+	})
+}
+
+func TestSQLiteProtectionStoreRestart(t *testing.T) {
+	requireLocalDurability(t)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "index.db")
+	store, err := OpenSQLiteIndexStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, time.August, 10, 14, 0, 0, 0, time.UTC)
+	stage := BlobStage{
+		ID: testProtectionID(100), Namespace: "scope",
+		Blob:      BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("restart stage"))},
+		CreatedAt: createdAt, ExpiresAt: createdAt.Add(time.Hour),
+	}
+	lease := FileLease{
+		ID: testProtectionID(101), Namespace: "scope", File: xethash.Chunk([]byte("restart lease")),
+		CreatedAt: createdAt, ExpiresAt: createdAt.Add(time.Hour),
+	}
+	if err := store.PutBlobStage(ctx, stage); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutFileLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenSQLiteIndexStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close() //nolint:errcheck // Test cleanup.
+	stages, err := store.ListBlobStages(ctx, nil, PageRequest{})
+	if err != nil || len(stages.Items) != 1 || stages.Items[0] != stage {
+		t.Fatalf("reopened stages = %#v, %v", stages, err)
+	}
+	leases, err := store.ListFileLeases(ctx, nil, PageRequest{})
+	if err != nil || len(leases.Items) != 1 || leases.Items[0] != lease {
+		t.Fatalf("reopened leases = %#v, %v", leases, err)
+	}
+}
+
+func TestSQLiteProtectionStoreCorruption(t *testing.T) {
+	requireLocalDurability(t)
+	ctx := context.Background()
+	createdAt := time.Date(2026, time.August, 10, 14, 0, 0, 0, time.UTC)
+	stage := BlobStage{
+		ID: testProtectionID(300), Namespace: "scope",
+		Blob:      BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("corrupt stage"))},
+		CreatedAt: createdAt, ExpiresAt: createdAt.Add(time.Hour),
+	}
+	lease := FileLease{
+		ID: testProtectionID(301), Namespace: "scope", File: xethash.Chunk([]byte("corrupt lease")),
+		CreatedAt: createdAt, ExpiresAt: createdAt.Add(time.Hour),
+	}
+	for _, test := range []struct {
+		name    string
+		prepare func(*SQLiteIndexStore) error
+		corrupt string
+		check   func(*SQLiteIndexStore) error
+	}{
+		{
+			name: "stage put validates conflict", prepare: func(store *SQLiteIndexStore) error {
+				return store.PutBlobStage(ctx, stage)
+			},
+			corrupt: "UPDATE blob_stages SET created_at = X'01'",
+			check:   func(store *SQLiteIndexStore) error { return store.PutBlobStage(ctx, stage) },
+		},
+		{
+			name: "stage renewal validates result", prepare: func(store *SQLiteIndexStore) error {
+				return store.PutBlobStage(ctx, stage)
+			},
+			corrupt: "UPDATE blob_stages SET expires_at = X'01'",
+			check: func(store *SQLiteIndexStore) error {
+				return store.RenewBlobStage(ctx, stage.Namespace, stage.ID, stage.ExpiresAt.Add(time.Hour))
+			},
+		},
+		{
+			name: "lease put validates conflict", prepare: func(store *SQLiteIndexStore) error {
+				return store.PutFileLease(ctx, lease)
+			},
+			corrupt: "UPDATE file_leases SET created_at = X'01'",
+			check:   func(store *SQLiteIndexStore) error { return store.PutFileLease(ctx, lease) },
+		},
+		{
+			name: "lease renewal validates result", prepare: func(store *SQLiteIndexStore) error {
+				return store.PutFileLease(ctx, lease)
+			},
+			corrupt: "UPDATE file_leases SET expires_at = X'01'",
+			check: func(store *SQLiteIndexStore) error {
+				return store.RenewFileLease(ctx, lease.Namespace, lease.ID, lease.ExpiresAt.Add(time.Hour))
+			},
+		},
+		{
+			name: "stage listing validates kind", prepare: func(store *SQLiteIndexStore) error {
+				return store.PutBlobStage(ctx, stage)
+			},
+			corrupt: "UPDATE blob_stages SET blob_kind = 'invalid'",
+			check: func(store *SQLiteIndexStore) error {
+				_, err := store.ListBlobStages(ctx, nil, PageRequest{})
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := OpenSQLiteIndexStore(filepath.Join(t.TempDir(), "index.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close() //nolint:errcheck // Test cleanup.
+			if err := test.prepare(store); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.ExecContext(ctx, "PRAGMA ignore_check_constraints=ON"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.ExecContext(ctx, test.corrupt); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.check(store); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("corrupt lifecycle operation = %v", err)
+			}
+		})
+	}
+
+	t.Run("backend errors", func(t *testing.T) {
+		store, err := OpenSQLiteIndexStore(filepath.Join(t.TempDir(), "index.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close() //nolint:errcheck // Test cleanup.
+		if _, err := store.db.ExecContext(ctx, "DROP TABLE blob_stages; DROP TABLE file_leases"); err != nil {
+			t.Fatal(err)
+		}
+		for name, call := range map[string]func() error{
+			"put stage":    func() error { return store.PutBlobStage(ctx, stage) },
+			"renew stage":  func() error { return store.RenewBlobStage(ctx, stage.Namespace, stage.ID, stage.ExpiresAt) },
+			"delete stage": func() error { return store.DeleteBlobStage(ctx, stage.Namespace, stage.ID) },
+			"list stages":  func() error { _, err := store.ListBlobStages(ctx, nil, PageRequest{}); return err },
+			"put lease":    func() error { return store.PutFileLease(ctx, lease) },
+			"renew lease":  func() error { return store.RenewFileLease(ctx, lease.Namespace, lease.ID, lease.ExpiresAt) },
+			"delete lease": func() error { return store.DeleteFileLease(ctx, lease.Namespace, lease.ID) },
+			"list leases":  func() error { _, err := store.ListFileLeases(ctx, nil, PageRequest{}); return err },
+		} {
+			if err := call(); err == nil {
+				t.Fatalf("%s against missing table succeeded", name)
+			}
+		}
+	})
+}
+
 func TestFilesystemBlobStoreRestartRecoveryAndSafety(t *testing.T) {
 	requireLocalDurability(t)
 	barrierRoot := t.TempDir()
@@ -2175,7 +2635,93 @@ INSERT INTO sha256_associations(namespace, sum, size, file_hash) VALUES(?, ?, ?,
 		}
 		if _, err := store.db.ExecContext(ctx,
 			"INSERT INTO xorbs(hash, record) VALUES(?, ?)", strings.Repeat("x", 32), []byte("{}")); err == nil {
-			t.Fatal("version two schema accepted a text hash")
+			t.Fatal("current schema accepted a text hash")
+		}
+	})
+
+	t.Run("version two migration", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "index.db")
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, sqliteSchemaV1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, sqliteSchemaV2); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
+			t.Fatal(err)
+		}
+		hash := xethash.Chunk([]byte("preserved version two Xorb"))
+		record := XorbRecord{Blob: BlobKey{Kind: BlobXorb, Hash: hash}, Layout: xorb.Ingested{Hash: hash}}
+		encoded, err := encodeIndexRecord(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, "INSERT INTO xorbs(hash, record) VALUES(?, ?)", hashBytes(hash), encoded); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		store, err := OpenSQLiteIndexStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close() //nolint:errcheck // Test cleanup.
+		createdAt := time.Date(2026, time.August, 10, 15, 0, 0, 0, time.UTC)
+		if err := store.PutFileLease(ctx, FileLease{
+			ID: testProtectionID(200), Namespace: "migrated", File: xethash.Zero,
+			CreatedAt: createdAt, ExpiresAt: createdAt.Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var version int
+		if err := store.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != sqliteSchemaVersion {
+			t.Fatalf("version two migration result = %d, %v", version, err)
+		}
+		if got, found, err := store.GetXorb(ctx, hash); err != nil || !found || !reflect.DeepEqual(got, record) {
+			t.Fatalf("version two row after migration = %#v, %v, %v", got, found, err)
+		}
+	})
+
+	t.Run("version two failed migration rolls back", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "index.db")
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, sqliteSchemaV1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, sqliteSchemaV2); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, "CREATE TABLE blob_stages(conflict INTEGER); PRAGMA user_version = 2"); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenSQLiteIndexStore(path); err == nil {
+			t.Fatal("conflicting version two migration succeeded")
+		}
+		db, err = sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close() //nolint:errcheck // Test cleanup.
+		var version int
+		if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 2 {
+			t.Fatalf("rolled-back version = %d, %v", version, err)
+		}
+		var columns int
+		if err := db.QueryRowContext(ctx,
+			"SELECT count(*) FROM pragma_table_info('blob_stages') WHERE name = 'conflict'",
+		).Scan(&columns); err != nil || columns != 1 {
+			t.Fatalf("pre-migration table after rollback = %d, %v", columns, err)
 		}
 	})
 
@@ -2408,6 +2954,15 @@ func TestSQLiteIndexStoreClosedErrors(t *testing.T) {
 	record := XorbRecord{Blob: BlobKey{Kind: BlobXorb, Hash: hash}, Layout: xorb.Ingested{Hash: hash}}
 	file := FileRecord{File: shard.RegisteredFile{File: shard.File{Hash: hash}}}
 	sum := [32]byte{1}
+	createdAt := time.Date(2026, time.August, 10, 15, 0, 0, 0, time.UTC)
+	stage := BlobStage{
+		ID: testProtectionID(400), Namespace: "scope", Blob: BlobKey{Kind: BlobXorb, Hash: hash},
+		CreatedAt: createdAt, ExpiresAt: createdAt.Add(time.Hour),
+	}
+	lease := FileLease{
+		ID: testProtectionID(401), Namespace: "scope", File: hash,
+		CreatedAt: createdAt, ExpiresAt: createdAt.Add(time.Hour),
+	}
 	operations := []struct {
 		name string
 		call func() error
@@ -2421,6 +2976,18 @@ func TestSQLiteIndexStoreClosedErrors(t *testing.T) {
 		{"resolve SHA", func() error { _, _, err := store.ResolveSHA256(ctx, "scope", sum, 1); return err }},
 		{"put SHA", func() error { return store.PutSHA256(ctx, "scope", sum, 1, hash) }},
 		{"publish", func() error { return store.PublishShard(ctx, ShardPublication{}) }},
+		{"put stage", func() error { return store.PutBlobStage(ctx, stage) }},
+		{"renew stage", func() error {
+			return store.RenewBlobStage(ctx, stage.Namespace, stage.ID, stage.ExpiresAt.Add(time.Hour))
+		}},
+		{"delete stage", func() error { return store.DeleteBlobStage(ctx, stage.Namespace, stage.ID) }},
+		{"list stages", func() error { _, err := store.ListBlobStages(ctx, nil, PageRequest{}); return err }},
+		{"put lease", func() error { return store.PutFileLease(ctx, lease) }},
+		{"renew lease", func() error {
+			return store.RenewFileLease(ctx, lease.Namespace, lease.ID, lease.ExpiresAt.Add(time.Hour))
+		}},
+		{"delete lease", func() error { return store.DeleteFileLease(ctx, lease.Namespace, lease.ID) }},
+		{"list leases", func() error { _, err := store.ListFileLeases(ctx, nil, PageRequest{}); return err }},
 	}
 	for _, operation := range operations {
 		if err := operation.call(); err == nil {
@@ -2448,8 +3015,8 @@ func TestDurableCASServiceRoundTripAcrossRestart(t *testing.T) {
 		service, err := New(Options{
 			Blobs: blobs, Index: index,
 			Authorizer: AllowAllAuthorizer{Namespace: "durable"},
-			Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
-				return "https://storage.example/object", nil
+			Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+				return signedTestRange("https://storage.example/object"), nil
 			}),
 			DedupProtectionKey: xethash.Chunk([]byte("durable key")),
 		})

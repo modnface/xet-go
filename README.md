@@ -203,19 +203,32 @@ cas, err := server.New(server.Options{
 Filesystem writes use exact-length temporary files, file sync, non-replacing
 hard-link publication, and directory durability barriers. SQLite uses WAL,
 `synchronous=FULL`, immediate write transactions, and one atomic
-`PublishShard` transaction. Schema version 2 enforces SQLite storage classes as
-well as key lengths, so text/blob aliases cannot split one logical index key.
-Both constructors reject symlinked leaf paths and
-return `ErrDurabilityUnsupported` without modifying their target on platforms
-where strict directory durability is not implemented. Cross-store staging and
-garbage collection are not yet implemented: a failed SQL publication can leave
-an unreachable immutable blob, but cannot expose a partial logical file.
+`PublishShard` transaction. Schema version 3 enforces SQLite storage classes as
+well as key lengths and adds durable namespace-scoped blob stages and file read
+leases. Both constructors reject symlinked leaf paths and return
+`ErrDurabilityUnsupported` without modifying their target on platforms where
+strict directory durability is not implemented.
 
-Stores may additionally implement `BlobLister` and `IndexLister` for bounded,
-keyset-paginated operational scans. The memory, filesystem, and SQLite stores
-provide these capabilities for blobs, Xorbs, namespace-scoped files and dedup
-records, and namespace-scoped SHA associations. Cursors are opaque and tied to
-one operation, blob kind, and namespace-filter mode. SQLite seeks through its
+When the index implements `ProtectionStore`, the service durably stages each
+Xorb or shard before writing its immutable blob, renews that stage throughout a
+slow publication, and removes it only after logical index publication. A failed
+or ambiguously completed publication conservatively leaves the stage for future
+recovery and reachability-aware cleanup. Active typed reads acquire and renew a
+file lease before traversing the reconstruction graph. Signed reconstruction
+responses retain a detached lease through the maximum `SignedRange.ExpiresAt`
+returned by the signer plus `ReadLeaseTTL` as a grace interval. This is why a
+`RangeURLSigner` must return both the URL and its authoritative expiration.
+Reachability audit and destructive garbage collection are not yet implemented;
+expired protection records must not be treated as permission to delete bytes
+without the documented age/grace and reachability checks.
+
+Stores may additionally implement `BlobLister`, `IndexLister`, and
+`ProtectionStore` for bounded, keyset-paginated operational scans and lifecycle
+roots. The memory, filesystem, and SQLite stores collectively provide these
+capabilities for blobs, Xorbs, namespace-scoped files and dedup records,
+namespace-scoped SHA associations, blob stages, and file leases.
+Cursors are opaque and tied to one operation, blob kind, and namespace-filter
+mode. SQLite seeks through its
 composite primary keys; filesystem scans seek the two-level hash-prefix tree
 and stop after finding one page, while reading and sorting one
 four-hex-character leaf as the smallest unit of work. Listers expose physical
@@ -239,12 +252,15 @@ _, err = io.Copy(destination, opened.Body)
 `OpenFile` uses the same bounded reconstruction planner as the wire routes,
 coalesces safe adjacent Xorb reads, validates every decoded chunk and length,
 verifies a present SHA-256 for complete coverage, and propagates cancellation
-while closing active backend readers.
+while closing active backend readers. Where lifecycle protection is available,
+the lease is durable before the first file/index lookup and lease renewal or
+cleanup failures are propagated through the stream and `Body.Close`.
 
 Xorb bodies are decoded and identity-checked before canonical complete storage.
 Shard registration resolves durable xorb metadata and recomputes term and file
 identities instead of trusting client accounting. Publication writes the full
-shard, then atomically publishes its scoped dedup, SHA, and file indexes. v2
+shard under a renewable durable stage, then atomically publishes its scoped
+dedup, SHA, and file indexes. v2
 shard responses stream NDJSON heartbeats and a terminal result or error.
 Registration has configurable file, xorb, term, and aggregate chunk-reference
 budgets; ingestion admission is bounded before request bodies are buffered.

@@ -11,12 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"time"
 
 	"github.com/jmwoliver/xet-go/xethash"
 	_ "modernc.org/sqlite"
 )
 
-const sqliteSchemaVersion = 2
+const sqliteSchemaVersion = 3
 
 // SQLiteIndexStore is a durable single-node IndexStore. Payload bytes remain
 // in a BlobStore; SQLite contains only validated layouts, recipes, and scoped
@@ -156,7 +157,12 @@ func (s *SQLiteIndexStore) initialize(ctx context.Context) error {
 			return fmt.Errorf("xet CAS server: migrate SQLite schema to version 2: %w", err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
+	if version < 3 {
+		if _, err := tx.ExecContext(ctx, sqliteSchemaV3); err != nil {
+			return fmt.Errorf("xet CAS server: migrate SQLite schema to version 3: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 3"); err != nil {
 		return fmt.Errorf("xet CAS server: record SQLite schema version: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -231,6 +237,29 @@ CREATE TABLE sha256_associations (
 INSERT INTO sha256_associations(namespace, sum, size, file_hash)
 SELECT namespace, sum, size, file_hash FROM sha256_associations_v1;
 DROP TABLE sha256_associations_v1;
+`
+
+const sqliteSchemaV3 = `
+CREATE TABLE blob_stages (
+    namespace TEXT NOT NULL CHECK(typeof(namespace) = 'text'),
+    id BLOB NOT NULL CHECK(typeof(id) = 'blob' AND length(id) = 16),
+    blob_kind TEXT NOT NULL CHECK(typeof(blob_kind) = 'text' AND blob_kind IN ('xorb', 'shard')),
+    blob_hash BLOB NOT NULL CHECK(typeof(blob_hash) = 'blob' AND length(blob_hash) = 32),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer'),
+    expires_at INTEGER NOT NULL CHECK(typeof(expires_at) = 'integer' AND expires_at > created_at),
+    PRIMARY KEY(namespace, id)
+) WITHOUT ROWID;
+CREATE INDEX blob_stages_expiration ON blob_stages(expires_at, namespace, id);
+
+CREATE TABLE file_leases (
+    namespace TEXT NOT NULL CHECK(typeof(namespace) = 'text'),
+    id BLOB NOT NULL CHECK(typeof(id) = 'blob' AND length(id) = 16),
+    file_hash BLOB NOT NULL CHECK(typeof(file_hash) = 'blob' AND length(file_hash) = 32),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer'),
+    expires_at INTEGER NOT NULL CHECK(typeof(expires_at) = 'integer' AND expires_at > created_at),
+    PRIMARY KEY(namespace, id)
+) WITHOUT ROWID;
+CREATE INDEX file_leases_expiration ON file_leases(expires_at, namespace, id);
 `
 
 func (s *SQLiteIndexStore) Close() error { return s.db.Close() }
@@ -520,6 +549,242 @@ SELECT file_hash FROM sha256_associations WHERE namespace = ? AND sum = ? AND si
 	return nil
 }
 
+func (s *SQLiteIndexStore) PutBlobStage(ctx context.Context, stage BlobStage) error {
+	stage, err := normalizeBlobStage(stage)
+	if err != nil {
+		return err
+	}
+	createdAt, err := protectionTimeToSQLite(stage.CreatedAt)
+	if err != nil {
+		return err
+	}
+	expiresAt, err := protectionTimeToSQLite(stage.ExpiresAt)
+	if err != nil {
+		return err
+	}
+	row := s.db.QueryRowContext(ctx, `
+INSERT INTO blob_stages(namespace, id, blob_kind, blob_hash, created_at, expires_at)
+VALUES(?, ?, ?, ?, ?, ?)
+ON CONFLICT(namespace, id) DO UPDATE SET id = excluded.id
+WHERE blob_kind = excluded.blob_kind AND blob_hash = excluded.blob_hash
+  AND created_at = excluded.created_at AND expires_at = excluded.expires_at
+RETURNING namespace, id, blob_kind, blob_hash, created_at, expires_at,
+  typeof(namespace), typeof(id), typeof(blob_kind), typeof(blob_hash), typeof(created_at), typeof(expires_at)`,
+		stage.Namespace, stage.ID[:], string(stage.Blob.Kind), hashBytes(stage.Blob.Hash), createdAt, expiresAt)
+	stored, err := scanSQLiteBlobStage(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, lookupErr := s.sqliteBlobStage(ctx, stage.Namespace, stage.ID); lookupErr != nil {
+			return fmt.Errorf("xet CAS server: inspect conflicting SQLite blob stage: %w", lookupErr)
+		}
+		return ErrConflict
+	}
+	if err != nil {
+		return fmt.Errorf("xet CAS server: put SQLite blob stage: %w", err)
+	}
+	if stored != stage {
+		return ErrConflict
+	}
+	return nil
+}
+
+func (s *SQLiteIndexStore) DeleteBlobStage(ctx context.Context, namespace string, id ProtectionID) error {
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM blob_stages WHERE namespace = ? AND id = ?", namespace, id[:]); err != nil {
+		return fmt.Errorf("xet CAS server: delete SQLite blob stage: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteIndexStore) RenewBlobStage(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+	expiresAt time.Time,
+) error {
+	expiresAt, err := normalizeProtectionTime(expiresAt)
+	if err != nil {
+		return err
+	}
+	databaseExpiration, err := protectionTimeToSQLite(expiresAt)
+	if err != nil {
+		return err
+	}
+	row := s.db.QueryRowContext(ctx, `
+UPDATE blob_stages SET expires_at = max(expires_at, ?) WHERE namespace = ? AND id = ?
+RETURNING namespace, id, blob_kind, blob_hash, created_at, expires_at,
+  typeof(namespace), typeof(id), typeof(blob_kind), typeof(blob_hash), typeof(created_at), typeof(expires_at)`,
+		databaseExpiration, namespace, id[:])
+	stage, err := scanSQLiteBlobStage(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("xet CAS server: renew SQLite blob stage: %w", err)
+	}
+	if stage.Namespace != namespace || stage.ID != id || stage.ExpiresAt.Before(expiresAt) {
+		return fmt.Errorf("%w: SQLite blob stage renewal identity mismatch", ErrCorrupt)
+	}
+	return nil
+}
+
+func (s *SQLiteIndexStore) ListBlobStages(
+	ctx context.Context,
+	namespace *string,
+	request PageRequest,
+) (BlobStagePage, error) {
+	cursorKind := cursorBlobStageAll
+	if namespace != nil {
+		cursorKind = cursorBlobStageScoped
+	}
+	limit, cursorNamespace, cursorID, hasCursor, err := scopedProtectionPage(request, namespace, cursorKind)
+	if err != nil {
+		return BlobStagePage{}, err
+	}
+	const base = `SELECT namespace, id, blob_kind, blob_hash, created_at, expires_at,
+typeof(namespace), typeof(id), typeof(blob_kind), typeof(blob_hash), typeof(created_at), typeof(expires_at)
+FROM blob_stages`
+	query, arguments := scopedProtectionQuery(base, namespace, cursorNamespace, cursorID, hasCursor, limit)
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return BlobStagePage{}, fmt.Errorf("xet CAS server: list SQLite blob stages: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // rows.Err and the explicit close below determine the result.
+	page := BlobStagePage{Items: make([]BlobStage, 0, limit)}
+	for rows.Next() {
+		stage, err := scanSQLiteBlobStage(rows)
+		if err != nil {
+			return BlobStagePage{}, fmt.Errorf("xet CAS server: scan SQLite blob stage: %w", err)
+		}
+		page.Items = append(page.Items, stage)
+	}
+	if err := finishSQLiteRows(rows); err != nil {
+		return BlobStagePage{}, fmt.Errorf("xet CAS server: finish SQLite blob stage page: %w", err)
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, last.ID[:])
+	}
+	return page, nil
+}
+
+func (s *SQLiteIndexStore) PutFileLease(ctx context.Context, lease FileLease) error {
+	lease, err := normalizeFileLease(lease)
+	if err != nil {
+		return err
+	}
+	createdAt, err := protectionTimeToSQLite(lease.CreatedAt)
+	if err != nil {
+		return err
+	}
+	expiresAt, err := protectionTimeToSQLite(lease.ExpiresAt)
+	if err != nil {
+		return err
+	}
+	row := s.db.QueryRowContext(ctx, `
+INSERT INTO file_leases(namespace, id, file_hash, created_at, expires_at)
+VALUES(?, ?, ?, ?, ?)
+ON CONFLICT(namespace, id) DO UPDATE SET expires_at = max(file_leases.expires_at, excluded.expires_at)
+WHERE file_hash = excluded.file_hash AND created_at = excluded.created_at
+RETURNING namespace, id, file_hash, created_at, expires_at,
+  typeof(namespace), typeof(id), typeof(file_hash), typeof(created_at), typeof(expires_at)`,
+		lease.Namespace, lease.ID[:], hashBytes(lease.File), createdAt, expiresAt)
+	stored, err := scanSQLiteFileLease(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, lookupErr := s.sqliteFileLease(ctx, lease.Namespace, lease.ID); lookupErr != nil {
+			return fmt.Errorf("xet CAS server: inspect conflicting SQLite file lease: %w", lookupErr)
+		}
+		return ErrConflict
+	}
+	if err != nil {
+		return fmt.Errorf("xet CAS server: put SQLite file lease: %w", err)
+	}
+	if stored.Namespace != lease.Namespace || stored.ID != lease.ID || stored.File != lease.File ||
+		!stored.CreatedAt.Equal(lease.CreatedAt) || stored.ExpiresAt.Before(lease.ExpiresAt) {
+		return ErrConflict
+	}
+	return nil
+}
+
+func (s *SQLiteIndexStore) RenewFileLease(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+	expiresAt time.Time,
+) error {
+	expiresAt, err := normalizeProtectionTime(expiresAt)
+	if err != nil {
+		return err
+	}
+	databaseExpiration, err := protectionTimeToSQLite(expiresAt)
+	if err != nil {
+		return err
+	}
+	row := s.db.QueryRowContext(ctx, `
+UPDATE file_leases SET expires_at = max(expires_at, ?) WHERE namespace = ? AND id = ?
+RETURNING namespace, id, file_hash, created_at, expires_at,
+  typeof(namespace), typeof(id), typeof(file_hash), typeof(created_at), typeof(expires_at)`,
+		databaseExpiration, namespace, id[:])
+	lease, err := scanSQLiteFileLease(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("xet CAS server: renew SQLite file lease: %w", err)
+	}
+	if lease.Namespace != namespace || lease.ID != id || lease.ExpiresAt.Before(expiresAt) {
+		return fmt.Errorf("%w: SQLite file lease renewal identity mismatch", ErrCorrupt)
+	}
+	return nil
+}
+
+func (s *SQLiteIndexStore) DeleteFileLease(ctx context.Context, namespace string, id ProtectionID) error {
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM file_leases WHERE namespace = ? AND id = ?", namespace, id[:]); err != nil {
+		return fmt.Errorf("xet CAS server: delete SQLite file lease: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteIndexStore) ListFileLeases(
+	ctx context.Context,
+	namespace *string,
+	request PageRequest,
+) (FileLeasePage, error) {
+	cursorKind := cursorFileLeaseAll
+	if namespace != nil {
+		cursorKind = cursorFileLeaseScoped
+	}
+	limit, cursorNamespace, cursorID, hasCursor, err := scopedProtectionPage(request, namespace, cursorKind)
+	if err != nil {
+		return FileLeasePage{}, err
+	}
+	const base = `SELECT namespace, id, file_hash, created_at, expires_at,
+typeof(namespace), typeof(id), typeof(file_hash), typeof(created_at), typeof(expires_at)
+FROM file_leases`
+	query, arguments := scopedProtectionQuery(base, namespace, cursorNamespace, cursorID, hasCursor, limit)
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return FileLeasePage{}, fmt.Errorf("xet CAS server: list SQLite file leases: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // rows.Err and the explicit close below determine the result.
+	page := FileLeasePage{Items: make([]FileLease, 0, limit)}
+	for rows.Next() {
+		lease, err := scanSQLiteFileLease(rows)
+		if err != nil {
+			return FileLeasePage{}, fmt.Errorf("xet CAS server: scan SQLite file lease: %w", err)
+		}
+		page.Items = append(page.Items, lease)
+	}
+	if err := finishSQLiteRows(rows); err != nil {
+		return FileLeasePage{}, fmt.Errorf("xet CAS server: finish SQLite file lease page: %w", err)
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, last.ID[:])
+	}
+	return page, nil
+}
+
 func (s *SQLiteIndexStore) ListXorbs(ctx context.Context, request PageRequest) (XorbRecordPage, error) {
 	limit, err := pageLimit(request)
 	if err != nil {
@@ -772,6 +1037,29 @@ func scopedHashQuery(
 	return base + order, []any{limit + 1}
 }
 
+func scopedProtectionQuery(
+	base string,
+	namespace *string,
+	cursorNamespace string,
+	cursorID ProtectionID,
+	hasCursor bool,
+	limit int,
+) (string, []any) {
+	const order = " ORDER BY namespace, id LIMIT ?"
+	if namespace != nil {
+		if hasCursor {
+			return base + " WHERE namespace = ? AND id > ?" + order,
+				[]any{*namespace, cursorID[:], limit + 1}
+		}
+		return base + " WHERE namespace = ?" + order, []any{*namespace, limit + 1}
+	}
+	if hasCursor {
+		return base + " WHERE (namespace, id) > (?, ?)" + order,
+			[]any{cursorNamespace, cursorID[:], limit + 1}
+	}
+	return base + order, []any{limit + 1}
+}
+
 func scopedSHAQuery(
 	namespace *string,
 	cursorNamespace string,
@@ -797,6 +1085,99 @@ typeof(namespace), typeof(sum), typeof(size), typeof(file_hash) FROM sha256_asso
 	return base + order, []any{limit + 1}
 }
 
+type sqliteScanner interface {
+	Scan(...any) error
+}
+
+func (s *SQLiteIndexStore) sqliteBlobStage(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+) (BlobStage, error) {
+	return scanSQLiteBlobStage(s.db.QueryRowContext(ctx, `
+SELECT namespace, id, blob_kind, blob_hash, created_at, expires_at,
+  typeof(namespace), typeof(id), typeof(blob_kind), typeof(blob_hash), typeof(created_at), typeof(expires_at)
+FROM blob_stages WHERE namespace = ? AND id = ?`, namespace, id[:]))
+}
+
+func (s *SQLiteIndexStore) sqliteFileLease(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+) (FileLease, error) {
+	return scanSQLiteFileLease(s.db.QueryRowContext(ctx, `
+SELECT namespace, id, file_hash, created_at, expires_at,
+  typeof(namespace), typeof(id), typeof(file_hash), typeof(created_at), typeof(expires_at)
+FROM file_leases WHERE namespace = ? AND id = ?`, namespace, id[:]))
+}
+
+func scanSQLiteBlobStage(scanner sqliteScanner) (BlobStage, error) {
+	var namespace, kind string
+	var idData, hashData []byte
+	var createdValue, expiresValue any
+	var namespaceType, idType, kindType, hashType, createdType, expiresType string
+	if err := scanner.Scan(
+		&namespace, &idData, &kind, &hashData, &createdValue, &expiresValue,
+		&namespaceType, &idType, &kindType, &hashType, &createdType, &expiresType,
+	); err != nil {
+		return BlobStage{}, err
+	}
+	createdAt, createdOK := createdValue.(int64)
+	expiresAt, expiresOK := expiresValue.(int64)
+	if namespaceType != "text" || idType != "blob" || kindType != "text" || hashType != "blob" ||
+		createdType != "integer" || expiresType != "integer" || len(idData) != len(ProtectionID{}) ||
+		!createdOK || !expiresOK {
+		return BlobStage{}, fmt.Errorf("%w: malformed SQLite blob stage", ErrCorrupt)
+	}
+	hash, err := sqliteHash(hashData)
+	if err != nil {
+		return BlobStage{}, err
+	}
+	var id ProtectionID
+	copy(id[:], idData)
+	stage, err := normalizeBlobStage(BlobStage{
+		ID: id, Namespace: namespace, Blob: BlobKey{Kind: BlobKind(kind), Hash: hash},
+		CreatedAt: protectionTimeFromSQLite(createdAt), ExpiresAt: protectionTimeFromSQLite(expiresAt),
+	})
+	if err != nil {
+		return BlobStage{}, fmt.Errorf("%w: malformed SQLite blob stage value: %v", ErrCorrupt, err)
+	}
+	return stage, nil
+}
+
+func scanSQLiteFileLease(scanner sqliteScanner) (FileLease, error) {
+	var namespace string
+	var idData, hashData []byte
+	var createdValue, expiresValue any
+	var namespaceType, idType, hashType, createdType, expiresType string
+	if err := scanner.Scan(
+		&namespace, &idData, &hashData, &createdValue, &expiresValue,
+		&namespaceType, &idType, &hashType, &createdType, &expiresType,
+	); err != nil {
+		return FileLease{}, err
+	}
+	createdAt, createdOK := createdValue.(int64)
+	expiresAt, expiresOK := expiresValue.(int64)
+	if namespaceType != "text" || idType != "blob" || hashType != "blob" || createdType != "integer" ||
+		expiresType != "integer" || len(idData) != len(ProtectionID{}) || !createdOK || !expiresOK {
+		return FileLease{}, fmt.Errorf("%w: malformed SQLite file lease", ErrCorrupt)
+	}
+	hash, err := sqliteHash(hashData)
+	if err != nil {
+		return FileLease{}, err
+	}
+	var id ProtectionID
+	copy(id[:], idData)
+	lease, err := normalizeFileLease(FileLease{
+		ID: id, Namespace: namespace, File: hash,
+		CreatedAt: protectionTimeFromSQLite(createdAt), ExpiresAt: protectionTimeFromSQLite(expiresAt),
+	})
+	if err != nil {
+		return FileLease{}, fmt.Errorf("%w: malformed SQLite file lease value: %v", ErrCorrupt, err)
+	}
+	return lease, nil
+}
+
 func sqliteHash(data []byte) (xethash.Hash, error) {
 	if len(data) != len(xethash.Hash{}) {
 		return xethash.Hash{}, fmt.Errorf("%w: invalid SQLite hash length", ErrCorrupt)
@@ -804,6 +1185,22 @@ func sqliteHash(data []byte) (xethash.Hash, error) {
 	var hash xethash.Hash
 	copy(hash[:], data)
 	return hash, nil
+}
+
+func protectionTimeToSQLite(value time.Time) (int64, error) {
+	value, err := normalizeProtectionTime(value)
+	if err != nil {
+		return 0, err
+	}
+	nanoseconds := value.UnixNano()
+	if !time.Unix(0, nanoseconds).Equal(value) {
+		return 0, fmt.Errorf("%w: protection timestamp is outside SQLite nanosecond range", ErrInvalid)
+	}
+	return nanoseconds, nil
+}
+
+func protectionTimeFromSQLite(nanoseconds int64) time.Time {
+	return time.Unix(0, nanoseconds).UTC()
 }
 
 func finishSQLiteRows(rows *sql.Rows) error {

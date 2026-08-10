@@ -152,6 +152,34 @@ type XorbRecordPage struct {
 	NextCursor string
 }
 
+type ProtectionID [16]byte
+
+type BlobStage struct {
+	ID        ProtectionID
+	Namespace string
+	Blob      BlobKey
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+
+type BlobStagePage struct {
+	Items      []BlobStage
+	NextCursor string
+}
+
+type FileLease struct {
+	ID        ProtectionID
+	Namespace string
+	File      xethash.Hash
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+
+type FileLeasePage struct {
+	Items      []FileLease
+	NextCursor string
+}
+
 // ShardPublication is the complete set of logical index records exposed by
 // one validated shard. PublishShard must commit all records atomically within
 // Namespace or expose none of them.
@@ -180,6 +208,24 @@ type IndexStore interface {
 	ResolveSHA256(context.Context, string, [32]byte, uint64) (xethash.Hash, bool, error)
 	PutSHA256(context.Context, string, [32]byte, uint64, xethash.Hash) error
 	PublishShard(context.Context, ShardPublication) error
+}
+
+// ProtectionStore is an optional durable lifecycle capability. Blob stages
+// protect immutable objects whose logical index publication has not completed.
+// File leases protect namespace-scoped reconstruction roots while reads are in
+// flight or signed range capabilities remain valid. Put operations are
+// idempotent for an identical record; IDs cannot be retargeted. Renewals may
+// extend but never shorten a protection. Delete operations are idempotent.
+type ProtectionStore interface {
+	PutBlobStage(context.Context, BlobStage) error
+	RenewBlobStage(context.Context, string, ProtectionID, time.Time) error
+	DeleteBlobStage(context.Context, string, ProtectionID) error
+	ListBlobStages(context.Context, *string, PageRequest) (BlobStagePage, error)
+
+	PutFileLease(context.Context, FileLease) error
+	RenewFileLease(context.Context, string, ProtectionID, time.Time) error
+	DeleteFileLease(context.Context, string, ProtectionID) error
+	ListFileLeases(context.Context, *string, PageRequest) (FileLeasePage, error)
 }
 
 // IndexLister is the optional operational-iteration capability implemented by
@@ -215,6 +261,10 @@ const (
 	cursorDedupScoped
 	cursorSHA256All
 	cursorSHA256Scoped
+	cursorBlobStageAll
+	cursorBlobStageScoped
+	cursorFileLeaseAll
+	cursorFileLeaseScoped
 )
 
 func encodeHashCursor(kind byte, hash xethash.Hash) string {
@@ -264,6 +314,55 @@ func decodeCursor(cursor string) ([]byte, error) {
 	return data, nil
 }
 
+func normalizeBlobStage(stage BlobStage) (BlobStage, error) {
+	if stage.ID == (ProtectionID{}) || stage.Blob.Kind != BlobXorb && stage.Blob.Kind != BlobShard {
+		return BlobStage{}, fmt.Errorf("%w: invalid blob stage identity", ErrInvalid)
+	}
+	createdAt, err := normalizeProtectionTime(stage.CreatedAt)
+	if err != nil {
+		return BlobStage{}, err
+	}
+	expiresAt, err := normalizeProtectionTime(stage.ExpiresAt)
+	if err != nil {
+		return BlobStage{}, err
+	}
+	if !expiresAt.After(createdAt) {
+		return BlobStage{}, fmt.Errorf("%w: blob stage expiration must follow creation", ErrInvalid)
+	}
+	stage.CreatedAt, stage.ExpiresAt = createdAt, expiresAt
+	return stage, nil
+}
+
+func normalizeFileLease(lease FileLease) (FileLease, error) {
+	if lease.ID == (ProtectionID{}) {
+		return FileLease{}, fmt.Errorf("%w: invalid file lease identity", ErrInvalid)
+	}
+	createdAt, err := normalizeProtectionTime(lease.CreatedAt)
+	if err != nil {
+		return FileLease{}, err
+	}
+	expiresAt, err := normalizeProtectionTime(lease.ExpiresAt)
+	if err != nil {
+		return FileLease{}, err
+	}
+	if !expiresAt.After(createdAt) {
+		return FileLease{}, fmt.Errorf("%w: file lease expiration must follow creation", ErrInvalid)
+	}
+	lease.CreatedAt, lease.ExpiresAt = createdAt, expiresAt
+	return lease, nil
+}
+
+func normalizeProtectionTime(value time.Time) (time.Time, error) {
+	if value.IsZero() {
+		return time.Time{}, fmt.Errorf("%w: protection timestamp is required", ErrInvalid)
+	}
+	value = value.Round(0).UTC()
+	if !time.Unix(0, value.UnixNano()).Equal(value) {
+		return time.Time{}, fmt.Errorf("%w: protection timestamp is outside the supported nanosecond range", ErrInvalid)
+	}
+	return value, nil
+}
+
 type Operation string
 
 const (
@@ -289,13 +388,21 @@ type Authorizer interface {
 	Authorize(context.Context, string, AccessRequest) (Grant, error)
 }
 
-type RangeURLSigner interface {
-	SignRange(context.Context, BlobKey, xetcas.HTTPRange) (string, error)
+// SignedRange is one object-store capability and its authoritative expiration.
+// The service retains a namespace-scoped file lease through ExpiresAt plus its
+// configured read-lease grace interval.
+type SignedRange struct {
+	URL       string
+	ExpiresAt time.Time
 }
 
-type RangeURLSignerFunc func(context.Context, BlobKey, xetcas.HTTPRange) (string, error)
+type RangeURLSigner interface {
+	SignRange(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error)
+}
 
-func (f RangeURLSignerFunc) SignRange(ctx context.Context, key BlobKey, value xetcas.HTTPRange) (string, error) {
+type RangeURLSignerFunc func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error)
+
+func (f RangeURLSignerFunc) SignRange(ctx context.Context, key BlobKey, value xetcas.HTTPRange) (SignedRange, error) {
 	return f(ctx, key, value)
 }
 
@@ -312,6 +419,8 @@ type Options struct {
 	MaxShardBody         int64
 	RegistrationLimits   shard.RegistrationLimits
 	MaxConcurrentIngests int
+	StagingProtectionTTL time.Duration
+	ReadLeaseTTL         time.Duration
 }
 
 type ShardResult struct {

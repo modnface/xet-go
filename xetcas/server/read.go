@@ -16,12 +16,21 @@ import (
 	"github.com/jmwoliver/xet-go/xorb"
 )
 
-func (s *Service) file(ctx context.Context, credential string, hash xethash.Hash) (FileRecord, error) {
+func (s *Service) authorizedFile(
+	ctx context.Context,
+	credential string,
+	hash xethash.Hash,
+) (Grant, FileRecord, error) {
 	grant, err := s.authorize(ctx, credential, AccessRequest{Operation: OperationReadFile, Hash: hash})
 	if err != nil {
-		return FileRecord{}, err
+		return Grant{}, FileRecord{}, err
 	}
-	value, found, err := s.index.GetFile(ctx, grant.Namespace, hash)
+	file, err := s.scopedFile(ctx, grant.Namespace, hash)
+	return grant, file, err
+}
+
+func (s *Service) scopedFile(ctx context.Context, namespace string, hash xethash.Hash) (FileRecord, error) {
+	value, found, err := s.index.GetFile(ctx, namespace, hash)
 	if err != nil {
 		return FileRecord{}, err
 	}
@@ -29,6 +38,11 @@ func (s *Service) file(ctx context.Context, credential string, hash xethash.Hash
 		return FileRecord{}, ErrNotFound
 	}
 	return value, nil
+}
+
+func (s *Service) file(ctx context.Context, credential string, hash xethash.Hash) (FileRecord, error) {
+	_, file, err := s.authorizedFile(ctx, credential, hash)
+	return file, err
 }
 
 func (s *Service) File(ctx context.Context, credential string, hash xethash.Hash) (FileRecord, error) {
@@ -74,11 +88,11 @@ func (s *Service) layoutLookup(ctx context.Context) xetcas.XorbLayoutLookup {
 
 func (s *Service) reconstructionPlan(
 	ctx context.Context,
-	credential string,
+	namespace string,
 	hash xethash.Hash,
 	requested *xetcas.FileRange,
 ) (FileRecord, *xetcas.ReconstructionPlan, error) {
-	file, err := s.file(ctx, credential, hash)
+	file, err := s.scopedFile(ctx, namespace, hash)
 	if err != nil {
 		return FileRecord{}, nil, err
 	}
@@ -97,8 +111,24 @@ func (s *Service) ReconstructionV2(
 	credential string,
 	hash xethash.Hash,
 	requested *xetcas.FileRange,
-) (*xetcas.Reconstruction, error) {
-	_, plan, err := s.reconstructionPlan(ctx, credential, hash, requested)
+) (result *xetcas.Reconstruction, returnError error) {
+	grant, err := s.authorize(ctx, credential, AccessRequest{Operation: OperationReadFile, Hash: hash})
+	if err != nil {
+		return nil, err
+	}
+	leaseContext, cancelLease := context.WithCancelCause(ctx)
+	defer cancelLease(nil)
+	lease, err := s.acquireActiveFileLease(leaseContext, cancelLease, grant.Namespace, hash)
+	if err != nil {
+		return nil, err
+	}
+	detached := false
+	defer func() {
+		if !detached {
+			returnError = errors.Join(returnError, lease.Close())
+		}
+	}()
+	_, plan, err := s.reconstructionPlan(leaseContext, grant.Namespace, hash, requested)
 	if err != nil {
 		return nil, err
 	}
@@ -107,22 +137,30 @@ func (s *Service) ReconstructionV2(
 		Terms:                append([]xetcas.ReconstructionTerm(nil), plan.Terms...),
 		Xorbs:                make(map[xethash.Hash][]xetcas.MultiRangeFetch, len(plan.Xorbs)),
 	}
+	var maximumExpiry time.Time
 	for xorbHash, ranges := range plan.Xorbs {
 		for _, value := range ranges {
-			url, err := s.signer.SignRange(ctx, BlobKey{Kind: BlobXorb, Hash: xorbHash}, value.Bytes)
+			signed, err := s.signRange(leaseContext, BlobKey{Kind: BlobXorb, Hash: xorbHash}, value.Bytes)
 			if err != nil {
 				return nil, fmt.Errorf("xet CAS server: sign xorb %s range: %w", xorbHash, err)
+			}
+			if signed.ExpiresAt.After(maximumExpiry) {
+				maximumExpiry = signed.ExpiresAt
 			}
 			// One range per URL works with direct S3 GetObject, which does not
 			// implement HTTP multi-range requests.
 			response.Xorbs[xorbHash] = append(response.Xorbs[xorbHash], xetcas.MultiRangeFetch{
-				URL: url, Ranges: []xetcas.XorbRangeDescriptor{value},
+				URL: signed.URL, Ranges: []xetcas.XorbRangeDescriptor{value},
 			})
 		}
 	}
 	if err := response.Validate(); err != nil {
 		return nil, err
 	}
+	if err := lease.Detach(maximumExpiry); err != nil {
+		return nil, err
+	}
+	detached = true
 	return response, nil
 }
 
@@ -131,8 +169,24 @@ func (s *Service) ReconstructionV1(
 	credential string,
 	hash xethash.Hash,
 	requested *xetcas.FileRange,
-) (*xetcas.ReconstructionV1, error) {
-	_, plan, err := s.reconstructionPlan(ctx, credential, hash, requested)
+) (result *xetcas.ReconstructionV1, returnError error) {
+	grant, err := s.authorize(ctx, credential, AccessRequest{Operation: OperationReadFile, Hash: hash})
+	if err != nil {
+		return nil, err
+	}
+	leaseContext, cancelLease := context.WithCancelCause(ctx)
+	defer cancelLease(nil)
+	lease, err := s.acquireActiveFileLease(leaseContext, cancelLease, grant.Namespace, hash)
+	if err != nil {
+		return nil, err
+	}
+	detached := false
+	defer func() {
+		if !detached {
+			returnError = errors.Join(returnError, lease.Close())
+		}
+	}()
+	_, plan, err := s.reconstructionPlan(leaseContext, grant.Namespace, hash, requested)
 	if err != nil {
 		return nil, err
 	}
@@ -141,18 +195,164 @@ func (s *Service) ReconstructionV1(
 		Terms:                append([]xetcas.ReconstructionTerm(nil), plan.Terms...),
 		FetchInfo:            make(map[xethash.Hash][]xetcas.V1FetchInfo, len(plan.Xorbs)),
 	}
+	var maximumExpiry time.Time
 	for xorbHash, ranges := range plan.Xorbs {
 		for _, value := range ranges {
-			url, err := s.signer.SignRange(ctx, BlobKey{Kind: BlobXorb, Hash: xorbHash}, value.Bytes)
+			signed, err := s.signRange(leaseContext, BlobKey{Kind: BlobXorb, Hash: xorbHash}, value.Bytes)
 			if err != nil {
 				return nil, fmt.Errorf("xet CAS server: sign xorb %s range: %w", xorbHash, err)
 			}
+			if signed.ExpiresAt.After(maximumExpiry) {
+				maximumExpiry = signed.ExpiresAt
+			}
 			response.FetchInfo[xorbHash] = append(response.FetchInfo[xorbHash], xetcas.V1FetchInfo{
-				Range: value.Chunks, URL: url, URLRange: value.Bytes,
+				Range: value.Chunks, URL: signed.URL, URLRange: value.Bytes,
 			})
 		}
 	}
+	if err := lease.Detach(maximumExpiry); err != nil {
+		return nil, err
+	}
+	detached = true
 	return response, nil
+}
+
+func (s *Service) signRange(ctx context.Context, key BlobKey, value xetcas.HTTPRange) (SignedRange, error) {
+	signed, err := s.signer.SignRange(ctx, key, value)
+	if err != nil {
+		return SignedRange{}, err
+	}
+	expiresAt, err := normalizeProtectionTime(signed.ExpiresAt)
+	if err != nil || signed.URL == "" || !expiresAt.After(s.now()) {
+		return SignedRange{}, fmt.Errorf("%w: signer returned an empty URL or invalid expiration", ErrInvalid)
+	}
+	signed.ExpiresAt = expiresAt
+	return signed, nil
+}
+
+type activeFileLease struct {
+	store        ProtectionStore
+	namespace    string
+	id           ProtectionID
+	expiresAt    time.Time
+	ttl          time.Duration
+	now          func() time.Time
+	cancelRenew  context.CancelFunc
+	done         <-chan struct{}
+	renewalError error
+	closeOnce    sync.Once
+	closeError   error
+}
+
+func (s *Service) acquireActiveFileLease(
+	ctx context.Context,
+	failStream func(error),
+	namespace string,
+	hash xethash.Hash,
+) (*activeFileLease, error) {
+	if s.protections == nil {
+		return nil, nil
+	}
+	id, err := newProtectionID()
+	if err != nil {
+		return nil, err
+	}
+	createdAt := s.now()
+	if err := s.protections.PutFileLease(ctx, FileLease{
+		ID: id, Namespace: namespace, File: hash,
+		CreatedAt: createdAt, ExpiresAt: createdAt.Add(s.readLeaseTTL),
+	}); err != nil {
+		return nil, fmt.Errorf("xet CAS server: acquire file read lease: %w", err)
+	}
+	renewContext, cancelRenew := context.WithCancel(ctx)
+	done := make(chan struct{})
+	lease := &activeFileLease{
+		store: s.protections, namespace: namespace, id: id, expiresAt: createdAt.Add(s.readLeaseTTL),
+		ttl: s.readLeaseTTL, now: s.now,
+		cancelRenew: cancelRenew, done: done,
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(lease.ttl / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewContext.Done():
+				return
+			case <-ticker.C:
+				expiresAt := lease.now().Add(lease.ttl)
+				if !expiresAt.After(lease.expiresAt) {
+					expiresAt = lease.expiresAt.Add(lease.ttl / 3)
+				}
+				if err := lease.store.RenewFileLease(
+					renewContext, lease.namespace, lease.id, expiresAt,
+				); err != nil {
+					if renewContext.Err() != nil {
+						return
+					}
+					lease.renewalError = fmt.Errorf("xet CAS server: renew file read lease: %w", err)
+					failStream(lease.renewalError)
+					return
+				}
+				lease.expiresAt = expiresAt
+			}
+		}
+	}()
+	return lease, nil
+}
+
+func (l *activeFileLease) stopRenewal() error {
+	if l == nil {
+		return nil
+	}
+	l.cancelRenew()
+	<-l.done
+	return l.renewalError
+}
+
+func (l *activeFileLease) Detach(signedExpiry time.Time) error {
+	if l == nil {
+		return nil
+	}
+	expiresAt := l.now().Add(l.ttl)
+	if !signedExpiry.IsZero() {
+		signedWithGrace := signedExpiry.Add(l.ttl)
+		if signedWithGrace.After(expiresAt) {
+			expiresAt = signedWithGrace
+		}
+	}
+	expiresAt, err := normalizeProtectionTime(expiresAt)
+	if err != nil {
+		return errors.Join(err, l.Close())
+	}
+	finalizeContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	finalizeError := l.store.RenewFileLease(finalizeContext, l.namespace, l.id, expiresAt)
+	renewalError := l.stopRenewal()
+	if finalizeError != nil || renewalError != nil {
+		if finalizeError != nil {
+			finalizeError = fmt.Errorf("xet CAS server: finalize signed reconstruction lease: %w", finalizeError)
+		}
+		return errors.Join(finalizeError, renewalError, l.Close())
+	}
+	return nil
+}
+
+func (l *activeFileLease) Close() error {
+	if l == nil {
+		return nil
+	}
+	l.closeOnce.Do(func() {
+		renewalError := l.stopRenewal()
+		releaseContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var releaseError error
+		if err := l.store.DeleteFileLease(releaseContext, l.namespace, l.id); err != nil {
+			releaseError = fmt.Errorf("xet CAS server: release file read lease: %w", err)
+		}
+		l.closeError = errors.Join(renewalError, releaseError)
+	})
+	return l.closeError
 }
 
 type reconstructionGroup struct {
@@ -221,9 +421,20 @@ func (s *Service) OpenFile(
 	if ctx == nil {
 		return nil, errors.New("xet CAS server: nil open-file context")
 	}
-	file, plan, err := s.reconstructionPlan(ctx, credential, hash, requested)
+	grant, err := s.authorize(ctx, credential, AccessRequest{Operation: OperationReadFile, Hash: hash})
 	if err != nil {
 		return nil, err
+	}
+	streamContext, cancel := context.WithCancelCause(ctx)
+	lease, err := s.acquireActiveFileLease(streamContext, cancel, grant.Namespace, hash)
+	if err != nil {
+		cancel(err)
+		return nil, err
+	}
+	file, plan, err := s.reconstructionPlan(streamContext, grant.Namespace, hash, requested)
+	if err != nil {
+		cancel(err)
+		return nil, errors.Join(err, lease.Close())
 	}
 	selected := xetcas.FileRange{Start: 0, End: file.File.Size}
 	if requested != nil {
@@ -231,30 +442,33 @@ func (s *Service) OpenFile(
 		selected.End = min(requested.End, file.File.Size)
 	}
 	wholeFile := selected.Start == 0 && selected.End == file.File.Size
-	groups, err := s.reconstructionGroups(ctx, plan)
+	groups, err := s.reconstructionGroups(streamContext, plan)
 	if err != nil {
-		return nil, err
+		cancel(err)
+		return nil, errors.Join(err, lease.Close())
 	}
-	streamContext, cancel := context.WithCancel(ctx)
 	reader, writer := io.Pipe()
-	done := make(chan struct{})
+	settlement := &openFileSettlement{done: make(chan struct{})}
 	go func() {
-		defer close(done)
-		err := s.streamReconstruction(streamContext, writer, groups, plan.OffsetIntoFirstRange,
+		streamError := s.streamReconstruction(streamContext, writer, groups, plan.OffsetIntoFirstRange,
 			selected.Len(), wholeFile, file.File.File.SHA256)
-		_ = writer.CloseWithError(err)
+		leaseError := lease.Close()
+		settlement.finish(streamError, leaseError)
+		_ = writer.CloseWithError(errors.Join(streamError, leaseError))
 	}()
 	go func() {
 		select {
 		case <-ctx.Done():
 			_ = reader.CloseWithError(ctx.Err())
-			cancel()
-		case <-done:
+			cancel(ctx.Err())
+		case <-settlement.done:
 		}
 	}()
 	result := &OpenedFile{
 		Hash: hash, FileSize: file.File.Size, Range: selected, Size: selected.Len(),
-		Body: &cancelReadCloser{PipeReader: reader, ctx: streamContext, cancel: cancel, done: done},
+		Body: &cancelReadCloser{
+			PipeReader: reader, ctx: streamContext, cancel: cancel, settlement: settlement,
+		},
 	}
 	if file.File.File.SHA256 != nil {
 		sum := *file.File.File.SHA256
@@ -263,28 +477,54 @@ func (s *Service) OpenFile(
 	return result, nil
 }
 
+type openFileSettlement struct {
+	done      chan struct{}
+	mu        sync.Mutex
+	streamErr error
+	leaseErr  error
+}
+
+func (s *openFileSettlement) finish(streamErr, leaseErr error) {
+	s.mu.Lock()
+	s.streamErr = streamErr
+	s.leaseErr = leaseErr
+	s.mu.Unlock()
+	close(s.done)
+}
+
+func (s *openFileSettlement) errors() (error, error) {
+	<-s.done
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.streamErr, s.leaseErr
+}
+
 type cancelReadCloser struct {
 	*io.PipeReader
-	ctx    context.Context
-	cancel context.CancelFunc
-	done   <-chan struct{}
-	once   sync.Once
-	err    error
+	ctx        context.Context
+	cancel     context.CancelCauseFunc
+	settlement *openFileSettlement
+	once       sync.Once
+	err        error
 }
 
 func (r *cancelReadCloser) Read(data []byte) (int, error) {
 	n, err := r.PipeReader.Read(data)
 	if err != nil && r.ctx.Err() != nil {
-		return n, r.ctx.Err()
+		return n, context.Cause(r.ctx)
 	}
 	return n, err
 }
 
 func (r *cancelReadCloser) Close() error {
 	r.once.Do(func() {
-		r.cancel()
-		r.err = r.PipeReader.Close()
-		<-r.done
+		r.cancel(nil)
+		pipeError := r.PipeReader.Close()
+		streamError, leaseError := r.settlement.errors()
+		if streamError == io.ErrClosedPipe || streamError == context.Canceled {
+			streamError = nil
+		}
+		r.err = errors.Join(pipeError, streamError, leaseError)
 	})
 	return r.err
 }
@@ -452,15 +692,26 @@ func (s *Service) FileChunkHashes(
 	credential string,
 	hash xethash.Hash,
 	dirty []xetcas.FileRange,
-) (*xetcas.FileChunkHashesResponse, error) {
-	file, err := s.file(ctx, credential, hash)
+) (result *xetcas.FileChunkHashesResponse, returnError error) {
+	grant, err := s.authorize(ctx, credential, AccessRequest{Operation: OperationReadFile, Hash: hash})
 	if err != nil {
 		return nil, err
 	}
-	if err := s.validateRecipeWork(ctx, file.File); err != nil {
+	leaseContext, cancelLease := context.WithCancelCause(ctx)
+	defer cancelLease(nil)
+	lease, err := s.acquireActiveFileLease(leaseContext, cancelLease, grant.Namespace, hash)
+	if err != nil {
 		return nil, err
 	}
-	return xetcas.PlanFileChunkHashesContext(ctx, file.File, dirty, s.layoutLookup(ctx))
+	defer func() { returnError = errors.Join(returnError, lease.Close()) }()
+	file, err := s.scopedFile(leaseContext, grant.Namespace, hash)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.validateRecipeWork(leaseContext, file.File); err != nil {
+		return nil, err
+	}
+	return xetcas.PlanFileChunkHashesContext(leaseContext, file.File, dirty, s.layoutLookup(leaseContext))
 }
 
 func (s *Service) GlobalDedup(

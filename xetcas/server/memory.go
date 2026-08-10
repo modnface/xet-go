@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/jmwoliver/xet-go/shard"
 	"github.com/jmwoliver/xet-go/xetcas"
@@ -27,6 +28,11 @@ type scopedHash struct {
 	hash      xethash.Hash
 }
 
+type scopedProtection struct {
+	namespace string
+	id        ProtectionID
+}
+
 // MemoryStore is a concurrency-safe reference BlobStore and IndexStore. It is
 // intended for tests, local development, and protocol interoperability suites.
 type MemoryStore struct {
@@ -36,6 +42,8 @@ type MemoryStore struct {
 	files  map[scopedHash]FileRecord
 	dedup  map[scopedHash]DedupRecord
 	sha256 map[shaKey]xethash.Hash
+	stages map[scopedProtection]BlobStage
+	leases map[scopedProtection]FileLease
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -43,6 +51,7 @@ func NewMemoryStore() *MemoryStore {
 		blobs: make(map[BlobKey][]byte), xorbs: make(map[xethash.Hash]XorbRecord),
 		files: make(map[scopedHash]FileRecord), dedup: make(map[scopedHash]DedupRecord),
 		sha256: make(map[shaKey]xethash.Hash),
+		stages: make(map[scopedProtection]BlobStage), leases: make(map[scopedProtection]FileLease),
 	}
 }
 
@@ -495,6 +504,270 @@ func (s *MemoryStore) ListSHA256(
 		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, shaCursorKey(last.Record.Sum, last.Record.Size))
 	}
 	return page, nil
+}
+
+func (s *MemoryStore) PutBlobStage(ctx context.Context, stage BlobStage) error {
+	stage, err := normalizeBlobStage(stage)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key := scopedProtection{namespace: stage.Namespace, id: stage.ID}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if previous, found := s.stages[key]; found {
+		if previous != stage {
+			return ErrConflict
+		}
+		return nil
+	}
+	s.stages[key] = stage
+	return nil
+}
+
+func (s *MemoryStore) RenewBlobStage(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+	expiresAt time.Time,
+) error {
+	expiresAt, err := normalizeProtectionTime(expiresAt)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key := scopedProtection{namespace: namespace, id: id}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stage, found := s.stages[key]
+	if !found {
+		return ErrNotFound
+	}
+	if expiresAt.After(stage.ExpiresAt) {
+		stage.ExpiresAt = expiresAt
+		s.stages[key] = stage
+	}
+	return nil
+}
+
+func (s *MemoryStore) DeleteBlobStage(ctx context.Context, namespace string, id ProtectionID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	delete(s.stages, scopedProtection{namespace: namespace, id: id})
+	return nil
+}
+
+func (s *MemoryStore) ListBlobStages(
+	ctx context.Context,
+	namespace *string,
+	request PageRequest,
+) (BlobStagePage, error) {
+	cursorKind := cursorBlobStageAll
+	if namespace != nil {
+		cursorKind = cursorBlobStageScoped
+	}
+	limit, cursorNamespace, cursorID, hasCursor, err := scopedProtectionPage(request, namespace, cursorKind)
+	if err != nil {
+		return BlobStagePage{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return BlobStagePage{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]BlobStage, 0, min(limit+1, len(s.stages)))
+	for key, stage := range s.stages {
+		if err := ctx.Err(); err != nil {
+			return BlobStagePage{}, err
+		}
+		if namespace != nil && key.namespace != *namespace {
+			continue
+		}
+		if hasCursor && compareScopedProtection(key.namespace, key.id, cursorNamespace, cursorID) <= 0 {
+			continue
+		}
+		items = append(items, stage)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return compareScopedProtection(items[i].Namespace, items[i].ID, items[j].Namespace, items[j].ID) < 0
+	})
+	page := BlobStagePage{Items: items}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, last.ID[:])
+	}
+	return page, nil
+}
+
+func (s *MemoryStore) PutFileLease(ctx context.Context, lease FileLease) error {
+	lease, err := normalizeFileLease(lease)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key := scopedProtection{namespace: lease.Namespace, id: lease.ID}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if previous, found := s.leases[key]; found {
+		if previous.ID != lease.ID || previous.Namespace != lease.Namespace || previous.File != lease.File ||
+			!previous.CreatedAt.Equal(lease.CreatedAt) {
+			return ErrConflict
+		}
+		if lease.ExpiresAt.After(previous.ExpiresAt) {
+			previous.ExpiresAt = lease.ExpiresAt
+			s.leases[key] = previous
+		}
+		return nil
+	}
+	s.leases[key] = lease
+	return nil
+}
+
+func (s *MemoryStore) RenewFileLease(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+	expiresAt time.Time,
+) error {
+	expiresAt, err := normalizeProtectionTime(expiresAt)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key := scopedProtection{namespace: namespace, id: id}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	lease, found := s.leases[key]
+	if !found {
+		return ErrNotFound
+	}
+	if expiresAt.After(lease.ExpiresAt) {
+		lease.ExpiresAt = expiresAt
+		s.leases[key] = lease
+	}
+	return nil
+}
+
+func (s *MemoryStore) DeleteFileLease(ctx context.Context, namespace string, id ProtectionID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	delete(s.leases, scopedProtection{namespace: namespace, id: id})
+	return nil
+}
+
+func (s *MemoryStore) ListFileLeases(
+	ctx context.Context,
+	namespace *string,
+	request PageRequest,
+) (FileLeasePage, error) {
+	cursorKind := cursorFileLeaseAll
+	if namespace != nil {
+		cursorKind = cursorFileLeaseScoped
+	}
+	limit, cursorNamespace, cursorID, hasCursor, err := scopedProtectionPage(request, namespace, cursorKind)
+	if err != nil {
+		return FileLeasePage{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return FileLeasePage{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]FileLease, 0, min(limit+1, len(s.leases)))
+	for key, lease := range s.leases {
+		if err := ctx.Err(); err != nil {
+			return FileLeasePage{}, err
+		}
+		if namespace != nil && key.namespace != *namespace {
+			continue
+		}
+		if hasCursor && compareScopedProtection(key.namespace, key.id, cursorNamespace, cursorID) <= 0 {
+			continue
+		}
+		items = append(items, lease)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return compareScopedProtection(items[i].Namespace, items[i].ID, items[j].Namespace, items[j].ID) < 0
+	})
+	page := FileLeasePage{Items: items}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, last.ID[:])
+	}
+	return page, nil
+}
+
+func scopedProtectionPage(
+	request PageRequest,
+	namespace *string,
+	cursorKind byte,
+) (int, string, ProtectionID, bool, error) {
+	limit, err := pageLimit(request)
+	if err != nil {
+		return 0, "", ProtectionID{}, false, err
+	}
+	if request.Cursor == "" {
+		return limit, "", ProtectionID{}, false, nil
+	}
+	cursorNamespace, key, err := decodeScopedCursor(request.Cursor, cursorKind, len(ProtectionID{}))
+	if err != nil {
+		return 0, "", ProtectionID{}, false, err
+	}
+	if namespace != nil && cursorNamespace != *namespace {
+		return 0, "", ProtectionID{}, false, fmt.Errorf("%w: cursor namespace differs from filter", ErrInvalid)
+	}
+	var id ProtectionID
+	copy(id[:], key)
+	return limit, cursorNamespace, id, true, nil
+}
+
+func compareScopedProtection(
+	leftNamespace string,
+	leftID ProtectionID,
+	rightNamespace string,
+	rightID ProtectionID,
+) int {
+	if leftNamespace < rightNamespace {
+		return -1
+	}
+	if leftNamespace > rightNamespace {
+		return 1
+	}
+	return bytes.Compare(leftID[:], rightID[:])
 }
 
 func scopedHashPage(

@@ -81,7 +81,9 @@ func (s faultBlobStore) Get(ctx context.Context, key BlobKey, wanted *xetcas.HTT
 
 func TestNewServiceValidationAndDefaults(t *testing.T) {
 	store := NewMemoryStore()
-	signer := RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) { return "x", nil })
+	signer := RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+		return signedTestRange("x"), nil
+	})
 	base := Options{Blobs: store, Index: store, Signer: signer, Authorizer: AllowAllAuthorizer{}}
 	for name, mutate := range map[string]func(*Options){
 		"missing dependency": func(value *Options) { value.Signer = nil },
@@ -91,6 +93,12 @@ func TestNewServiceValidationAndDefaults(t *testing.T) {
 		"zero shard limit":   func(value *Options) { value.MaxShardBody = -1 },
 		"large shard limit":  func(value *Options) { value.MaxShardBody = shard.MaxSize + 1 },
 		"negative ingests":   func(value *Options) { value.MaxConcurrentIngests = -1 },
+		"short staging TTL":  func(value *Options) { value.StagingProtectionTTL = time.Second },
+		"short read TTL":     func(value *Options) { value.ReadLeaseTTL = time.Second },
+		"missing protection store": func(value *Options) {
+			value.Index = &faultIndex{IndexStore: store}
+			value.ReadLeaseTTL = time.Minute
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			options := base
@@ -111,7 +119,8 @@ func TestNewServiceValidationAndDefaults(t *testing.T) {
 		service.registration.MaxTerms != defaultMaxRegistrationTerms ||
 		service.registration.MaxChunkReferences != defaultMaxRegistrationChunkRefs ||
 		cap(service.ingestSlots) != defaultMaxConcurrentIngests ||
-		service.shardHeartbeat != defaultShardHeartbeat {
+		service.shardHeartbeat != defaultShardHeartbeat || service.protections != store ||
+		service.stagingTTL != defaultStagingProtectionTTL || service.readLeaseTTL != defaultReadLeaseTTL {
 		t.Fatalf("defaults = %#v", service)
 	}
 
@@ -438,8 +447,8 @@ func TestInjectedStorageIndexAndSignerFailuresPropagate(t *testing.T) {
 	}
 
 	signFailure := errors.New("sign failed")
-	service.signer = RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
-		return "", signFailure
+	service.signer = RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+		return SignedRange{}, signFailure
 	})
 	if _, err := service.ReconstructionV2(ctx, "", value.Files[0].Hash, nil); !errors.Is(err, signFailure) {
 		t.Fatalf("v2 signer failure = %v", err)
@@ -447,13 +456,25 @@ func TestInjectedStorageIndexAndSignerFailuresPropagate(t *testing.T) {
 	if _, err := service.ReconstructionV1(ctx, "", value.Files[0].Hash, nil); !errors.Is(err, signFailure) {
 		t.Fatalf("v1 signer failure = %v", err)
 	}
-	service.signer = RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) {
-		return "", nil
+	service.signer = RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+		return SignedRange{}, nil
 	})
 	if _, err := service.ReconstructionV2(ctx, "", value.Files[0].Hash, nil); err == nil {
 		t.Fatal("invalid signed URL succeeded")
 	}
-
+	for name, expiresAt := range map[string]time.Time{
+		"expired":      service.now(),
+		"out of range": time.Date(3000, time.January, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		t.Run("signed URL "+name, func(t *testing.T) {
+			service.signer = RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+				return SignedRange{URL: "https://storage.example/object", ExpiresAt: expiresAt}, nil
+			})
+			if _, err := service.ReconstructionV2(ctx, "", value.Files[0].Hash, nil); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("invalid signed URL expiration = %v", err)
+			}
+		})
+	}
 	faults.failAt = "get-dedup"
 	if _, err := service.GlobalDedup(ctx, "", xetcas.DefaultDedupPrefix, none.Chunks[0].Hash); err == nil {
 		t.Fatal("dedup index read failure succeeded")
@@ -722,7 +743,9 @@ func TestHandlerShardHeartbeatSuccessAndEarlyFailures(t *testing.T) {
 
 	secure, err := New(Options{
 		Blobs: store, Index: store,
-		Signer:             RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) { return "x", nil }),
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+			return signedTestRange("x"), nil
+		}),
 		Authorizer:         StaticTokenAuthorizer{Token: "secret"},
 		DedupProtectionKey: xethash.Chunk([]byte("key")),
 		MaxShardBody:       1,
@@ -757,7 +780,9 @@ func TestServiceAuthorizationLimitsAndExistingConflict(t *testing.T) {
 	store := NewMemoryStore()
 	service, err := New(Options{
 		Blobs: store, Index: store,
-		Signer:             RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (string, error) { return "x", nil }),
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+			return signedTestRange("x"), nil
+		}),
 		Authorizer:         StaticTokenAuthorizer{Token: "secret"},
 		DedupProtectionKey: xethash.Chunk([]byte("key")),
 		MaxShardBody:       1,
