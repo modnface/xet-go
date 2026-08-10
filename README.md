@@ -219,16 +219,22 @@ responses retain a detached lease through the maximum `SignedRange.ExpiresAt`
 returned by the signer plus `ReadLeaseTTL` as a grace interval. This is why a
 `RangeURLSigner` must return both the URL and its authoritative expiration.
 Reachability audit and destructive garbage collection are not yet implemented;
-expired protection records must not be treated as permission to delete bytes
-without the documented age/grace and reachability checks.
+`ProtectionExpiryStore` only lists and conditionally removes expired protection
+metadata. Its cursors are bound to a stable cutoff, and compare-before-delete
+preserves a record renewed after it was listed. These methods never delete blob
+payloads: an expired or removed stage must not be treated as permission to
+delete bytes without the documented classification, age/grace, and reachability
+checks.
 
-Stores may additionally implement `BlobLister`, `IndexLister`, and
-`ProtectionStore` for bounded, keyset-paginated operational scans and lifecycle
-roots. The memory, filesystem, and SQLite stores collectively provide these
-capabilities for blobs, Xorbs, namespace-scoped files and dedup records,
-namespace-scoped SHA associations, blob stages, and file leases.
-Cursors are opaque and tied to one operation, blob kind, and namespace-filter
-mode. SQLite seeks through its
+Stores may additionally implement `BlobLister`, `IndexLister`,
+`ProtectionStore`, and `ProtectionExpiryStore` for bounded, keyset-paginated
+operational scans and lifecycle roots. Memory and SQLite implement expiry scans
+with pages ordered by expiration, namespace, and protection ID. The memory,
+filesystem, and SQLite stores collectively provide these capabilities for blobs,
+Xorbs, namespace-scoped files and dedup records, namespace-scoped SHA
+associations, blob stages, and file leases. Cursors are opaque and tied to one
+operation, blob kind, namespace-filter mode, and, for expiry scans, cutoff.
+SQLite seeks through its
 composite primary keys; filesystem scans seek the two-level hash-prefix tree
 and stop after finding one page, while reading and sorting one
 four-hex-character leaf as the smallest unit of work. Listers expose physical

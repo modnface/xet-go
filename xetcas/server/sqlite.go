@@ -667,6 +667,84 @@ FROM blob_stages`
 	return page, nil
 }
 
+func (s *SQLiteIndexStore) ListExpiredBlobStages(
+	ctx context.Context,
+	cutoff time.Time,
+	request PageRequest,
+) (BlobStagePage, error) {
+	cutoff, limit, cursor, hasCursor, err := protectionExpiryPage(cutoff, request, cursorBlobStageExpired)
+	if err != nil {
+		return BlobStagePage{}, err
+	}
+	databaseCutoff, err := protectionTimeToSQLite(cutoff)
+	if err != nil {
+		return BlobStagePage{}, err
+	}
+	const columns = `SELECT namespace, id, blob_kind, blob_hash, created_at, expires_at,
+typeof(namespace), typeof(id), typeof(blob_kind), typeof(blob_hash), typeof(created_at), typeof(expires_at)
+FROM blob_stages`
+	var databaseExpiration int64
+	if hasCursor {
+		databaseExpiration, err = protectionTimeToSQLite(cursor.expiresAt)
+		if err != nil {
+			return BlobStagePage{}, err
+		}
+	}
+	query, arguments := sqliteProtectionExpiryQuery(
+		columns, databaseCutoff, databaseExpiration, cursor.namespace, cursor.id, hasCursor, limit,
+	)
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return BlobStagePage{}, fmt.Errorf("xet CAS server: list expired SQLite blob stages: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // rows.Err and the explicit close below determine the result.
+	page := BlobStagePage{Items: make([]BlobStage, 0, limit)}
+	for rows.Next() {
+		stage, err := scanSQLiteBlobStage(rows)
+		if err != nil {
+			return BlobStagePage{}, fmt.Errorf("xet CAS server: scan expired SQLite blob stage: %w", err)
+		}
+		page.Items = append(page.Items, stage)
+	}
+	if err := finishSQLiteRows(rows); err != nil {
+		return BlobStagePage{}, fmt.Errorf("xet CAS server: finish expired SQLite blob stage page: %w", err)
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeProtectionExpiryCursor(
+			cursorBlobStageExpired, cutoff, last.ExpiresAt, last.Namespace, last.ID,
+		)
+	}
+	return page, nil
+}
+
+func (s *SQLiteIndexStore) DeleteExpiredBlobStage(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+	cutoff time.Time,
+) (bool, error) {
+	if id == (ProtectionID{}) {
+		return false, fmt.Errorf("%w: invalid blob stage identity", ErrInvalid)
+	}
+	databaseCutoff, err := protectionTimeToSQLite(cutoff)
+	if err != nil {
+		return false, err
+	}
+	result, err := s.db.ExecContext(ctx,
+		"DELETE FROM blob_stages WHERE namespace = ? AND id = ? AND expires_at <= ?",
+		namespace, id[:], databaseCutoff)
+	if err != nil {
+		return false, fmt.Errorf("xet CAS server: delete expired SQLite blob stage: %w", err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("xet CAS server: inspect expired SQLite blob stage deletion: %w", err)
+	}
+	return deleted != 0, nil
+}
+
 func (s *SQLiteIndexStore) PutFileLease(ctx context.Context, lease FileLease) error {
 	lease, err := normalizeFileLease(lease)
 	if err != nil {
@@ -783,6 +861,84 @@ FROM file_leases`
 		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, last.ID[:])
 	}
 	return page, nil
+}
+
+func (s *SQLiteIndexStore) ListExpiredFileLeases(
+	ctx context.Context,
+	cutoff time.Time,
+	request PageRequest,
+) (FileLeasePage, error) {
+	cutoff, limit, cursor, hasCursor, err := protectionExpiryPage(cutoff, request, cursorFileLeaseExpired)
+	if err != nil {
+		return FileLeasePage{}, err
+	}
+	databaseCutoff, err := protectionTimeToSQLite(cutoff)
+	if err != nil {
+		return FileLeasePage{}, err
+	}
+	const columns = `SELECT namespace, id, file_hash, created_at, expires_at,
+typeof(namespace), typeof(id), typeof(file_hash), typeof(created_at), typeof(expires_at)
+FROM file_leases`
+	var databaseExpiration int64
+	if hasCursor {
+		databaseExpiration, err = protectionTimeToSQLite(cursor.expiresAt)
+		if err != nil {
+			return FileLeasePage{}, err
+		}
+	}
+	query, arguments := sqliteProtectionExpiryQuery(
+		columns, databaseCutoff, databaseExpiration, cursor.namespace, cursor.id, hasCursor, limit,
+	)
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return FileLeasePage{}, fmt.Errorf("xet CAS server: list expired SQLite file leases: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // rows.Err and the explicit close below determine the result.
+	page := FileLeasePage{Items: make([]FileLease, 0, limit)}
+	for rows.Next() {
+		lease, err := scanSQLiteFileLease(rows)
+		if err != nil {
+			return FileLeasePage{}, fmt.Errorf("xet CAS server: scan expired SQLite file lease: %w", err)
+		}
+		page.Items = append(page.Items, lease)
+	}
+	if err := finishSQLiteRows(rows); err != nil {
+		return FileLeasePage{}, fmt.Errorf("xet CAS server: finish expired SQLite file lease page: %w", err)
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeProtectionExpiryCursor(
+			cursorFileLeaseExpired, cutoff, last.ExpiresAt, last.Namespace, last.ID,
+		)
+	}
+	return page, nil
+}
+
+func (s *SQLiteIndexStore) DeleteExpiredFileLease(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+	cutoff time.Time,
+) (bool, error) {
+	if id == (ProtectionID{}) {
+		return false, fmt.Errorf("%w: invalid file lease identity", ErrInvalid)
+	}
+	databaseCutoff, err := protectionTimeToSQLite(cutoff)
+	if err != nil {
+		return false, err
+	}
+	result, err := s.db.ExecContext(ctx,
+		"DELETE FROM file_leases WHERE namespace = ? AND id = ? AND expires_at <= ?",
+		namespace, id[:], databaseCutoff)
+	if err != nil {
+		return false, fmt.Errorf("xet CAS server: delete expired SQLite file lease: %w", err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("xet CAS server: inspect expired SQLite file lease deletion: %w", err)
+	}
+	return deleted != 0, nil
 }
 
 func (s *SQLiteIndexStore) ListXorbs(ctx context.Context, request PageRequest) (XorbRecordPage, error) {
@@ -1058,6 +1214,22 @@ func scopedProtectionQuery(
 			[]any{cursorNamespace, cursorID[:], limit + 1}
 	}
 	return base + order, []any{limit + 1}
+}
+
+func sqliteProtectionExpiryQuery(
+	base string,
+	cutoff, cursorExpiration int64,
+	cursorNamespace string,
+	cursorID ProtectionID,
+	hasCursor bool,
+	limit int,
+) (string, []any) {
+	const order = " ORDER BY expires_at, namespace, id LIMIT ?"
+	if hasCursor {
+		return base + " WHERE expires_at <= ? AND (expires_at, namespace, id) > (?, ?, ?)" + order,
+			[]any{cutoff, cursorExpiration, cursorNamespace, cursorID[:], limit + 1}
+	}
+	return base + " WHERE expires_at <= ?" + order, []any{cutoff, limit + 1}
 }
 
 func scopedSHAQuery(

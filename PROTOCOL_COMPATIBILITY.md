@@ -123,8 +123,12 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
 - optional operational listers provide opaque, operation- and filter-specific
   keyset cursors for blobs, Xorbs, scoped file and dedup records, scoped SHA
   associations, blob stages, and file leases; SQLite query-plan tests prove
-  composite-primary-key seeks, and
-  filesystem pages seek the hash-prefix tree without collecting the whole
+  composite-primary-key seeks, while expiration scans seek dedicated
+  `(expires_at, namespace, id)` indexes with cursors bound to a stable cutoff;
+- memory and SQLite conditionally delete expired stage/lease metadata in the
+  same atomic comparison as deletion, so a stale scan cannot remove a renewed
+  protection; this never deletes payloads or authorizes physical collection;
+- filesystem pages seek the hash-prefix tree without collecting the whole
   store (one four-hex-character leaf remains the minimum sorted work unit); and
 - the same backend contract suite runs against memory/filesystem and
   memory/SQLite, including cancellation, namespace isolation, concurrent
@@ -139,9 +143,9 @@ process running as the service identity is outside its threat model.
 
 Remaining production storage boundaries are:
 
-1. expiry scanning, publication recovery, and grace-based cleanup built on the
-   current durable stages and leases (expiration alone never authorizes object
-   deletion);
+1. publication recovery, expired-stage classification, and grace-based cleanup
+   built on the bounded expiry scans (expiration or protection deletion alone
+   never authorizes object deletion);
 2. catalog reachability roots and read/maintenance epochs for destructive work;
 3. audit, repair, resumable mark-and-sweep, and guarded garbage collection built
    on the current blob/index/protection iteration plus those root primitives;

@@ -228,6 +228,21 @@ type ProtectionStore interface {
 	ListFileLeases(context.Context, *string, PageRequest) (FileLeasePage, error)
 }
 
+// ProtectionExpiryStore is the optional administrative capability used by
+// recovery and garbage collection to scan protections that expired at or
+// before a stable cutoff. Cursors are bound to both the method and cutoff.
+// Conditional deletion prevents a stale scan from removing a concurrently
+// renewed protection. Delete methods remove protection metadata only and must
+// never delete BlobStore payloads. Deleting a stage does not authorize deleting
+// its Blob; callers must first preserve or classify that object under a
+// reachability and grace protocol.
+type ProtectionExpiryStore interface {
+	ListExpiredBlobStages(context.Context, time.Time, PageRequest) (BlobStagePage, error)
+	DeleteExpiredBlobStage(context.Context, string, ProtectionID, time.Time) (bool, error)
+	ListExpiredFileLeases(context.Context, time.Time, PageRequest) (FileLeasePage, error)
+	DeleteExpiredFileLease(context.Context, string, ProtectionID, time.Time) (bool, error)
+}
+
 // IndexLister is the optional operational-iteration capability implemented by
 // durable indexes. A nil namespace lists all namespaces; a non-nil namespace,
 // including a pointer to the empty string, restricts the page to that exact
@@ -265,6 +280,8 @@ const (
 	cursorBlobStageScoped
 	cursorFileLeaseAll
 	cursorFileLeaseScoped
+	cursorBlobStageExpired
+	cursorFileLeaseExpired
 )
 
 func encodeHashCursor(kind byte, hash xethash.Hash) string {
@@ -312,6 +329,79 @@ func decodeCursor(cursor string) ([]byte, error) {
 		return nil, fmt.Errorf("%w: malformed page cursor", ErrInvalid)
 	}
 	return data, nil
+}
+
+type protectionExpiryCursor struct {
+	cutoff    time.Time
+	expiresAt time.Time
+	namespace string
+	id        ProtectionID
+}
+
+func encodeProtectionExpiryCursor(
+	kind byte,
+	cutoff, expiresAt time.Time,
+	namespace string,
+	id ProtectionID,
+) string {
+	data := make([]byte, 21+len(namespace)+len(id))
+	data[0] = kind
+	binary.BigEndian.PutUint64(data[1:9], uint64(cutoff.UnixNano()))
+	binary.BigEndian.PutUint64(data[9:17], uint64(expiresAt.UnixNano()))
+	binary.BigEndian.PutUint32(data[17:21], uint32(len(namespace)))
+	copy(data[21:], namespace)
+	copy(data[21+len(namespace):], id[:])
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func decodeProtectionExpiryCursor(cursor string, kind byte, cutoff time.Time) (protectionExpiryCursor, error) {
+	data, err := decodeCursor(cursor)
+	if err != nil || len(data) < 21+len(ProtectionID{}) || data[0] != kind {
+		return protectionExpiryCursor{}, fmt.Errorf("%w: malformed protection expiry cursor", ErrInvalid)
+	}
+	namespaceSize := uint64(binary.BigEndian.Uint32(data[17:21]))
+	if namespaceSize > uint64(len(data)-21) || uint64(len(data))-21-namespaceSize != uint64(len(ProtectionID{})) {
+		return protectionExpiryCursor{}, fmt.Errorf("%w: malformed protection expiry cursor", ErrInvalid)
+	}
+	storedCutoff := protectionTimeFromCursor(binary.BigEndian.Uint64(data[1:9]))
+	if !storedCutoff.Equal(cutoff) {
+		return protectionExpiryCursor{}, fmt.Errorf("%w: protection expiry cursor cutoff differs from request", ErrInvalid)
+	}
+	namespaceEnd := 21 + int(namespaceSize)
+	var id ProtectionID
+	copy(id[:], data[namespaceEnd:])
+	return protectionExpiryCursor{
+		cutoff: storedCutoff, expiresAt: protectionTimeFromCursor(binary.BigEndian.Uint64(data[9:17])),
+		namespace: string(data[21:namespaceEnd]), id: id,
+	}, nil
+}
+
+func protectionTimeFromCursor(value uint64) time.Time {
+	return time.Unix(0, int64(value)).UTC()
+}
+
+func protectionExpiryPage(
+	cutoff time.Time,
+	request PageRequest,
+	cursorKind byte,
+) (time.Time, int, protectionExpiryCursor, bool, error) {
+	var err error
+	cutoff, err = normalizeProtectionTime(cutoff)
+	if err != nil {
+		return time.Time{}, 0, protectionExpiryCursor{}, false, err
+	}
+	limit, err := pageLimit(request)
+	if err != nil {
+		return time.Time{}, 0, protectionExpiryCursor{}, false, err
+	}
+	if request.Cursor == "" {
+		return cutoff, limit, protectionExpiryCursor{}, false, nil
+	}
+	cursor, err := decodeProtectionExpiryCursor(request.Cursor, cursorKind, cutoff)
+	if err != nil {
+		return time.Time{}, 0, protectionExpiryCursor{}, false, err
+	}
+	return cutoff, limit, cursor, true, nil
 }
 
 func normalizeBlobStage(stage BlobStage) (BlobStage, error) {

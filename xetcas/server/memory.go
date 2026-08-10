@@ -731,6 +731,177 @@ func (s *MemoryStore) ListFileLeases(
 	return page, nil
 }
 
+func (s *MemoryStore) ListExpiredBlobStages(
+	ctx context.Context,
+	cutoff time.Time,
+	request PageRequest,
+) (BlobStagePage, error) {
+	cutoff, limit, cursor, hasCursor, err := protectionExpiryPage(cutoff, request, cursorBlobStageExpired)
+	if err != nil {
+		return BlobStagePage{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return BlobStagePage{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]BlobStage, 0, min(limit+1, len(s.stages)))
+	for _, stage := range s.stages {
+		if err := ctx.Err(); err != nil {
+			return BlobStagePage{}, err
+		}
+		if stage.ExpiresAt.After(cutoff) || hasCursor && compareProtectionExpiry(
+			stage.ExpiresAt, stage.Namespace, stage.ID, cursor.expiresAt, cursor.namespace, cursor.id,
+		) <= 0 {
+			continue
+		}
+		items = keepFirstProtections(items, stage, limit+1, func(left, right BlobStage) int {
+			return compareProtectionExpiry(
+				left.ExpiresAt, left.Namespace, left.ID, right.ExpiresAt, right.Namespace, right.ID,
+			)
+		})
+	}
+	page := BlobStagePage{Items: items}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeProtectionExpiryCursor(
+			cursorBlobStageExpired, cutoff, last.ExpiresAt, last.Namespace, last.ID,
+		)
+	}
+	return page, nil
+}
+
+func (s *MemoryStore) DeleteExpiredBlobStage(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+	cutoff time.Time,
+) (bool, error) {
+	if id == (ProtectionID{}) {
+		return false, fmt.Errorf("%w: invalid blob stage identity", ErrInvalid)
+	}
+	cutoff, err := normalizeProtectionTime(cutoff)
+	if err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	key := scopedProtection{namespace: namespace, id: id}
+	stage, found := s.stages[key]
+	if !found || stage.ExpiresAt.After(cutoff) {
+		return false, nil
+	}
+	delete(s.stages, key)
+	return true, nil
+}
+
+func (s *MemoryStore) ListExpiredFileLeases(
+	ctx context.Context,
+	cutoff time.Time,
+	request PageRequest,
+) (FileLeasePage, error) {
+	cutoff, limit, cursor, hasCursor, err := protectionExpiryPage(cutoff, request, cursorFileLeaseExpired)
+	if err != nil {
+		return FileLeasePage{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return FileLeasePage{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]FileLease, 0, min(limit+1, len(s.leases)))
+	for _, lease := range s.leases {
+		if err := ctx.Err(); err != nil {
+			return FileLeasePage{}, err
+		}
+		if lease.ExpiresAt.After(cutoff) || hasCursor && compareProtectionExpiry(
+			lease.ExpiresAt, lease.Namespace, lease.ID, cursor.expiresAt, cursor.namespace, cursor.id,
+		) <= 0 {
+			continue
+		}
+		items = keepFirstProtections(items, lease, limit+1, func(left, right FileLease) int {
+			return compareProtectionExpiry(
+				left.ExpiresAt, left.Namespace, left.ID, right.ExpiresAt, right.Namespace, right.ID,
+			)
+		})
+	}
+	page := FileLeasePage{Items: items}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeProtectionExpiryCursor(
+			cursorFileLeaseExpired, cutoff, last.ExpiresAt, last.Namespace, last.ID,
+		)
+	}
+	return page, nil
+}
+
+func (s *MemoryStore) DeleteExpiredFileLease(
+	ctx context.Context,
+	namespace string,
+	id ProtectionID,
+	cutoff time.Time,
+) (bool, error) {
+	if id == (ProtectionID{}) {
+		return false, fmt.Errorf("%w: invalid file lease identity", ErrInvalid)
+	}
+	cutoff, err := normalizeProtectionTime(cutoff)
+	if err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	key := scopedProtection{namespace: namespace, id: id}
+	lease, found := s.leases[key]
+	if !found || lease.ExpiresAt.After(cutoff) {
+		return false, nil
+	}
+	delete(s.leases, key)
+	return true, nil
+}
+
+func keepFirstProtections[T any](items []T, value T, limit int, compare func(T, T) int) []T {
+	position := sort.Search(len(items), func(index int) bool {
+		return compare(items[index], value) >= 0
+	})
+	if position >= limit {
+		return items
+	}
+	if len(items) < limit {
+		items = append(items, value)
+	}
+	copy(items[position+1:], items[position:len(items)-1])
+	items[position] = value
+	return items
+}
+
+func compareProtectionExpiry(
+	leftExpiry time.Time,
+	leftNamespace string,
+	leftID ProtectionID,
+	rightExpiry time.Time,
+	rightNamespace string,
+	rightID ProtectionID,
+) int {
+	if comparison := leftExpiry.Compare(rightExpiry); comparison != 0 {
+		return comparison
+	}
+	return compareScopedProtection(leftNamespace, leftID, rightNamespace, rightID)
+}
+
 func scopedProtectionPage(
 	request PageRequest,
 	namespace *string,
