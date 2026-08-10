@@ -94,7 +94,7 @@ type BlobLister interface {
 }
 
 type XorbRecord struct {
-	Blob   BlobKey
+	Blob BlobKey
 	// Layout contains metadata only. Service publication stores Complete in
 	// Blob and clears Layout.Complete before publishing the index record.
 	Layout xorb.Ingested
@@ -344,9 +344,9 @@ type FileLeaseAuditSubject struct {
 	Lease FileLease
 }
 
-// AuditStatus describes only the metadata and forward point checks documented
-// for one AuditKind at the time of their individual lookups. It never proves
-// payload bytes, reachability, retention, liveness, or deletion safety.
+// AuditStatus is the common outcome of an administrative check. The operation
+// and result type define the evidence checked; no status by itself proves
+// reachability, retention, liveness, or deletion safety.
 type AuditStatus string
 
 const (
@@ -406,6 +406,49 @@ type AuditResult struct {
 type AuditPage struct {
 	Kind       AuditKind
 	Items      []AuditResult
+	NextCursor string
+}
+
+// PayloadAuditRequest selects one bounded page of globally stored physical
+// objects for full byte verification. Only BlobXorb and BlobShard are valid;
+// logical namespace reachability is deliberately outside this operation.
+type PayloadAuditRequest struct {
+	Kind BlobKind
+	Page PageRequest
+}
+
+// PayloadAuditFinding classifies full physical-object checks. A successful
+// check proves that the bytes read during that check were the exact canonical
+// durable encoding for Entry.Key. It does not prove reachability, retention,
+// or deletion safety.
+type PayloadAuditFinding string
+
+const (
+	PayloadAuditFindingNone             PayloadAuditFinding = ""
+	PayloadAuditFindingBlobMissing      PayloadAuditFinding = "blob-missing"
+	PayloadAuditFindingSizeInvalid      PayloadAuditFinding = "blob-size-invalid"
+	PayloadAuditFindingPayloadInvalid   PayloadAuditFinding = "payload-invalid"
+	PayloadAuditFindingIdentityMismatch PayloadAuditFinding = "identity-mismatch"
+	PayloadAuditFindingCheckFailed      PayloadAuditFinding = "check-failed"
+)
+
+type PayloadAuditResult struct {
+	Entry   BlobEntry
+	Status  AuditStatus
+	Finding PayloadAuditFinding
+	// Err is nil for no-issue-found and missing outcomes. Invalid payloads
+	// retain ErrCorrupt; failed reads retain their backend error.
+	Err error
+}
+
+// PayloadAuditPage contains checks from one physical-object page. Per-item
+// failures do not fail the page and its continuation advances past them, so
+// callers must retain and retry failed entries explicitly. If AuditBlobPayloads
+// returns a non-nil error, Items may contain completed checks, but NextCursor
+// is always empty and callers must retry the request.
+type PayloadAuditPage struct {
+	Kind       BlobKind
+	Items      []PayloadAuditResult
 	NextCursor string
 }
 
@@ -517,6 +560,7 @@ const (
 	cursorBlobStageExpired
 	cursorFileLeaseExpired
 	cursorAuditEnvelope
+	cursorPayloadAuditEnvelope
 )
 
 // validateShardPublication is shared by durable backends so contradictory

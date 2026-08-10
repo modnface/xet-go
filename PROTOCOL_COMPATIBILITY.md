@@ -33,6 +33,7 @@
 | Typed reconstruction | `Service.OpenFile` streams full files or ranges directly from global physical Xorbs reached through a namespace-scoped file recipe, with chunk/length validation, optional whole-file SHA-256, backpressure, cancellation, and deterministic closure |
 | Local durable storage | Linux/macOS immutable filesystem blobs plus a pure-Go SQLite WAL index; strict file/directory barriers, process-root locking, restart persistence, transactional shard-index publication, and schema-v4 lifecycle and shard-registration metadata |
 | Administrative audit | Bounded, weakly consistent, read-only forward metadata checks across blob/index/protection inventories; no tenant authorization, payload hashing, catalog reachability, repair, or deletion authority |
+| Physical payload audit | Bounded, sequential exact reads of physical Xorbs and shards with canonical durable-form and key-identity verification; no namespace reachability, repair, retention, or deletion authority |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
 | Credential refresh | Refresh 30 seconds before expiry, coalesce concurrent refresh, and retry exactly once after a 401 invalidation |
@@ -55,6 +56,13 @@ identical content, boundaries, lengths, and identities. The adaptive controller
 preserves the official limits and behavioral contract but uses Go-native AIMD rather than
 copying Rust's latency model. Both allowances are explicitly permitted by the
 module boundary because they do not alter the protocol.
+
+Malformed-input permissiveness is not an interoperability promise. The pinned
+negative differential matrix records that xet-core's streaming readers accept
+some empty/truncated Xorb streams and ignore some shard version/footer/trailing
+conditions that Go rejects. Go retains the stricter bounded decoder because it
+accepts every canonical artifact produced by the pinned Rust implementation and
+does not need to accept malformed artifacts for wire compatibility.
 
 The core and server APIs contain no Hugging Face repository, revision, path,
 user token, commit, Git, S3, or LFS concepts. They accept only generic Xet CAS
@@ -159,7 +167,13 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
   determine catalog reachability, or authorize deletion. Physical shard
   reachability remains indeterminate; point failures advance as retained
   diagnostics, while cancellation withholds the cursor and requires retry from
-  the original request; and
+  the original request;
+- a separate bounded physical-payload audit exactly reads one Xorb or shard at
+  a time and verifies its canonical durable encoding and key identity. It
+  distinguishes missing, size-invalid, malformed/noncanonical,
+  identity-mismatched, and backend-failed objects. Success proves only the
+  bytes observed for that object, not namespace reachability, file SHA-256,
+  retention, or deletion safety; and
 - the same backend contract suite runs against memory/filesystem and
   memory/SQLite, including cancellation, namespace isolation, concurrent
   publication and pagination mutation, corrupt-row detection, injected
@@ -177,8 +191,8 @@ Remaining production storage boundaries are:
    blocked recovery stages (expiration or protection deletion alone never
    authorizes object deletion);
 2. catalog reachability roots and read/maintenance epochs for destructive work;
-3. payload-byte audit, repair, resumable mark-and-sweep, and guarded garbage
-   collection built on the current bounded metadata audit and explicit root
+3. repair, resumable mark-and-sweep, and guarded garbage collection built on
+   the current bounded metadata and physical-payload audits plus explicit root
    primitives;
 4. S3-compatible immutable/conditional blob publication and signed range reads;
 5. PostgreSQL migrations and an index/protection implementation with the same

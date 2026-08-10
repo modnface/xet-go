@@ -48,6 +48,16 @@ type decodedShard struct {
 	Verification bool `json:"verification"`
 }
 
+type acceptanceRecord struct {
+	Accepted bool `json:"accepted"`
+}
+
+type artifactAcceptanceCase struct {
+	Body []byte
+	Go   bool
+	Rust bool
+}
+
 type oracleCorpus struct {
 	Size     int           `json:"size"`
 	Chunks   []oracleChunk `json:"chunks"`
@@ -412,6 +422,121 @@ func TestRustDifferentialShard(t *testing.T) {
 	}
 	if decoded.Files != 0 || decoded.Xorbs != 1 {
 		t.Fatalf("Rust decoded protected shard = %+v", decoded)
+	}
+}
+
+func TestRustDifferentialArtifactAcceptance(t *testing.T) {
+	oracle := os.Getenv("XET_RUST_ORACLE")
+	if oracle == "" {
+		t.Skip("set XET_RUST_ORACLE to the binary produced by conformance/build-rust-oracle.sh")
+	}
+
+	object, err := xorb.Encode([][]byte{bytes.Repeat([]byte("negative-xorb-vector"), 4096)}, xorb.LZ4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xorbCases := map[string]artifactAcceptanceCase{
+		"valid":                   {Body: object.Body, Go: true, Rust: true},
+		"empty":                   {Body: []byte{}, Go: false, Rust: true},
+		"short header":            {Body: object.Body[:xorb.HeaderSize-1], Go: false, Rust: false},
+		"truncated payload":       {Body: object.Body[:len(object.Body)-1], Go: false, Rust: true},
+		"trailing partial header": {Body: append(append([]byte(nil), object.Body...), 0), Go: false, Rust: false},
+	}
+	invalidVersion := append([]byte(nil), object.Body...)
+	invalidVersion[0] = 1
+	xorbCases["unsupported version"] = artifactAcceptanceCase{Body: invalidVersion, Go: false, Rust: false}
+	invalidScheme := append([]byte(nil), object.Body...)
+	invalidScheme[4] = 9
+	xorbCases["unsupported scheme"] = artifactAcceptanceCase{Body: invalidScheme, Go: false, Rust: false}
+	zeroCompressed := append([]byte(nil), object.Body...)
+	clear(zeroCompressed[1:4])
+	xorbCases["zero compressed length"] = artifactAcceptanceCase{Body: zeroCompressed, Go: false, Rust: false}
+	zeroUncompressed := append([]byte(nil), object.Body...)
+	clear(zeroUncompressed[5:8])
+	xorbCases["zero uncompressed length"] = artifactAcceptanceCase{Body: zeroUncompressed, Go: false, Rust: false}
+	for name, test := range xorbCases {
+		t.Run("Xorb/"+name, func(t *testing.T) {
+			compareArtifactAcceptance(t, oracle, "accept-xorb", test, func() error {
+				_, err := xorb.Decode(test.Body)
+				return err
+			})
+		})
+	}
+
+	parts := chunker.Bytes(bytes.Repeat([]byte("negative-shard-vector"), 20_000))
+	chunks := make([][]byte, len(parts))
+	for i := range parts {
+		chunks[i] = parts[i].Data
+	}
+	shardXorb, err := xorb.Encode(chunks, xorb.None)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xorbInfo, err := shard.XorbFromObject(shardXorb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logical := shard.Shard{Xorbs: []shard.Xorb{xorbInfo}}
+	uploadShard, err := shard.EncodeUpload(logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullShard, err := shard.EncodeFull(logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shardCases := map[string]artifactAcceptanceCase{
+		"valid upload":         {Body: uploadShard, Go: true, Rust: true},
+		"valid full":           {Body: fullShard, Go: true, Rust: true},
+		"empty":                {Body: []byte{}, Go: false, Rust: false},
+		"short header":         {Body: uploadShard[:shard.HeaderSize-1], Go: false, Rust: false},
+		"truncated upload":     {Body: uploadShard[:len(uploadShard)-1], Go: false, Rust: false},
+		"truncated full":       {Body: fullShard[:len(fullShard)-1], Go: false, Rust: true},
+		"trailing upload data": {Body: append(append([]byte(nil), uploadShard...), 0), Go: false, Rust: true},
+	}
+	wrongMagic := append([]byte(nil), uploadShard...)
+	wrongMagic[0] ^= 1
+	shardCases["wrong magic"] = artifactAcceptanceCase{Body: wrongMagic, Go: false, Rust: false}
+	wrongVersion := append([]byte(nil), uploadShard...)
+	wrongVersion[32]++
+	shardCases["unsupported version"] = artifactAcceptanceCase{Body: wrongVersion, Go: false, Rust: true}
+	invalidFooterSize := append([]byte(nil), uploadShard...)
+	invalidFooterSize[40] = 1
+	shardCases["invalid footer size"] = artifactAcceptanceCase{Body: invalidFooterSize, Go: false, Rust: true}
+	for name, test := range shardCases {
+		t.Run("shard/"+name, func(t *testing.T) {
+			compareArtifactAcceptance(t, oracle, "accept-shard", test, func() error {
+				_, err := shard.Decode(test.Body)
+				return err
+			})
+		})
+	}
+}
+
+func compareArtifactAcceptance(
+	t testing.TB,
+	oracle string,
+	mode string,
+	test artifactAcceptanceCase,
+	goDecode func() error,
+) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "artifact.bin")
+	if err := os.WriteFile(path, test.Body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command(oracle, mode, path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("Rust %s: %v\n%s", mode, err, output)
+	}
+	var rust acceptanceRecord
+	if err := json.Unmarshal(output, &rust); err != nil {
+		t.Fatalf("decode Rust %s result: %v\n%s", mode, err, output)
+	}
+	goAccepted := goDecode() == nil
+	if goAccepted != test.Go || rust.Accepted != test.Rust {
+		t.Fatalf("artifact acceptance changed: Go accepted=%v (want %v), Rust accepted=%v (want %v)",
+			goAccepted, test.Go, rust.Accepted, test.Rust)
 	}
 }
 

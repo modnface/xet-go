@@ -21,6 +21,14 @@ The Rust checkout and binary live below ignored `.oracle/`. They are development
 and CI dependencies only; the released Go module remains pure Go and CGO-free.
 The build uses Rust 1.95.0 because the pinned upstream source uses standard
 library APIs newer than the module's product toolchain requirements.
+The differential gate compares positive encoding and decoding in both
+directions and pins the Go/Rust acceptance matrix for deterministic malformed,
+truncated, and corrupt network Xorbs and upload/full MDB shards. The Go decoder
+intentionally rejects several malformed forms accepted by xet-core's permissive
+streaming parsers; canonical valid forms must remain accepted by both. Oracle
+acceptance modes return structured JSON rather than panicking on rejected
+input, so both shared and intentionally stricter boundaries remain ordinary
+conformance assertions.
 
 Download and checksum the official protocol reference files from their pinned
 Hugging Face revision, then run the full-corpus gate:

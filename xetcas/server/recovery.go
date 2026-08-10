@@ -155,20 +155,12 @@ func (s *Service) recoverXorbStage(
 }
 
 func xorbRecordFromComplete(body []byte, key BlobKey) (XorbRecord, error) {
-	object, err := xorb.Decode(body)
+	object, err := decodeCanonicalXorb(body)
 	if err != nil {
 		return XorbRecord{}, err
 	}
-	if object.Footer == nil || object.Footer.Version != 1 || object.LegacyTrailer ||
-		object.Footer.UniquenessNonce != ([4]byte{}) || object.Hash != key.Hash || object.FooterOffset == 0 {
-		return XorbRecord{}, errors.New("stored xorb is not a canonical complete object")
-	}
-	canonical, err := xorb.EncodeComplete(object, [4]byte{})
-	if err != nil {
-		return XorbRecord{}, err
-	}
-	if !bytes.Equal(canonical, body) {
-		return XorbRecord{}, errors.New("stored xorb complete encoding is not canonical")
+	if object.Hash != key.Hash {
+		return XorbRecord{}, errors.New("stored xorb identity differs from key")
 	}
 	record := XorbRecord{Blob: key, Layout: xorb.Ingested{
 		Hash: object.Hash, NetworkBytes: object.FooterOffset, UncompressedSize: object.UncompressedSize,
@@ -183,31 +175,36 @@ func xorbRecordFromComplete(body []byte, key BlobKey) (XorbRecord, error) {
 	return record, nil
 }
 
+func decodeCanonicalXorb(body []byte) (*xorb.Object, error) {
+	object, err := xorb.Decode(body)
+	if err != nil {
+		return nil, err
+	}
+	if object.Footer == nil || object.Footer.Version != 1 || object.LegacyTrailer ||
+		object.Footer.UniquenessNonce != ([4]byte{}) || object.FooterOffset == 0 {
+		return nil, errors.New("stored xorb is not a canonical complete object")
+	}
+	canonical, err := xorb.EncodeComplete(object, [4]byte{})
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(canonical, body) {
+		return nil, errors.New("stored xorb complete encoding is not canonical")
+	}
+	return object, nil
+}
+
 func (s *Service) recoverShardStage(
 	ctx context.Context,
 	stage BlobStage,
 	body []byte,
 ) BlobStageRecoveryResult {
+	logical, err := decodeCanonicalShard(body)
+	if err != nil {
+		return corruptRecovery(stage, BlobStageRecoveryValidate, err)
+	}
 	if xethash.Chunk(body) != stage.Blob.Hash {
-		return corruptRecovery(stage, BlobStageRecoveryValidate, errors.New("stored shard hash differs from key"))
-	}
-	decoded, err := shard.Decode(body)
-	if err != nil || decoded.Footer == nil {
-		if err == nil {
-			err = errors.New("stored shard is footerless")
-		}
-		return corruptRecovery(stage, BlobStageRecoveryValidate, err)
-	}
-	logical := shard.Shard{
-		Files: append([]shard.File(nil), decoded.Files...),
-		Xorbs: append([]shard.Xorb(nil), decoded.Xorbs...),
-	}
-	canonical, err := shard.EncodeFull(logical)
-	if err != nil || !bytes.Equal(canonical, body) {
-		if err == nil {
-			err = errors.New("stored shard full encoding is not canonical")
-		}
-		return corruptRecovery(stage, BlobStageRecoveryValidate, err)
+		return corruptRecovery(stage, BlobStageRecoveryValidate, errors.New("stored shard identity differs from key"))
 	}
 	registration, err := s.validateShardRegistration(ctx, logical)
 	if err != nil {
@@ -233,6 +230,28 @@ func (s *Service) recoverShardStage(
 		return BlobStageRecoveryResult{Stage: stage, Status: status, Phase: BlobStageRecoveryPublish, Err: err}
 	}
 	return BlobStageRecoveryResult{Stage: stage, Status: BlobStageRecoveryPublishedNotRemoved}
+}
+
+func decodeCanonicalShard(body []byte) (shard.Shard, error) {
+	decoded, err := shard.Decode(body)
+	if err != nil {
+		return shard.Shard{}, err
+	}
+	if decoded.Footer == nil {
+		return shard.Shard{}, errors.New("stored shard is footerless")
+	}
+	logical := shard.Shard{
+		Files: append([]shard.File(nil), decoded.Files...),
+		Xorbs: append([]shard.Xorb(nil), decoded.Xorbs...),
+	}
+	canonical, err := shard.EncodeFull(logical)
+	if err != nil {
+		return shard.Shard{}, err
+	}
+	if !bytes.Equal(canonical, body) {
+		return shard.Shard{}, errors.New("stored shard full encoding is not canonical")
+	}
+	return logical, nil
 }
 
 func corruptRecovery(

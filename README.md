@@ -284,6 +284,21 @@ retry failed subjects explicitly. Cancellation may return completed diagnostic
 items, but never a continuation; retry from the original request cursor. There
 is no repair or payload-sweep API.
 
+`Service.AuditBlobPayloads` is the separate, stronger physical-byte check. It
+lists one bounded Xorb or shard page, reads each object exactly and one at a
+time, closes every reader, and validates the canonical durable encoding and
+its key identity. Xorbs must be current V1 complete objects with a zero
+uniqueness nonce; shards must be canonical full shards. Results distinguish a
+missing object, invalid listed/read size, malformed or noncanonical payload,
+key/content identity mismatch, and backend check failure. A successful result
+proves only the bytes read for that object at that time. It does not inspect
+namespace-scoped registration or catalog reachability, recompute reconstructed
+file SHA-256 values, repair content, or authorize retention or deletion. Like
+the metadata audit, it is administrative, weakly consistent across pages, and
+withholds the continuation cursor after cancellation. Backend point failures
+remain per-item diagnostics and iteration advances past them, so operators must
+retain and retry failed entries explicitly.
+
 Embedders can stream reconstructed content without interpreting protocol JSON
 or making an internal HTTP request:
 

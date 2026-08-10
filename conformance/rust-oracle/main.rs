@@ -132,6 +132,11 @@ struct DecodedShardRecord {
 }
 
 #[derive(Serialize)]
+struct AcceptanceRecord {
+    accepted: bool,
+}
+
+#[derive(Serialize)]
 struct SubtreeRecord {
     full: MerkleHashSubtree,
     left: MerkleHashSubtree,
@@ -422,7 +427,7 @@ fn main() -> ExitCode {
     let args: Vec<_> = env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "usage: xet-go-rust-oracle <corpus|bench|perf|subtree|encode-xorb|encode-xorb-complete|decode-xorb|encode-shard|decode-shard|remote-roundtrip> <file> [argument]"
+            "usage: xet-go-rust-oracle <corpus|bench|perf|subtree|encode-xorb|encode-xorb-complete|decode-xorb|accept-xorb|encode-shard|decode-shard|accept-shard|remote-roundtrip> <file> [argument]"
         );
         return ExitCode::from(2);
     }
@@ -571,6 +576,13 @@ fn main() -> ExitCode {
                 .unwrap()
             );
         }
+        "accept-xorb" => println!(
+            "{}",
+            serde_json::to_string(&AcceptanceRecord {
+                accepted: deserialize_chunks(&mut Cursor::new(&data)).is_ok(),
+            })
+            .unwrap()
+        ),
         "encode-shard" => {
             let chunks = Chunker::default().next_block(&data, true);
             let nodes: Vec<_> = chunks
@@ -649,6 +661,13 @@ fn main() -> ExitCode {
                 .unwrap()
             );
         }
+        "accept-shard" => println!(
+            "{}",
+            serde_json::to_string(&AcceptanceRecord {
+                accepted: MDBMinimalShard::from_reader(&mut Cursor::new(&data), true, true).is_ok(),
+            })
+            .unwrap()
+        ),
         command => {
             eprintln!("unknown command {command:?}");
             return ExitCode::from(2);
