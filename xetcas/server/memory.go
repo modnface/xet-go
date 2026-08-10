@@ -39,6 +39,7 @@ type MemoryStore struct {
 	mu     sync.RWMutex
 	blobs  map[BlobKey][]byte
 	xorbs  map[xethash.Hash]XorbRecord
+	shards map[scopedHash]ShardRecord
 	files  map[scopedHash]FileRecord
 	dedup  map[scopedHash]DedupRecord
 	sha256 map[shaKey]xethash.Hash
@@ -49,10 +50,29 @@ type MemoryStore struct {
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		blobs: make(map[BlobKey][]byte), xorbs: make(map[xethash.Hash]XorbRecord),
-		files: make(map[scopedHash]FileRecord), dedup: make(map[scopedHash]DedupRecord),
+		shards: make(map[scopedHash]ShardRecord),
+		files:  make(map[scopedHash]FileRecord), dedup: make(map[scopedHash]DedupRecord),
 		sha256: make(map[shaKey]xethash.Hash),
 		stages: make(map[scopedProtection]BlobStage), leases: make(map[scopedProtection]FileLease),
 	}
+}
+
+func (s *MemoryStore) GetShard(ctx context.Context, namespace string, hash xethash.Hash) (ShardRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return ShardRecord{}, false, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return ShardRecord{}, false, err
+	}
+	value, ok := s.shards[scopedHash{namespace: namespace, hash: hash}]
+	if ok {
+		if err := validateShardRecord(hash, value); err != nil {
+			return ShardRecord{}, false, err
+		}
+	}
+	return value, ok, nil
 }
 
 func (s *MemoryStore) PutIfAbsent(ctx context.Context, key BlobKey, body io.Reader, size int64) (bool, error) {
@@ -208,6 +228,11 @@ func (s *MemoryStore) GetFile(ctx context.Context, namespace string, hash xethas
 		return FileRecord{}, false, err
 	}
 	value, ok := s.files[scopedHash{namespace: namespace, hash: hash}]
+	if ok {
+		if err := validateFileRecord(hash, value); err != nil {
+			return FileRecord{}, false, err
+		}
+	}
 	return cloneFileRecord(value), ok, nil
 }
 
@@ -241,6 +266,11 @@ func (s *MemoryStore) GetDedup(ctx context.Context, namespace string, hash xetha
 		return DedupRecord{}, false, err
 	}
 	value, ok := s.dedup[scopedHash{namespace: namespace, hash: hash}]
+	if ok {
+		if err := validateDedupRecord(value); err != nil {
+			return DedupRecord{}, false, err
+		}
+	}
 	return value, ok, nil
 }
 
@@ -298,6 +328,9 @@ func (s *MemoryStore) PublishShard(ctx context.Context, publication ShardPublica
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := validateShardPublication(publication); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -305,6 +338,28 @@ func (s *MemoryStore) PublishShard(ctx context.Context, publication ShardPublica
 	}
 	// Preflight every immutable SHA association before changing any map. File
 	// and dedup records deliberately retain their first already-valid source.
+	shardKey := scopedHash{namespace: publication.Namespace, hash: publication.Shard.Hash}
+	if previous, ok := s.shards[shardKey]; ok {
+		if err := validateShardRecord(shardKey.hash, previous); err != nil {
+			return err
+		}
+	}
+	for _, association := range publication.Dedup {
+		key := scopedHash{namespace: publication.Namespace, hash: association.Chunk}
+		if previous, ok := s.dedup[key]; ok {
+			if err := validateDedupRecord(previous); err != nil {
+				return err
+			}
+		}
+	}
+	for _, record := range publication.Files {
+		key := scopedHash{namespace: publication.Namespace, hash: record.File.File.Hash}
+		if previous, ok := s.files[key]; ok {
+			if err := validateFileRecord(key.hash, previous); err != nil {
+				return err
+			}
+		}
+	}
 	pendingSHA := make(map[shaKey]xethash.Hash, len(publication.SHA256))
 	for _, association := range publication.SHA256 {
 		key := shaKey{namespace: publication.Namespace, sum: association.Sum, size: association.Size}
@@ -330,6 +385,9 @@ func (s *MemoryStore) PublishShard(ctx context.Context, publication ShardPublica
 		if _, ok := s.files[key]; !ok {
 			s.files[key] = cloneFileRecord(record)
 		}
+	}
+	if _, ok := s.shards[shardKey]; !ok {
+		s.shards[shardKey] = ShardRecord{Blob: publication.Shard}
 	}
 	return nil
 }
@@ -371,6 +429,45 @@ func (s *MemoryStore) ListXorbs(ctx context.Context, request PageRequest) (XorbR
 	return page, nil
 }
 
+func (s *MemoryStore) ListShards(ctx context.Context, namespace *string, request PageRequest) (ShardRecordPage, error) {
+	cursorKind := cursorShardAll
+	if namespace != nil {
+		cursorKind = cursorShardScoped
+	}
+	limit, cursorNamespace, cursorHash, hasCursor, err := scopedHashPage(request, namespace, cursorKind)
+	if err != nil {
+		return ShardRecordPage{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return ShardRecordPage{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]ScopedShardRecord, 0, min(limit+1, len(s.shards)))
+	for key, record := range s.shards {
+		if err := ctx.Err(); err != nil {
+			return ShardRecordPage{}, err
+		}
+		if namespace != nil && key.namespace != *namespace || hasCursor && compareScopedHash(key.namespace, key.hash, cursorNamespace, cursorHash) <= 0 {
+			continue
+		}
+		if err := validateShardRecord(key.hash, record); err != nil {
+			return ShardRecordPage{}, err
+		}
+		items = append(items, ScopedShardRecord{Namespace: key.namespace, Record: record})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return compareScopedHash(items[i].Namespace, items[i].Record.Blob.Hash, items[j].Namespace, items[j].Record.Blob.Hash) < 0
+	})
+	page := ShardRecordPage{Items: items}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, last.Record.Blob.Hash[:])
+	}
+	return page, nil
+}
+
 func (s *MemoryStore) ListFiles(
 	ctx context.Context,
 	namespace *string,
@@ -399,6 +496,9 @@ func (s *MemoryStore) ListFiles(
 		}
 		if hasCursor && compareScopedHash(key.namespace, key.hash, cursorNamespace, cursorHash) <= 0 {
 			continue
+		}
+		if err := validateFileRecord(key.hash, record); err != nil {
+			return FileRecordPage{}, err
 		}
 		items = append(items, ScopedFileRecord{Namespace: key.namespace, Record: cloneFileRecord(record)})
 	}
@@ -443,6 +543,9 @@ func (s *MemoryStore) ListDedup(
 		}
 		if hasCursor && compareScopedHash(key.namespace, key.hash, cursorNamespace, cursorHash) <= 0 {
 			continue
+		}
+		if err := validateDedupRecord(record); err != nil {
+			return DedupRecordPage{}, err
 		}
 		items = append(items, ScopedDedupRecord{Namespace: key.namespace, Chunk: key.hash, Record: record})
 	}

@@ -208,7 +208,7 @@ func TestMemoryStoreBlobContractsAndClonesIndexes(t *testing.T) {
 	sum := [32]byte{7}
 	fileRecord := FileRecord{File: shard.RegisteredFile{File: shard.File{
 		Hash: fileHash, SHA256: &sum, Terms: []shard.Term{{XorbHash: key.Hash, Start: 0, End: 1}},
-	}, Size: 5}}
+	}, Size: 5}, Shard: BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("file shard"))}}
 	if err := store.PutFile(ctx, "scope", fileRecord); err != nil {
 		t.Fatal(err)
 	}
@@ -245,17 +245,19 @@ func TestMemoryStorePublishesShardIndexesAtomically(t *testing.T) {
 	fileHash := xethash.Chunk([]byte("atomic file"))
 	chunkHash := xethash.Chunk([]byte("atomic chunk"))
 	sum := sha256.Sum256([]byte("atomic bytes"))
+	shardKey := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("shard"))}
 	publication := ShardPublication{
 		Namespace: "scope",
+		Shard:     shardKey,
 		Dedup: []DedupAssociation{{
 			Chunk: chunkHash,
-			Value: DedupRecord{Shard: BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("shard"))}},
+			Value: DedupRecord{Shard: shardKey},
 		}},
 		SHA256: []SHA256Association{
 			{Sum: sum, Size: 12, File: fileHash},
 			{Sum: sum, Size: 12, File: xethash.Chunk([]byte("conflict"))},
 		},
-		Files: []FileRecord{{File: shard.RegisteredFile{File: shard.File{Hash: fileHash}, Size: 12}}},
+		Files: []FileRecord{{File: shard.RegisteredFile{File: shard.File{Hash: fileHash}, Size: 12}, Shard: shardKey}},
 	}
 	if err := store.PublishShard(ctx, publication); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting publication = %v", err)

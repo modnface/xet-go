@@ -117,6 +117,22 @@ type SHA256Association struct {
 	File xethash.Hash
 }
 
+// ShardRecord registers a successfully published logical shard. Registration
+// is namespace-scoped even though the immutable shard blob remains global.
+type ShardRecord struct {
+	Blob BlobKey
+}
+
+type ScopedShardRecord struct {
+	Namespace string
+	Record    ShardRecord
+}
+
+type ShardRecordPage struct {
+	Items      []ScopedShardRecord
+	NextCursor string
+}
+
 type ScopedFileRecord struct {
 	Namespace string
 	Record    FileRecord
@@ -228,6 +244,7 @@ type FileLeasePage struct {
 // Namespace or expose none of them.
 type ShardPublication struct {
 	Namespace string
+	Shard     BlobKey
 	Dedup     []DedupAssociation
 	SHA256    []SHA256Association
 	Files     []FileRecord
@@ -244,6 +261,7 @@ type ShardPublication struct {
 type IndexStore interface {
 	GetXorb(context.Context, xethash.Hash) (XorbRecord, bool, error)
 	PutXorb(context.Context, XorbRecord) error
+	GetShard(context.Context, string, xethash.Hash) (ShardRecord, bool, error)
 	GetFile(context.Context, string, xethash.Hash) (FileRecord, bool, error)
 	PutFile(context.Context, string, FileRecord) error
 	GetDedup(context.Context, string, xethash.Hash) (DedupRecord, bool, error)
@@ -294,6 +312,7 @@ type ProtectionExpiryStore interface {
 // this interface performs no tenant authorization.
 type IndexLister interface {
 	ListXorbs(context.Context, PageRequest) (XorbRecordPage, error)
+	ListShards(context.Context, *string, PageRequest) (ShardRecordPage, error)
 	ListFiles(context.Context, *string, PageRequest) (FileRecordPage, error)
 	ListDedup(context.Context, *string, PageRequest) (DedupRecordPage, error)
 	ListSHA256(context.Context, *string, PageRequest) (SHA256AssociationPage, error)
@@ -313,6 +332,8 @@ const (
 	cursorBlobXorb byte = iota + 1
 	cursorBlobShard
 	cursorIndexXorb
+	cursorShardAll
+	cursorShardScoped
 	cursorFileAll
 	cursorFileScoped
 	cursorDedupAll
@@ -326,6 +347,50 @@ const (
 	cursorBlobStageExpired
 	cursorFileLeaseExpired
 )
+
+// validateShardPublication is shared by durable backends so contradictory
+// source identities are rejected before any state changes.
+func validateShardPublication(publication ShardPublication) error {
+	if err := validateShardSource(publication.Shard); err != nil {
+		return fmt.Errorf("%w: invalid shard publication identity", ErrInvalid)
+	}
+	for _, association := range publication.Dedup {
+		if association.Value.Shard != publication.Shard {
+			return fmt.Errorf("%w: dedup source differs from publication shard", ErrInvalid)
+		}
+	}
+	for _, record := range publication.Files {
+		if record.Shard != publication.Shard {
+			return fmt.Errorf("%w: file source differs from publication shard", ErrInvalid)
+		}
+	}
+	return nil
+}
+
+func validateShardSource(source BlobKey) error {
+	if source.Kind != BlobShard || source.Hash == xethash.Zero {
+		return fmt.Errorf("%w: invalid shard source", ErrCorrupt)
+	}
+	return nil
+}
+
+func validateShardRecord(key xethash.Hash, record ShardRecord) error {
+	if err := validateShardSource(record.Blob); err != nil || record.Blob.Hash != key {
+		return fmt.Errorf("%w: shard record identity mismatch", ErrCorrupt)
+	}
+	return nil
+}
+
+func validateFileRecord(key xethash.Hash, record FileRecord) error {
+	if record.File.File.Hash != key {
+		return fmt.Errorf("%w: file record identity mismatch", ErrCorrupt)
+	}
+	return validateShardSource(record.Shard)
+}
+
+func validateDedupRecord(record DedupRecord) error {
+	return validateShardSource(record.Shard)
+}
 
 func encodeHashCursor(kind byte, hash xethash.Hash) string {
 	data := make([]byte, 1+len(hash))

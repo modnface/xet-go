@@ -468,6 +468,7 @@ func makeShardPublication(
 ) ShardPublication {
 	publication := ShardPublication{
 		Namespace: namespace,
+		Shard:     shardKey,
 		Dedup:     make([]DedupAssociation, 0, len(registration.GlobalDedupChunks)),
 		SHA256:    make([]SHA256Association, 0, len(registration.Files)),
 		Files:     make([]FileRecord, 0, len(registration.Files)),

@@ -203,11 +203,14 @@ cas, err := server.New(server.Options{
 Filesystem writes use exact-length temporary files, file sync, non-replacing
 hard-link publication, and directory durability barriers. SQLite uses WAL,
 `synchronous=FULL`, immediate write transactions, and one atomic
-`PublishShard` transaction. Schema version 3 enforces SQLite storage classes as
-well as key lengths and adds durable namespace-scoped blob stages and file read
-leases. Both constructors reject symlinked leaf paths and return
-`ErrDurabilityUnsupported` without modifying their target on platforms where
-strict directory durability is not implemented.
+`PublishShard` transaction. Schema version 4 adds durable namespace-scoped
+shard registrations to the typed tables introduced by earlier versions. The
+v3-to-v4 migration boundedly backfills shard sources visible in existing file
+and dedup indexes. New namespace-scoped shard registrations commit atomically
+with their file, dedup, and SHA indexes and are available through bounded
+`IndexLister` pagination. Both constructors reject symlinked leaf paths and
+return `ErrDurabilityUnsupported` without modifying their target on platforms
+where strict directory durability is not implemented.
 
 When the index implements `ProtectionStore`, the service durably stages each
 Xorb or shard before writing its immutable blob, renews that stage throughout a

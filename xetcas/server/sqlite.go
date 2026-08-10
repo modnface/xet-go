@@ -17,7 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const sqliteSchemaVersion = 3
+const sqliteSchemaVersion = 4
 
 // SQLiteIndexStore is a durable single-node IndexStore. Payload bytes remain
 // in a BlobStore; SQLite contains only validated layouts, recipes, and scoped
@@ -161,8 +161,17 @@ func (s *SQLiteIndexStore) initialize(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, sqliteSchemaV3); err != nil {
 			return fmt.Errorf("xet CAS server: migrate SQLite schema to version 3: %w", err)
 		}
+		version = 3
 	}
-	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 3"); err != nil {
+	if version < 4 {
+		if _, err := tx.ExecContext(ctx, sqliteSchemaV4); err != nil {
+			return fmt.Errorf("xet CAS server: migrate SQLite schema to version 4: %w", err)
+		}
+		if err := backfillSQLiteShards(ctx, tx); err != nil {
+			return fmt.Errorf("xet CAS server: backfill SQLite shard registrations: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 4"); err != nil {
 		return fmt.Errorf("xet CAS server: record SQLite schema version: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -300,6 +309,97 @@ CREATE TABLE file_leases (
 CREATE INDEX file_leases_expiration ON file_leases(expires_at, namespace, id);
 `
 
+const sqliteSchemaV4 = `
+CREATE TABLE shards (
+    namespace TEXT NOT NULL CHECK(typeof(namespace) = 'text'),
+    hash BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 32),
+    record BLOB NOT NULL CHECK(typeof(record) = 'blob'),
+    PRIMARY KEY(namespace, hash)
+) WITHOUT ROWID;
+`
+
+func backfillSQLiteShards(ctx context.Context, tx *sql.Tx) error {
+	const batchSize = 256
+	for _, source := range []struct{ table, key string }{{"files", "hash"}, {"dedup", "chunk_hash"}} {
+		var cursorNamespace string
+		var cursorHash []byte
+		hasCursor := false
+		for {
+			query := "SELECT namespace, " + source.key + ", record, typeof(namespace), typeof(" + source.key + "), typeof(record) FROM " + source.table
+			args := []any{batchSize}
+			if hasCursor {
+				query += " WHERE (namespace, " + source.key + ") > (?, ?)"
+				args = []any{cursorNamespace, cursorHash, batchSize}
+			}
+			query += " ORDER BY namespace, " + source.key + " LIMIT ?"
+			rows, err := tx.QueryContext(ctx, query, args...)
+			if err != nil {
+				return err
+			}
+			type item struct {
+				namespace   string
+				key, record []byte
+			}
+			items := make([]item, 0, batchSize)
+			for rows.Next() {
+				var value item
+				var namespaceType, keyType, recordType string
+				if err := rows.Scan(&value.namespace, &value.key, &value.record, &namespaceType, &keyType, &recordType); err != nil {
+					_ = rows.Close()
+					return err
+				}
+				if namespaceType != "text" || keyType != "blob" || recordType != "blob" || len(value.key) != len(xethash.Hash{}) {
+					_ = rows.Close()
+					return fmt.Errorf("%w: malformed legacy %s record", ErrCorrupt, source.table)
+				}
+				items = append(items, value)
+			}
+			if err := finishSQLiteRows(rows); err != nil {
+				return err
+			}
+			for _, item := range items {
+				key, err := sqliteHash(item.key)
+				if err != nil {
+					return err
+				}
+				var blob BlobKey
+				if source.table == "files" {
+					var record FileRecord
+					if err := decodeIndexRecord(item.record, &record); err != nil {
+						return err
+					}
+					if err := validateFileRecord(key, record); err != nil {
+						return err
+					}
+					blob = record.Shard
+				} else {
+					var record DedupRecord
+					if err := decodeIndexRecord(item.record, &record); err != nil {
+						return err
+					}
+					if err := validateDedupRecord(record); err != nil {
+						return err
+					}
+					blob = record.Shard
+				}
+				data, err := encodeIndexRecord(ShardRecord{Blob: blob})
+				if err != nil {
+					return err
+				}
+				if _, err := tx.ExecContext(ctx, "INSERT INTO shards(namespace, hash, record) VALUES(?, ?, ?) ON CONFLICT(namespace, hash) DO NOTHING", item.namespace, hashBytes(blob.Hash), data); err != nil {
+					return err
+				}
+			}
+			if len(items) < batchSize {
+				break
+			}
+			last := items[len(items)-1]
+			cursorNamespace, cursorHash, hasCursor = last.namespace, append([]byte(nil), last.key...), true
+		}
+	}
+	return nil
+}
+
 func (s *SQLiteIndexStore) Close() error { return s.db.Close() }
 
 func encodeIndexRecord(value any) ([]byte, error) {
@@ -315,6 +415,72 @@ func decodeIndexRecord(data []byte, destination any) error {
 		return fmt.Errorf("%w: decode SQLite index record: %v", ErrCorrupt, err)
 	}
 	return nil
+}
+
+func verifySQLiteShardRow(ctx context.Context, tx *sql.Tx, namespace string, hash xethash.Hash) error {
+	var keyData, data []byte
+	var keyType, recordType string
+	err := tx.QueryRowContext(ctx, "SELECT hash, record, typeof(hash), typeof(record) FROM shards WHERE namespace = ? AND hash = ?", namespace, hashBytes(hash)).Scan(&keyData, &data, &keyType, &recordType)
+	if err != nil {
+		return fmt.Errorf("xet CAS server: verify SQLite shard publication: %w", err)
+	}
+	if keyType != "blob" || recordType != "blob" {
+		return fmt.Errorf("%w: malformed SQLite shard storage class", ErrCorrupt)
+	}
+	key, err := sqliteHash(keyData)
+	if err != nil {
+		return err
+	}
+	var record ShardRecord
+	if err := decodeIndexRecord(data, &record); err != nil {
+		return err
+	}
+	return validateShardRecord(key, record)
+}
+
+func verifySQLiteFileRow(ctx context.Context, tx *sql.Tx, namespace string, hash xethash.Hash) error {
+	var keyData, data []byte
+	var keyType, recordType string
+	err := tx.QueryRowContext(ctx, "SELECT hash, record, typeof(hash), typeof(record) FROM files WHERE namespace = ? AND hash = ?", namespace, hashBytes(hash)).Scan(&keyData, &data, &keyType, &recordType)
+	if err != nil {
+		return fmt.Errorf("xet CAS server: verify SQLite file publication: %w", err)
+	}
+	if keyType != "blob" || recordType != "blob" {
+		return fmt.Errorf("%w: malformed SQLite file storage class", ErrCorrupt)
+	}
+	key, err := sqliteHash(keyData)
+	if err != nil {
+		return err
+	}
+	var record FileRecord
+	if err := decodeIndexRecord(data, &record); err != nil {
+		return err
+	}
+	return validateFileRecord(key, record)
+}
+
+func verifySQLiteDedupRow(ctx context.Context, tx *sql.Tx, namespace string, hash xethash.Hash) error {
+	var keyData, data []byte
+	var keyType, recordType string
+	err := tx.QueryRowContext(ctx, "SELECT chunk_hash, record, typeof(chunk_hash), typeof(record) FROM dedup WHERE namespace = ? AND chunk_hash = ?", namespace, hashBytes(hash)).Scan(&keyData, &data, &keyType, &recordType)
+	if err != nil {
+		return fmt.Errorf("xet CAS server: verify SQLite dedup publication: %w", err)
+	}
+	if keyType != "blob" || recordType != "blob" {
+		return fmt.Errorf("%w: malformed SQLite dedup storage class", ErrCorrupt)
+	}
+	key, err := sqliteHash(keyData)
+	if err != nil {
+		return err
+	}
+	if key != hash {
+		return fmt.Errorf("%w: SQLite dedup identity mismatch", ErrCorrupt)
+	}
+	var record DedupRecord
+	if err := decodeIndexRecord(data, &record); err != nil {
+		return err
+	}
+	return validateDedupRecord(record)
 }
 
 func hashBytes(hash xethash.Hash) []byte { return append([]byte(nil), hash[:]...) }
@@ -343,6 +509,40 @@ func (s *SQLiteIndexStore) GetXorb(ctx context.Context, hash xethash.Hash) (Xorb
 		return XorbRecord{}, false, fmt.Errorf("%w: SQLite xorb identity mismatch", ErrCorrupt)
 	}
 	return value, true, nil
+}
+
+func (s *SQLiteIndexStore) GetShard(ctx context.Context, namespace string, hash xethash.Hash) (ShardRecord, bool, error) {
+	var keyData, data []byte
+	var namespaceType, keyType, recordType string
+	err := s.db.QueryRowContext(ctx, `
+SELECT hash, record, typeof(namespace), typeof(hash), typeof(record)
+FROM shards WHERE namespace = ? AND hash = ?`, namespace, hashBytes(hash)).Scan(
+		&keyData, &data, &namespaceType, &keyType, &recordType,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ShardRecord{}, false, nil
+	}
+	if err != nil {
+		return ShardRecord{}, false, fmt.Errorf("xet CAS server: query SQLite shard: %w", err)
+	}
+	if namespaceType != "text" || keyType != "blob" || recordType != "blob" {
+		return ShardRecord{}, false, fmt.Errorf("%w: malformed SQLite shard storage class", ErrCorrupt)
+	}
+	key, err := sqliteHash(keyData)
+	if err != nil {
+		return ShardRecord{}, false, err
+	}
+	var record ShardRecord
+	if err := decodeIndexRecord(data, &record); err != nil {
+		return ShardRecord{}, false, err
+	}
+	if key != hash {
+		return ShardRecord{}, false, fmt.Errorf("%w: SQLite shard identity mismatch", ErrCorrupt)
+	}
+	if err := validateShardRecord(key, record); err != nil {
+		return ShardRecord{}, false, err
+	}
+	return record, true, nil
 }
 
 func (s *SQLiteIndexStore) PutXorb(ctx context.Context, value XorbRecord) error {
@@ -387,8 +587,8 @@ func (s *SQLiteIndexStore) GetFile(ctx context.Context, namespace string, hash x
 	if err := decodeIndexRecord(data, &value); err != nil {
 		return FileRecord{}, false, err
 	}
-	if value.File.File.Hash != hash {
-		return FileRecord{}, false, fmt.Errorf("%w: SQLite file identity mismatch", ErrCorrupt)
+	if err := validateFileRecord(hash, value); err != nil {
+		return FileRecord{}, false, err
 	}
 	return value, true, nil
 }
@@ -419,6 +619,9 @@ func (s *SQLiteIndexStore) GetDedup(ctx context.Context, namespace string, hash 
 	}
 	var value DedupRecord
 	if err := decodeIndexRecord(data, &value); err != nil {
+		return DedupRecord{}, false, err
+	}
+	if err := validateDedupRecord(value); err != nil {
 		return DedupRecord{}, false, err
 	}
 	return value, true, nil
@@ -506,6 +709,9 @@ ON CONFLICT(namespace, sum, size) DO NOTHING`, namespace, sum[:], databaseSize, 
 }
 
 func (s *SQLiteIndexStore) PublishShard(ctx context.Context, publication ShardPublication) error {
+	if err := validateShardPublication(publication); err != nil {
+		return err
+	}
 	// Detect contradictory immutable records before opening a write transaction.
 	pending := make(map[shaKey]xethash.Hash, len(publication.SHA256))
 	for _, association := range publication.SHA256 {
@@ -525,10 +731,20 @@ func (s *SQLiteIndexStore) PublishShard(ctx context.Context, publication ShardPu
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx,
+		result, err := tx.ExecContext(ctx,
 			"INSERT INTO dedup(namespace, chunk_hash, record) VALUES(?, ?, ?) ON CONFLICT(namespace, chunk_hash) DO NOTHING",
-			publication.Namespace, hashBytes(association.Chunk), data); err != nil {
+			publication.Namespace, hashBytes(association.Chunk), data)
+		if err != nil {
 			return fmt.Errorf("xet CAS server: publish SQLite dedup: %w", err)
+		}
+		inserted, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("xet CAS server: inspect SQLite dedup publication: %w", err)
+		}
+		if inserted == 0 {
+			if err := verifySQLiteDedupRow(ctx, tx, publication.Namespace, association.Chunk); err != nil {
+				return err
+			}
 		}
 	}
 	if err := s.runTestHook("after-dedup"); err != nil {
@@ -551,10 +767,14 @@ ON CONFLICT(namespace, sum, size) DO NOTHING`, publication.Namespace, associatio
 		}
 		if inserted == 0 {
 			var existing []byte
+			var storageClass string
 			if err := tx.QueryRowContext(ctx, `
-SELECT file_hash FROM sha256_associations WHERE namespace = ? AND sum = ? AND size = ?`,
-				publication.Namespace, association.Sum[:], databaseSize).Scan(&existing); err != nil {
+SELECT file_hash, typeof(file_hash) FROM sha256_associations WHERE namespace = ? AND sum = ? AND size = ?`,
+				publication.Namespace, association.Sum[:], databaseSize).Scan(&existing, &storageClass); err != nil {
 				return fmt.Errorf("xet CAS server: verify SQLite SHA-256 publication: %w", err)
+			}
+			if storageClass != "blob" || len(existing) != len(xethash.Hash{}) {
+				return fmt.Errorf("%w: malformed SQLite SHA-256 file hash", ErrCorrupt)
 			}
 			if !reflect.DeepEqual(existing, hashBytes(association.File)) {
 				return ErrConflict
@@ -569,13 +789,43 @@ SELECT file_hash FROM sha256_associations WHERE namespace = ? AND sum = ? AND si
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx,
+		result, err := tx.ExecContext(ctx,
 			"INSERT INTO files(namespace, hash, record) VALUES(?, ?, ?) ON CONFLICT(namespace, hash) DO NOTHING",
-			publication.Namespace, hashBytes(record.File.File.Hash), data); err != nil {
+			publication.Namespace, hashBytes(record.File.File.Hash), data)
+		if err != nil {
 			return fmt.Errorf("xet CAS server: publish SQLite file: %w", err)
+		}
+		inserted, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("xet CAS server: inspect SQLite file publication: %w", err)
+		}
+		if inserted == 0 {
+			if err := verifySQLiteFileRow(ctx, tx, publication.Namespace, record.File.File.Hash); err != nil {
+				return err
+			}
 		}
 	}
 	if err := s.runTestHook("after-files"); err != nil {
+		return err
+	}
+	shardData, err := encodeIndexRecord(ShardRecord{Blob: publication.Shard})
+	if err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, "INSERT INTO shards(namespace, hash, record) VALUES(?, ?, ?) ON CONFLICT(namespace, hash) DO NOTHING", publication.Namespace, hashBytes(publication.Shard.Hash), shardData)
+	if err != nil {
+		return fmt.Errorf("xet CAS server: publish SQLite shard registration: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("xet CAS server: inspect SQLite shard publication: %w", err)
+	}
+	if inserted == 0 {
+		if err := verifySQLiteShardRow(ctx, tx, publication.Namespace, publication.Shard.Hash); err != nil {
+			return err
+		}
+	}
+	if err := s.runTestHook("after-shard"); err != nil {
 		return err
 	}
 	if err := s.runTestHook("before-commit"); err != nil {
@@ -1032,6 +1282,56 @@ func (s *SQLiteIndexStore) ListXorbs(ctx context.Context, request PageRequest) (
 	return page, nil
 }
 
+func (s *SQLiteIndexStore) ListShards(ctx context.Context, namespace *string, request PageRequest) (ShardRecordPage, error) {
+	cursorKind := cursorShardAll
+	if namespace != nil {
+		cursorKind = cursorShardScoped
+	}
+	limit, cursorNamespace, cursorHash, hasCursor, err := scopedHashPage(request, namespace, cursorKind)
+	if err != nil {
+		return ShardRecordPage{}, err
+	}
+	query, arguments := scopedHashQuery("SELECT namespace, hash, record, typeof(namespace), typeof(hash), typeof(record) FROM shards", "hash", namespace, cursorNamespace, cursorHash, hasCursor, limit)
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return ShardRecordPage{}, fmt.Errorf("xet CAS server: list SQLite shards: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // rows.Err and the explicit close below determine the result.
+	page := ShardRecordPage{Items: make([]ScopedShardRecord, 0, limit)}
+	for rows.Next() {
+		var scope string
+		var hashData, recordData []byte
+		var scopeType, hashType, recordType string
+		if err := rows.Scan(&scope, &hashData, &recordData, &scopeType, &hashType, &recordType); err != nil {
+			return ShardRecordPage{}, fmt.Errorf("xet CAS server: scan SQLite shard page: %w", err)
+		}
+		if scopeType != "text" || hashType != "blob" || recordType != "blob" {
+			return ShardRecordPage{}, fmt.Errorf("%w: malformed SQLite shard storage class", ErrCorrupt)
+		}
+		hash, err := sqliteHash(hashData)
+		if err != nil {
+			return ShardRecordPage{}, err
+		}
+		var record ShardRecord
+		if err := decodeIndexRecord(recordData, &record); err != nil {
+			return ShardRecordPage{}, err
+		}
+		if err := validateShardRecord(hash, record); err != nil {
+			return ShardRecordPage{}, err
+		}
+		page.Items = append(page.Items, ScopedShardRecord{Namespace: scope, Record: record})
+	}
+	if err := finishSQLiteRows(rows); err != nil {
+		return ShardRecordPage{}, fmt.Errorf("xet CAS server: finish SQLite shard page: %w", err)
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, last.Record.Blob.Hash[:])
+	}
+	return page, nil
+}
+
 func (s *SQLiteIndexStore) ListFiles(
 	ctx context.Context,
 	namespace *string,
@@ -1073,8 +1373,8 @@ func (s *SQLiteIndexStore) ListFiles(
 		if err := decodeIndexRecord(recordData, &record); err != nil {
 			return FileRecordPage{}, err
 		}
-		if record.File.File.Hash != hash || record.Shard.Kind != BlobShard {
-			return FileRecordPage{}, fmt.Errorf("%w: SQLite file identity mismatch", ErrCorrupt)
+		if err := validateFileRecord(hash, record); err != nil {
+			return FileRecordPage{}, err
 		}
 		page.Items = append(page.Items, ScopedFileRecord{Namespace: scope, Record: record})
 	}
@@ -1130,8 +1430,8 @@ func (s *SQLiteIndexStore) ListDedup(
 		if err := decodeIndexRecord(recordData, &record); err != nil {
 			return DedupRecordPage{}, err
 		}
-		if record.Shard.Kind != BlobShard {
-			return DedupRecordPage{}, fmt.Errorf("%w: SQLite dedup shard kind mismatch", ErrCorrupt)
+		if err := validateDedupRecord(record); err != nil {
+			return DedupRecordPage{}, err
 		}
 		page.Items = append(page.Items, ScopedDedupRecord{Namespace: scope, Chunk: hash, Record: record})
 	}

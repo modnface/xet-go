@@ -290,14 +290,16 @@ func runIndexStoreContract(t *testing.T, factory indexStoreFactory) {
 		fileHash := xethash.Chunk([]byte("published file"))
 		chunkHash := xethash.Chunk([]byte("published chunk"))
 		sum := [32]byte{9}
+		shardKey := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("published shard"))}
 		publication := ShardPublication{
 			Namespace: "scope",
+			Shard:     shardKey,
 			Dedup: []DedupAssociation{{
 				Chunk: chunkHash,
-				Value: DedupRecord{Shard: BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("published shard"))}},
+				Value: DedupRecord{Shard: shardKey},
 			}},
 			SHA256: []SHA256Association{{Sum: sum, Size: 1, File: fileHash}},
-			Files:  []FileRecord{{File: shard.RegisteredFile{File: shard.File{Hash: fileHash}, Size: 1}}},
+			Files:  []FileRecord{{File: shard.RegisteredFile{File: shard.File{Hash: fileHash}, Size: 1}, Shard: shardKey}},
 		}
 		if err := store.PublishShard(ctx, publication); err != nil {
 			t.Fatal(err)
@@ -308,10 +310,52 @@ func runIndexStoreContract(t *testing.T, factory indexStoreFactory) {
 		if _, found, err := store.GetFile(ctx, "scope", fileHash); err != nil || !found {
 			t.Fatalf("published file = %v, %v", found, err)
 		}
+		if got, found, err := store.GetShard(ctx, "scope", shardKey.Hash); err != nil || !found || got.Blob != shardKey {
+			t.Fatalf("published shard = %#v, %v, %v", got, found, err)
+		}
+		if _, found, err := store.GetShard(ctx, "other", shardKey.Hash); err != nil || found {
+			t.Fatalf("cross-scope shard = %v, %v", found, err)
+		}
+		alternateShard := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("alternate published shard"))}
+		alternate := publication
+		alternate.Shard = alternateShard
+		alternate.Dedup = []DedupAssociation{{Chunk: chunkHash, Value: DedupRecord{Shard: alternateShard}}}
+		alternate.Files = []FileRecord{{
+			File: publication.Files[0].File, Shard: alternateShard,
+		}}
+		if err := store.PublishShard(ctx, alternate); err != nil {
+			t.Fatalf("alternate valid publication = %v", err)
+		}
+		if retained, found, err := store.GetFile(ctx, "scope", fileHash); err != nil || !found || retained.Shard != shardKey {
+			t.Fatalf("retained first file source = %#v, %v, %v", retained, found, err)
+		}
+		if retained, found, err := store.GetDedup(ctx, "scope", chunkHash); err != nil || !found || retained.Shard != shardKey {
+			t.Fatalf("retained first dedup source = %#v, %v, %v", retained, found, err)
+		}
+		if got, found, err := store.GetShard(ctx, "scope", alternateShard.Hash); err != nil || !found || got.Blob != alternateShard {
+			t.Fatalf("alternate shard registration = %#v, %v, %v", got, found, err)
+		}
+		if err := store.PublishShard(ctx, ShardPublication{}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("invalid shard publication identity = %v", err)
+		}
+		fileMismatch := ShardPublication{
+			Shard: shardKey,
+			Files: []FileRecord{{
+				File: publication.Files[0].File, Shard: alternateShard,
+			}},
+		}
+		if err := store.PublishShard(ctx, fileMismatch); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("file source mismatch = %v", err)
+		}
+		mismatch := publication
+		mismatch.Shard.Hash = xethash.Chunk([]byte("mismatched publication shard"))
+		if err := store.PublishShard(ctx, mismatch); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("publication source mismatch = %v", err)
+		}
 		existingConflict := publication
 		existingConflict.SHA256 = []SHA256Association{{Sum: sum, Size: 1, File: xethash.Zero}}
 		extraFile := xethash.Chunk([]byte("must roll back"))
-		existingConflict.Files = []FileRecord{{File: shard.RegisteredFile{File: shard.File{Hash: extraFile}, Size: 1}}}
+		existingConflict.Files = []FileRecord{{File: shard.RegisteredFile{File: shard.File{Hash: extraFile}, Size: 1}, Shard: shardKey}}
 		if err := store.PublishShard(ctx, existingConflict); !errors.Is(err, ErrConflict) {
 			t.Fatalf("existing SHA conflict = %v", err)
 		}
@@ -670,6 +714,15 @@ func runIndexListerContract(t *testing.T, factory indexStoreFactory) {
 		}
 	}
 	for namespaceIndex, namespace := range namespaces {
+		for shardIndex := range 3 {
+			listedShard := BlobKey{
+				Kind: BlobShard,
+				Hash: xethash.Chunk([]byte(fmt.Sprintf("registered shard %d %d", namespaceIndex, shardIndex))),
+			}
+			if err := store.PublishShard(ctx, ShardPublication{Namespace: namespace, Shard: listedShard}); err != nil {
+				t.Fatal(err)
+			}
+		}
 		for i := range recordsPerNamespace {
 			fileHash := xethash.Chunk([]byte(fmt.Sprintf("listed file %d %d", namespaceIndex, i)))
 			chunkHash := xethash.Chunk([]byte(fmt.Sprintf("listed dedup %d %d", namespaceIndex, i)))
@@ -710,6 +763,29 @@ func runIndexListerContract(t *testing.T, factory indexStoreFactory) {
 	}
 	if len(seenXorbs) != 7 {
 		t.Fatalf("listed %d xorbs, want 7", len(seenXorbs))
+	}
+
+	shardPage, err := lister.ListShards(ctx, nil, PageRequest{Limit: 1})
+	if err != nil || shardPage.NextCursor == "" {
+		t.Fatalf("first shard page = %#v, %v", shardPage, err)
+	}
+	alpha := "alpha"
+	if _, err := lister.ListShards(ctx, &alpha, PageRequest{Cursor: shardPage.NextCursor, Limit: 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cross-filter shard cursor = %v", err)
+	}
+	if _, err := lister.ListFiles(ctx, nil, PageRequest{Cursor: shardPage.NextCursor, Limit: 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cross-method shard cursor = %v", err)
+	}
+	shardCount := len(shardPage.Items)
+	for shardPage.NextCursor != "" {
+		shardPage, err = lister.ListShards(ctx, nil, PageRequest{Cursor: shardPage.NextCursor, Limit: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		shardCount += len(shardPage.Items)
+	}
+	if shardCount != len(namespaces)*3 {
+		t.Fatalf("listed %d shards, want %d", shardCount, len(namespaces)*3)
 	}
 
 	countFiles := func(namespace *string) int {
@@ -795,7 +871,6 @@ func runIndexListerContract(t *testing.T, factory indexStoreFactory) {
 		}
 	}
 
-	alpha := "alpha"
 	first, err := lister.ListFiles(ctx, &alpha, PageRequest{Limit: 1})
 	if err != nil || first.NextCursor == "" {
 		t.Fatalf("first filtered page = %#v, %v", first, err)
@@ -831,7 +906,8 @@ func runIndexListerContract(t *testing.T, factory indexStoreFactory) {
 	mutationNamespace := mutationPage.Items[0].Namespace
 	for _, hash := range []xethash.Hash{behind, ahead} {
 		if err := store.PutFile(ctx, mutationNamespace, FileRecord{
-			File: shard.RegisteredFile{File: shard.File{Hash: hash}}, Shard: BlobKey{Kind: BlobShard},
+			File:  shard.RegisteredFile{File: shard.File{Hash: hash}},
+			Shard: BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("mutation shard"))},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -857,6 +933,7 @@ func runIndexListerContract(t *testing.T, factory indexStoreFactory) {
 	}
 	for _, operation := range []func(context.Context) error{
 		func(ctx context.Context) error { _, err := lister.ListXorbs(ctx, PageRequest{}); return err },
+		func(ctx context.Context) error { _, err := lister.ListShards(ctx, nil, PageRequest{}); return err },
 		func(ctx context.Context) error { _, err := lister.ListFiles(ctx, nil, PageRequest{}); return err },
 		func(ctx context.Context) error { _, err := lister.ListDedup(ctx, nil, PageRequest{}); return err },
 		func(ctx context.Context) error { _, err := lister.ListSHA256(ctx, nil, PageRequest{}); return err },
@@ -913,20 +990,28 @@ func TestMemoryIndexListerCancellationDuringScan(t *testing.T) {
 	store := NewMemoryStore()
 	ctx := context.Background()
 	hash := xethash.Chunk([]byte("cancel index listing"))
+	shardKey := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("cancel index shard"))}
 	if err := store.PutXorb(ctx, XorbRecord{Blob: BlobKey{Kind: BlobXorb, Hash: hash}, Layout: xorb.Ingested{Hash: hash}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutFile(ctx, "scope", FileRecord{File: shard.RegisteredFile{File: shard.File{Hash: hash}}}); err != nil {
+	if err := store.PutFile(ctx, "scope", FileRecord{File: shard.RegisteredFile{File: shard.File{Hash: hash}}, Shard: shardKey}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutDedup(ctx, "scope", hash, DedupRecord{}); err != nil {
+	if err := store.PutDedup(ctx, "scope", hash, DedupRecord{Shard: shardKey}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.PutSHA256(ctx, "scope", [32]byte{}, 1, hash); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.PublishShard(ctx, ShardPublication{Namespace: "scope", Shard: shardKey}); err != nil {
+		t.Fatal(err)
+	}
 	for name, operation := range map[string]func(context.Context) error{
 		"xorbs": func(ctx context.Context) error { _, err := store.ListXorbs(ctx, PageRequest{}); return err },
+		"shards": func(ctx context.Context) error {
+			_, err := store.ListShards(ctx, nil, PageRequest{})
+			return err
+		},
 		"files": func(ctx context.Context) error { _, err := store.ListFiles(ctx, nil, PageRequest{}); return err },
 		"dedup": func(ctx context.Context) error { _, err := store.ListDedup(ctx, nil, PageRequest{}); return err },
 		"SHA":   func(ctx context.Context) error { _, err := store.ListSHA256(ctx, nil, PageRequest{}); return err },
@@ -938,6 +1023,178 @@ func TestMemoryIndexListerCancellationDuringScan(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSQLiteShardBackfillFailures(t *testing.T) {
+	requireLocalDurability(t)
+	ctx := context.Background()
+	t.Run("malformed legacy storage class", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "index.db")
+		db := openSQLiteV3TestIndex(t, path)
+		connection, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := connection.ExecContext(ctx, "PRAGMA ignore_check_constraints=ON"); err != nil {
+			_ = connection.Close()
+			t.Fatal(err)
+		}
+		fileHash := xethash.Chunk([]byte("legacy text record"))
+		source := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("legacy text source"))}
+		data, err := encodeIndexRecord(FileRecord{
+			File: shard.RegisteredFile{File: shard.File{Hash: fileHash}}, Shard: source,
+		})
+		if err != nil {
+			_ = connection.Close()
+			t.Fatal(err)
+		}
+		_, err = connection.ExecContext(ctx,
+			"INSERT INTO files(namespace, hash, record) VALUES(?, ?, ?)",
+			"scope", hashBytes(fileHash), string(data),
+		)
+		_ = connection.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenSQLiteIndexStore(path); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("legacy text record migration = %v", err)
+		}
+	})
+
+	t.Run("backfill backend and cancellation errors", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "index.db")
+		db := openSQLiteV3TestIndex(t, path)
+		fileHash := xethash.Chunk([]byte("backfill backend file"))
+		source := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("backfill backend source"))}
+		data, err := encodeIndexRecord(FileRecord{
+			File: shard.RegisteredFile{File: shard.File{Hash: fileHash}}, Shard: source,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx,
+			"INSERT INTO files(namespace, hash, record) VALUES(?, ?, ?)",
+			"scope", hashBytes(fileHash), data,
+		); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := backfillSQLiteShards(ctx, tx); err == nil {
+			t.Fatal("backfill without destination table succeeded")
+		}
+		_ = tx.Rollback()
+		tx, err = db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		if err := backfillSQLiteShards(canceled, tx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled backfill = %v", err)
+		}
+		_ = tx.Rollback()
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("publication verifier cancellation", func(t *testing.T) {
+		store, err := OpenSQLiteIndexStore(filepath.Join(t.TempDir(), "index.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close() //nolint:errcheck // Test cleanup.
+		tx, err := store.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback() //nolint:errcheck // Test cleanup.
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		hash := xethash.Chunk([]byte("canceled publication verification"))
+		for name, verify := range map[string]func() error{
+			"shard": func() error { return verifySQLiteShardRow(canceled, tx, "scope", hash) },
+			"file":  func() error { return verifySQLiteFileRow(canceled, tx, "scope", hash) },
+			"dedup": func() error { return verifySQLiteDedupRow(canceled, tx, "scope", hash) },
+		} {
+			t.Run(name, func(t *testing.T) {
+				if err := verify(); !errors.Is(err, context.Canceled) {
+					t.Fatalf("canceled %s verification = %v", name, err)
+				}
+			})
+		}
+		if err := store.initialize(canceled); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled initialization = %v", err)
+		}
+	})
+
+	t.Run("version four schema collision rolls back", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "index.db")
+		db := openSQLiteV3TestIndex(t, path)
+		if _, err := db.ExecContext(ctx, "CREATE TABLE shards(conflict INTEGER)"); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenSQLiteIndexStore(path); err == nil {
+			t.Fatal("conflicting version four migration succeeded")
+		}
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close() //nolint:errcheck // Test cleanup.
+		var version, conflictColumns int
+		if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRowContext(ctx,
+			"SELECT count(*) FROM pragma_table_info('shards') WHERE name = 'conflict'",
+		).Scan(&conflictColumns); err != nil {
+			t.Fatal(err)
+		}
+		if version != 3 || conflictColumns != 1 {
+			t.Fatalf("rolled-back collision = version %d, conflict columns %d", version, conflictColumns)
+		}
+	})
+
+	t.Run("version four backfill query failure rolls back", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "index.db")
+		db := openSQLiteV3TestIndex(t, path)
+		if _, err := db.ExecContext(ctx, "DROP TABLE files; CREATE TABLE files(namespace TEXT)"); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenSQLiteIndexStore(path); err == nil {
+			t.Fatal("version four migration with malformed source schema succeeded")
+		}
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close() //nolint:errcheck // Test cleanup.
+		var version, shardTables int
+		if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRowContext(ctx,
+			"SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'shards'",
+		).Scan(&shardTables); err != nil {
+			t.Fatal(err)
+		}
+		if version != 3 || shardTables != 0 {
+			t.Fatalf("rolled-back backfill = version %d, shard tables %d", version, shardTables)
+		}
+	})
 }
 
 func TestSQLiteIndexListerBackendAndCorruptionErrors(t *testing.T) {
@@ -952,10 +1209,11 @@ func TestSQLiteIndexListerBackendAndCorruptionErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		for name, operation := range map[string]func() error{
-			"xorbs": func() error { _, err := store.ListXorbs(ctx, PageRequest{}); return err },
-			"files": func() error { _, err := store.ListFiles(ctx, nil, PageRequest{}); return err },
-			"dedup": func() error { _, err := store.ListDedup(ctx, nil, PageRequest{}); return err },
-			"SHA":   func() error { _, err := store.ListSHA256(ctx, nil, PageRequest{}); return err },
+			"xorbs":  func() error { _, err := store.ListXorbs(ctx, PageRequest{}); return err },
+			"shards": func() error { _, err := store.ListShards(ctx, nil, PageRequest{}); return err },
+			"files":  func() error { _, err := store.ListFiles(ctx, nil, PageRequest{}); return err },
+			"dedup":  func() error { _, err := store.ListDedup(ctx, nil, PageRequest{}); return err },
+			"SHA":    func() error { _, err := store.ListSHA256(ctx, nil, PageRequest{}); return err },
 		} {
 			t.Run(name, func(t *testing.T) {
 				if err := operation(); err == nil {
@@ -1005,6 +1263,68 @@ func TestSQLiteIndexListerBackendAndCorruptionErrors(t *testing.T) {
 			}
 		}, func(store *SQLiteIndexStore) error {
 			_, err := store.ListXorbs(ctx, PageRequest{})
+			return err
+		}},
+		{"shard text hash", func(t *testing.T, connection *sql.Conn) {
+			hash := xethash.Chunk([]byte("text shard hash"))
+			record, err := encodeIndexRecord(ShardRecord{Blob: BlobKey{Kind: BlobShard, Hash: hash}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := connection.ExecContext(ctx,
+				"INSERT INTO shards(namespace, hash, record) VALUES(?, ?, ?)",
+				"scope", string(hash[:]), record,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}, func(store *SQLiteIndexStore) error {
+			_, err := store.ListShards(ctx, nil, PageRequest{})
+			return err
+		}},
+		{"shard short hash", func(t *testing.T, connection *sql.Conn) {
+			hash := xethash.Chunk([]byte("short shard hash"))
+			record, err := encodeIndexRecord(ShardRecord{Blob: BlobKey{Kind: BlobShard, Hash: hash}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := connection.ExecContext(ctx,
+				"INSERT INTO shards(namespace, hash, record) VALUES(?, ?, ?)",
+				"scope", []byte{1}, record,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}, func(store *SQLiteIndexStore) error {
+			_, err := store.ListShards(ctx, nil, PageRequest{})
+			return err
+		}},
+		{"shard malformed record", func(t *testing.T, connection *sql.Conn) {
+			hash := xethash.Chunk([]byte("malformed shard record"))
+			if _, err := connection.ExecContext(ctx,
+				"INSERT INTO shards(namespace, hash, record) VALUES(?, ?, ?)",
+				"scope", hashBytes(hash), []byte("{"),
+			); err != nil {
+				t.Fatal(err)
+			}
+		}, func(store *SQLiteIndexStore) error {
+			_, err := store.ListShards(ctx, nil, PageRequest{})
+			return err
+		}},
+		{"shard mismatched record", func(t *testing.T, connection *sql.Conn) {
+			hash := xethash.Chunk([]byte("mismatched shard record"))
+			record, err := encodeIndexRecord(ShardRecord{Blob: BlobKey{
+				Kind: BlobShard, Hash: xethash.Chunk([]byte("different shard record")),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := connection.ExecContext(ctx,
+				"INSERT INTO shards(namespace, hash, record) VALUES(?, ?, ?)",
+				"scope", hashBytes(hash), record,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}, func(store *SQLiteIndexStore) error {
+			_, err := store.ListShards(ctx, nil, PageRequest{})
 			return err
 		}},
 		{"file blob namespace", func(t *testing.T, connection *sql.Conn) {
@@ -1081,14 +1401,18 @@ func TestSQLiteIndexListerQueryPlans(t *testing.T) {
 	fileQuery, fileArguments := scopedHashQuery(
 		"SELECT namespace, hash, record FROM files", "hash", nil, "scope", hash, true, 1,
 	)
+	shardQuery, shardArguments := scopedHashQuery(
+		"SELECT namespace, hash, record FROM shards", "hash", nil, "scope", hash, true, 1,
+	)
 	shaQuery, shaArguments := scopedSHAQuery(nil, "scope", sum, 1, true, 1)
 	for name, plan := range map[string]struct {
 		table     string
 		query     string
 		arguments []any
 	}{
-		"files": {table: "files", query: fileQuery, arguments: fileArguments},
-		"SHA":   {table: "sha256_associations", query: shaQuery, arguments: shaArguments},
+		"shards": {table: "shards", query: shardQuery, arguments: shardArguments},
+		"files":  {table: "files", query: fileQuery, arguments: fileArguments},
+		"SHA":    {table: "sha256_associations", query: shaQuery, arguments: shaArguments},
 	} {
 		t.Run(name, func(t *testing.T) {
 			rows, err := store.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+plan.query, plan.arguments...)
@@ -2904,6 +3228,490 @@ func TestFilesystemBlobStoreErrorAndClosureSemantics(t *testing.T) {
 	})
 }
 
+func openSQLiteV3TestIndex(t testing.TB, path string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, schema := range []string{sqliteSchemaV1, sqliteSchemaV2, sqliteSchemaV3} {
+		if _, err := db.Exec(schema); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec("PRAGMA user_version = 3"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	return db
+}
+
+func TestSQLiteVersionThreeShardRegistrationMigration(t *testing.T) {
+	requireLocalDurability(t)
+	ctx := context.Background()
+
+	t.Run("bounded backfill", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "index.db")
+		db := openSQLiteV3TestIndex(t, path)
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := make(map[scopedHash]BlobKey)
+		alphaA := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("migration alpha A"))}
+		alphaB := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("migration alpha B"))}
+		beta := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("migration beta"))}
+		for i := range 260 {
+			namespace, source := "alpha", alphaA
+			if i%2 != 0 {
+				source = alphaB
+			}
+			if i >= 257 {
+				namespace, source = "beta", beta
+			}
+			fileHash := xethash.Chunk([]byte(fmt.Sprintf("migration file %03d", i)))
+			data, err := encodeIndexRecord(FileRecord{
+				File: shard.RegisteredFile{File: shard.File{Hash: fileHash}}, Shard: source,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.ExecContext(ctx,
+				"INSERT INTO files(namespace, hash, record) VALUES(?, ?, ?)",
+				namespace, hashBytes(fileHash), data,
+			); err != nil {
+				t.Fatal(err)
+			}
+			expected[scopedHash{namespace: namespace, hash: source.Hash}] = source
+		}
+		gamma := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("migration dedup only"))}
+		for i, association := range []struct {
+			namespace string
+			source    BlobKey
+		}{{"alpha", alphaA}, {"gamma", gamma}} {
+			chunk := xethash.Chunk([]byte(fmt.Sprintf("migration dedup %d", i)))
+			data, err := encodeIndexRecord(DedupRecord{Shard: association.source})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.ExecContext(ctx,
+				"INSERT INTO dedup(namespace, chunk_hash, record) VALUES(?, ?, ?)",
+				association.namespace, hashBytes(chunk), data,
+			); err != nil {
+				t.Fatal(err)
+			}
+			expected[scopedHash{namespace: association.namespace, hash: association.source.Hash}] = association.source
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		store, err := OpenSQLiteIndexStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close() //nolint:errcheck // Test cleanup.
+		for key, want := range expected {
+			got, found, err := store.GetShard(ctx, key.namespace, key.hash)
+			if err != nil || !found || got.Blob != want {
+				t.Fatalf("migrated shard %q/%s = %#v, %v, %v", key.namespace, key.hash, got, found, err)
+			}
+		}
+		seen := make(map[scopedHash]BlobKey)
+		request := PageRequest{Limit: 2}
+		for {
+			page, err := store.ListShards(ctx, nil, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, item := range page.Items {
+				seen[scopedHash{namespace: item.Namespace, hash: item.Record.Blob.Hash}] = item.Record.Blob
+			}
+			if page.NextCursor == "" {
+				break
+			}
+			request.Cursor = page.NextCursor
+		}
+		if !reflect.DeepEqual(seen, expected) {
+			t.Fatalf("migrated shard registrations = %#v, want %#v", seen, expected)
+		}
+		var version int
+		if err := store.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != 4 {
+			t.Fatalf("migrated version = %d, %v", version, err)
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		record func(xethash.Hash, BlobKey) []byte
+	}{
+		{"malformed JSON", func(xethash.Hash, BlobKey) []byte { return []byte("{") }},
+		{"invalid shard source", func(hash xethash.Hash, _ BlobKey) []byte {
+			data, _ := encodeIndexRecord(FileRecord{
+				File:  shard.RegisteredFile{File: shard.File{Hash: hash}},
+				Shard: BlobKey{Kind: BlobXorb, Hash: xethash.Chunk([]byte("invalid migration source"))},
+			})
+			return data
+		}},
+		{"file identity mismatch", func(_ xethash.Hash, source BlobKey) []byte {
+			data, _ := encodeIndexRecord(FileRecord{
+				File:  shard.RegisteredFile{File: shard.File{Hash: xethash.Chunk([]byte("wrong migration file"))}},
+				Shard: source,
+			})
+			return data
+		}},
+	} {
+		t.Run("late corruption "+test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "index.db")
+			db := openSQLiteV3TestIndex(t, path)
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			source := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("valid migration source"))}
+			for i := range 256 {
+				fileHash := xethash.Chunk([]byte(fmt.Sprintf("valid migration row %03d", i)))
+				data, err := encodeIndexRecord(FileRecord{
+					File: shard.RegisteredFile{File: shard.File{Hash: fileHash}}, Shard: source,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := tx.ExecContext(ctx,
+					"INSERT INTO files(namespace, hash, record) VALUES(?, ?, ?)",
+					"a", hashBytes(fileHash), data,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			corruptHash := xethash.Chunk([]byte("late corrupt migration row"))
+			if _, err := tx.ExecContext(ctx,
+				"INSERT INTO files(namespace, hash, record) VALUES(?, ?, ?)",
+				"z", hashBytes(corruptHash), test.record(corruptHash, source),
+			); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := OpenSQLiteIndexStore(path); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("corrupt v3 migration = %v", err)
+			}
+			db, err = sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close() //nolint:errcheck // Test cleanup.
+			var version, files, shardTables int
+			if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRowContext(ctx, "SELECT count(*) FROM files").Scan(&files); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRowContext(ctx,
+				"SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'shards'",
+			).Scan(&shardTables); err != nil {
+				t.Fatal(err)
+			}
+			if version != 3 || files != 257 || shardTables != 0 {
+				t.Fatalf("rolled-back migration = version %d, files %d, shard tables %d", version, files, shardTables)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name   string
+		record []byte
+	}{
+		{"malformed dedup JSON", []byte("{")},
+		{"invalid dedup source", func() []byte {
+			data, _ := encodeIndexRecord(DedupRecord{Shard: BlobKey{
+				Kind: BlobXorb, Hash: xethash.Chunk([]byte("invalid migration dedup source")),
+			}})
+			return data
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "index.db")
+			db := openSQLiteV3TestIndex(t, path)
+			chunk := xethash.Chunk([]byte("corrupt migration dedup"))
+			if _, err := db.ExecContext(ctx,
+				"INSERT INTO dedup(namespace, chunk_hash, record) VALUES(?, ?, ?)",
+				"scope", hashBytes(chunk), test.record,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := OpenSQLiteIndexStore(path); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("corrupt v3 dedup migration = %v", err)
+			}
+		})
+	}
+}
+
+type corruptPublicationFixture struct {
+	publication             ShardPublication
+	newFile, retainedFile   xethash.Hash
+	newChunk, retainedChunk xethash.Hash
+	newSum, retainedSum     [32]byte
+}
+
+func newCorruptPublicationFixture(label string) corruptPublicationFixture {
+	key := func(value string) xethash.Hash { return xethash.Chunk([]byte(label + " " + value)) }
+	fixture := corruptPublicationFixture{
+		newFile: key("new file"), retainedFile: key("retained file"),
+		newChunk: key("new chunk"), retainedChunk: key("retained chunk"),
+	}
+	newSum, retainedSum := key("new SHA"), key("retained SHA")
+	copy(fixture.newSum[:], newSum[:])
+	copy(fixture.retainedSum[:], retainedSum[:])
+	shardKey := BlobKey{Kind: BlobShard, Hash: key("publication shard")}
+	fixture.publication = ShardPublication{
+		Namespace: "scope", Shard: shardKey,
+		Dedup: []DedupAssociation{
+			{Chunk: fixture.newChunk, Value: DedupRecord{Shard: shardKey}},
+			{Chunk: fixture.retainedChunk, Value: DedupRecord{Shard: shardKey}},
+		},
+		SHA256: []SHA256Association{
+			{Sum: fixture.newSum, Size: 1, File: fixture.newFile},
+			{Sum: fixture.retainedSum, Size: 2, File: fixture.retainedFile},
+		},
+		Files: []FileRecord{
+			{File: shard.RegisteredFile{File: shard.File{Hash: fixture.newFile}, Size: 1}, Shard: shardKey},
+			{File: shard.RegisteredFile{File: shard.File{Hash: fixture.retainedFile}, Size: 2}, Shard: shardKey},
+		},
+	}
+	return fixture
+}
+
+func TestShardPublicationRejectsCorruptRetainedRecordsAtomically(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("memory", func(t *testing.T) {
+		for _, kind := range []string{"shard", "file", "dedup"} {
+			t.Run(kind, func(t *testing.T) {
+				store := NewMemoryStore()
+				fixture := newCorruptPublicationFixture("memory " + kind)
+				switch kind {
+				case "shard":
+					store.shards[scopedHash{
+						namespace: fixture.publication.Namespace, hash: fixture.publication.Shard.Hash,
+					}] = ShardRecord{Blob: BlobKey{Kind: BlobXorb, Hash: fixture.publication.Shard.Hash}}
+				case "file":
+					store.files[scopedHash{
+						namespace: fixture.publication.Namespace, hash: fixture.retainedFile,
+					}] = FileRecord{
+						File:  shard.RegisteredFile{File: shard.File{Hash: fixture.retainedFile}},
+						Shard: BlobKey{Kind: BlobXorb, Hash: fixture.publication.Shard.Hash},
+					}
+				case "dedup":
+					store.dedup[scopedHash{
+						namespace: fixture.publication.Namespace, hash: fixture.retainedChunk,
+					}] = DedupRecord{Shard: BlobKey{Kind: BlobXorb, Hash: fixture.publication.Shard.Hash}}
+				}
+				if err := store.PublishShard(ctx, fixture.publication); !errors.Is(err, ErrCorrupt) {
+					t.Fatalf("publication over corrupt %s = %v", kind, err)
+				}
+				switch kind {
+				case "shard":
+					if _, _, err := store.GetShard(ctx, "scope", fixture.publication.Shard.Hash); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("get corrupt memory shard = %v", err)
+					}
+					if _, err := store.ListShards(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("list corrupt memory shard = %v", err)
+					}
+				case "file":
+					if _, _, err := store.GetFile(ctx, "scope", fixture.retainedFile); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("get corrupt memory file = %v", err)
+					}
+					if _, err := store.ListFiles(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("list corrupt memory file = %v", err)
+					}
+				case "dedup":
+					if _, _, err := store.GetDedup(ctx, "scope", fixture.retainedChunk); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("get corrupt memory dedup = %v", err)
+					}
+					if _, err := store.ListDedup(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("list corrupt memory dedup = %v", err)
+					}
+				}
+				if _, found := store.files[scopedHash{namespace: "scope", hash: fixture.newFile}]; found {
+					t.Fatal("failed publication exposed new file")
+				}
+				if _, found := store.dedup[scopedHash{namespace: "scope", hash: fixture.newChunk}]; found {
+					t.Fatal("failed publication exposed new dedup")
+				}
+				if _, found := store.sha256[shaKey{namespace: "scope", sum: fixture.newSum, size: 1}]; found {
+					t.Fatal("failed publication exposed new SHA")
+				}
+				if kind != "shard" {
+					if _, found := store.shards[scopedHash{namespace: "scope", hash: fixture.publication.Shard.Hash}]; found {
+						t.Fatal("failed publication exposed shard registration")
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("sqlite", func(t *testing.T) {
+		requireLocalDurability(t)
+		for _, kind := range []string{
+			"shard", "shard JSON", "shard storage",
+			"file", "file JSON", "file storage",
+			"dedup", "dedup JSON", "dedup storage",
+			"SHA",
+		} {
+			t.Run(kind, func(t *testing.T) {
+				store, err := OpenSQLiteIndexStore(filepath.Join(t.TempDir(), "index.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer store.Close() //nolint:errcheck // Test cleanup.
+				fixture := newCorruptPublicationFixture("SQLite " + kind)
+				baseKind := strings.TrimSuffix(strings.TrimSuffix(kind, " JSON"), " storage")
+				insertRecord := func(query string, args ...any) {
+					t.Helper()
+					if strings.HasSuffix(kind, " storage") {
+						connection, err := store.db.Conn(ctx)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if _, err := connection.ExecContext(ctx, "PRAGMA ignore_check_constraints=ON"); err != nil {
+							_ = connection.Close()
+							t.Fatal(err)
+						}
+						args[len(args)-1] = string(args[len(args)-1].([]byte))
+						_, err = connection.ExecContext(ctx, query, args...)
+						_ = connection.Close()
+						if err != nil {
+							t.Fatal(err)
+						}
+						return
+					}
+					if _, err := store.db.ExecContext(ctx, query, args...); err != nil {
+						t.Fatal(err)
+					}
+				}
+				switch baseKind {
+				case "shard":
+					data, err := encodeIndexRecord(ShardRecord{Blob: BlobKey{
+						Kind: BlobShard, Hash: xethash.Chunk([]byte("wrong retained shard")),
+					}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if kind != baseKind {
+						data = []byte("{")
+					}
+					insertRecord(
+						"INSERT INTO shards(namespace, hash, record) VALUES(?, ?, ?)",
+						"scope", hashBytes(fixture.publication.Shard.Hash), data,
+					)
+				case "file":
+					data, err := encodeIndexRecord(FileRecord{
+						File:  shard.RegisteredFile{File: shard.File{Hash: fixture.retainedFile}},
+						Shard: BlobKey{Kind: BlobXorb, Hash: fixture.publication.Shard.Hash},
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if kind != baseKind {
+						data = []byte("{")
+					}
+					insertRecord(
+						"INSERT INTO files(namespace, hash, record) VALUES(?, ?, ?)",
+						"scope", hashBytes(fixture.retainedFile), data,
+					)
+				case "dedup":
+					data, err := encodeIndexRecord(DedupRecord{Shard: BlobKey{
+						Kind: BlobXorb, Hash: fixture.publication.Shard.Hash,
+					}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if kind != baseKind {
+						data = []byte("{")
+					}
+					insertRecord(
+						"INSERT INTO dedup(namespace, chunk_hash, record) VALUES(?, ?, ?)",
+						"scope", hashBytes(fixture.retainedChunk), data,
+					)
+				case "SHA":
+					connection, err := store.db.Conn(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := connection.ExecContext(ctx, "PRAGMA ignore_check_constraints=ON"); err != nil {
+						_ = connection.Close()
+						t.Fatal(err)
+					}
+					_, err = connection.ExecContext(ctx, `
+INSERT INTO sha256_associations(namespace, sum, size, file_hash) VALUES(?, ?, ?, ?)`,
+						"scope", fixture.retainedSum[:], 2, string(fixture.retainedFile[:]))
+					_ = connection.Close()
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				switch baseKind {
+				case "shard":
+					if _, _, err := store.GetShard(ctx, "scope", fixture.publication.Shard.Hash); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("get corrupt SQLite shard = %v", err)
+					}
+					if _, err := store.ListShards(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("list corrupt SQLite shard = %v", err)
+					}
+				case "file":
+					if _, _, err := store.GetFile(ctx, "scope", fixture.retainedFile); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("get corrupt SQLite file = %v", err)
+					}
+					if _, err := store.ListFiles(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("list corrupt SQLite file = %v", err)
+					}
+				case "dedup":
+					if _, _, err := store.GetDedup(ctx, "scope", fixture.retainedChunk); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("get corrupt SQLite dedup = %v", err)
+					}
+					if _, err := store.ListDedup(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("list corrupt SQLite dedup = %v", err)
+					}
+				case "SHA":
+					if _, err := store.ListSHA256(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+						t.Fatalf("list corrupt SQLite SHA = %v", err)
+					}
+				}
+				if err := store.PublishShard(ctx, fixture.publication); !errors.Is(err, ErrCorrupt) {
+					t.Fatalf("publication over corrupt %s = %v", kind, err)
+				}
+				if _, found, err := store.GetFile(ctx, "scope", fixture.newFile); err != nil || found {
+					t.Fatalf("new file after failed publication = %v, %v", found, err)
+				}
+				if _, found, err := store.GetDedup(ctx, "scope", fixture.newChunk); err != nil || found {
+					t.Fatalf("new dedup after failed publication = %v, %v", found, err)
+				}
+				if _, found, err := store.ResolveSHA256(ctx, "scope", fixture.newSum, 1); err != nil || found {
+					t.Fatalf("new SHA after failed publication = %v, %v", found, err)
+				}
+				if baseKind != "shard" {
+					if _, found, err := store.GetShard(ctx, "scope", fixture.publication.Shard.Hash); err != nil || found {
+						t.Fatalf("new shard after failed publication = %v, %v", found, err)
+					}
+				}
+			})
+		}
+	})
+}
+
 func TestSQLiteIndexStoreRestartMigrationAndAtomicFailures(t *testing.T) {
 	requireLocalDurability(t)
 	path := filepath.Join(t.TempDir(), "index.db")
@@ -2915,16 +3723,18 @@ func TestSQLiteIndexStoreRestartMigrationAndAtomicFailures(t *testing.T) {
 	fileHash := xethash.Chunk([]byte("SQLite durable file"))
 	chunkHash := xethash.Chunk([]byte("SQLite durable chunk"))
 	sum := [32]byte{4, 5, 6}
+	shardKey := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("SQLite shard"))}
 	publication := ShardPublication{
 		Namespace: "scope",
+		Shard:     shardKey,
 		Dedup: []DedupAssociation{{
-			Chunk: chunkHash, Value: DedupRecord{Shard: BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("SQLite shard"))}},
+			Chunk: chunkHash, Value: DedupRecord{Shard: shardKey},
 		}},
 		SHA256: []SHA256Association{{Sum: sum, Size: 10, File: fileHash}},
-		Files:  []FileRecord{{File: shard.RegisteredFile{File: shard.File{Hash: fileHash}, Size: 10}}},
+		Files:  []FileRecord{{File: shard.RegisteredFile{File: shard.File{Hash: fileHash}, Size: 10}, Shard: shardKey}},
 	}
 	injected := errors.New("injected SQLite transaction failure")
-	for _, stage := range []string{"after-dedup", "after-sha256", "after-files", "before-commit"} {
+	for _, stage := range []string{"after-dedup", "after-sha256", "after-files", "after-shard", "before-commit"} {
 		store.testHook = func(got string) error {
 			if got == stage {
 				return injected
@@ -2943,6 +3753,9 @@ func TestSQLiteIndexStoreRestartMigrationAndAtomicFailures(t *testing.T) {
 		if _, found, err := store.ResolveSHA256(ctx, "scope", sum, 10); err != nil || found {
 			t.Fatalf("%s partial SHA = %v, %v", stage, found, err)
 		}
+		if _, found, err := store.GetShard(ctx, "scope", shardKey.Hash); err != nil || found {
+			t.Fatalf("%s partial shard registration = %v, %v", stage, found, err)
+		}
 	}
 	store.testHook = nil
 	if err := store.PublishShard(ctx, publication); err != nil {
@@ -2958,6 +3771,9 @@ func TestSQLiteIndexStoreRestartMigrationAndAtomicFailures(t *testing.T) {
 	defer store.Close() //nolint:errcheck // Test cleanup.
 	if got, found, err := store.ResolveSHA256(ctx, "scope", sum, 10); err != nil || !found || got != fileHash {
 		t.Fatalf("reopened SHA = %s, %v, %v", got, found, err)
+	}
+	if got, found, err := store.GetShard(ctx, "scope", shardKey.Hash); err != nil || !found || got.Blob != shardKey {
+		t.Fatalf("reopened shard registration = %#v, %v, %v", got, found, err)
 	}
 	var version int
 	if err := store.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != sqliteSchemaVersion {
@@ -3155,7 +3971,7 @@ INSERT INTO sha256_associations(namespace, sum, size, file_hash) VALUES(?, ?, ?,
 			t.Fatalf("invalid SQLite record decode = %v", err)
 		}
 		if err := store.PublishShard(ctx, ShardPublication{
-			Namespace: "overflow", SHA256: []SHA256Association{{Size: ^uint64(0)}},
+			Namespace: "overflow", Shard: BlobKey{Kind: BlobShard, Hash: hash}, SHA256: []SHA256Association{{Size: ^uint64(0)}},
 		}); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("overflowing SQLite publication = %v", err)
 		}
@@ -3427,14 +4243,16 @@ INSERT INTO sha256_associations(namespace, sum, size, file_hash) VALUES(?, ?, ?,
 	})
 
 	t.Run("corrupt backend tables", func(t *testing.T) {
+		hash := xethash.Chunk([]byte("corrupt backend shard"))
 		for _, test := range []struct {
 			name        string
 			table       string
 			publication ShardPublication
 		}{
-			{"dedup", "dedup", ShardPublication{Dedup: []DedupAssociation{{}}}},
-			{"SHA", "sha256_associations", ShardPublication{SHA256: []SHA256Association{{}}}},
-			{"files", "files", ShardPublication{Files: []FileRecord{{}}}},
+			{"dedup", "dedup", ShardPublication{Shard: BlobKey{Kind: BlobShard, Hash: hash}, Dedup: []DedupAssociation{{Value: DedupRecord{Shard: BlobKey{Kind: BlobShard, Hash: hash}}}}}},
+			{"SHA", "sha256_associations", ShardPublication{Shard: BlobKey{Kind: BlobShard, Hash: hash}, SHA256: []SHA256Association{{}}}},
+			{"files", "files", ShardPublication{Shard: BlobKey{Kind: BlobShard, Hash: hash}, Files: []FileRecord{{Shard: BlobKey{Kind: BlobShard, Hash: hash}}}}},
+			{"shards", "shards", ShardPublication{Shard: BlobKey{Kind: BlobShard, Hash: hash}}},
 		} {
 			t.Run(test.name, func(t *testing.T) {
 				store, err := OpenSQLiteIndexStore(filepath.Join(t.TempDir(), "index.db"))
@@ -3560,13 +4378,16 @@ func TestSQLiteIndexStoreClosedErrors(t *testing.T) {
 	}{
 		{"get xorb", func() error { _, _, err := store.GetXorb(ctx, hash); return err }},
 		{"put xorb", func() error { return store.PutXorb(ctx, record) }},
+		{"get shard", func() error { _, _, err := store.GetShard(ctx, "scope", hash); return err }},
 		{"get file", func() error { _, _, err := store.GetFile(ctx, "scope", hash); return err }},
 		{"put file", func() error { return store.PutFile(ctx, "scope", file) }},
 		{"get dedup", func() error { _, _, err := store.GetDedup(ctx, "scope", hash); return err }},
 		{"put dedup", func() error { return store.PutDedup(ctx, "scope", hash, DedupRecord{}) }},
 		{"resolve SHA", func() error { _, _, err := store.ResolveSHA256(ctx, "scope", sum, 1); return err }},
 		{"put SHA", func() error { return store.PutSHA256(ctx, "scope", sum, 1, hash) }},
-		{"publish", func() error { return store.PublishShard(ctx, ShardPublication{}) }},
+		{"publish", func() error {
+			return store.PublishShard(ctx, ShardPublication{Shard: BlobKey{Kind: BlobShard, Hash: hash}})
+		}},
 		{"put stage", func() error { return store.PutBlobStage(ctx, stage) }},
 		{"renew stage", func() error {
 			return store.RenewBlobStage(ctx, stage.Namespace, stage.ID, stage.ExpiresAt.Add(time.Hour))
@@ -3731,12 +4552,17 @@ func TestDurableStoreInputSafety(t *testing.T) {
 func TestMemoryIndexStoreRechecksCancellationAfterAdmission(t *testing.T) {
 	store := NewMemoryStore()
 	var sum [32]byte
+	hash := xethash.Chunk([]byte("cancellation shard"))
 	tests := []struct {
 		name string
 		call func(context.Context) error
 	}{
 		{"get xorb", func(ctx context.Context) error { _, _, err := store.GetXorb(ctx, xethash.Hash{}); return err }},
 		{"put xorb", func(ctx context.Context) error { return store.PutXorb(ctx, XorbRecord{}) }},
+		{"get shard", func(ctx context.Context) error {
+			_, _, err := store.GetShard(ctx, "namespace", xethash.Hash{})
+			return err
+		}},
 		{"get file", func(ctx context.Context) error {
 			_, _, err := store.GetFile(ctx, "namespace", xethash.Hash{})
 			return err
@@ -3756,7 +4582,9 @@ func TestMemoryIndexStoreRechecksCancellationAfterAdmission(t *testing.T) {
 		{"put SHA-256", func(ctx context.Context) error {
 			return store.PutSHA256(ctx, "namespace", sum, 0, xethash.Hash{})
 		}},
-		{"publish shard", func(ctx context.Context) error { return store.PublishShard(ctx, ShardPublication{}) }},
+		{"publish shard", func(ctx context.Context) error {
+			return store.PublishShard(ctx, ShardPublication{Shard: BlobKey{Kind: BlobShard, Hash: hash}})
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -3765,6 +4593,11 @@ func TestMemoryIndexStoreRechecksCancellationAfterAdmission(t *testing.T) {
 				t.Fatalf("error = %v, want context cancellation", err)
 			}
 		})
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := store.GetShard(canceled, "namespace", hash); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled shard lookup = %v", err)
 	}
 }
 

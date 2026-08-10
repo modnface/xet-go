@@ -135,6 +135,12 @@ func TestServiceUploadPublicationAndReadPlanning(t *testing.T) {
 	if !result.Inserted || result.Files != 1 || result.GlobalDedupChunks == 0 {
 		t.Fatalf("shard result = %#v", result)
 	}
+	if got, found, err := store.GetShard(ctx, "tenant-a", result.Shard.Hash); err != nil || !found || got.Blob != result.Shard {
+		t.Fatalf("registered uploaded shard = %#v, %v, %v", got, found, err)
+	}
+	if _, found, err := store.GetShard(ctx, "tenant-b", result.Shard.Hash); err != nil || found {
+		t.Fatalf("cross-namespace uploaded shard = %v, %v", found, err)
+	}
 	result, err = service.UploadShard(ctx, "", bytes.NewReader(shardBody), int64(len(shardBody)))
 	if err != nil || result.Inserted {
 		t.Fatalf("replayed shard = %#v, %v", result, err)

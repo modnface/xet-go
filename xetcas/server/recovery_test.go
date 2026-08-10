@@ -143,6 +143,9 @@ func TestServiceRecoversExpiredXorbThenBlockedShard(t *testing.T) {
 	if err != nil || !found || file.Shard != shardKey {
 		t.Fatalf("recovered shard file = %#v, %v, %v", file, found, err)
 	}
+	if registered, found, err := store.GetShard(ctx, "tenant", shardKey.Hash); err != nil || !found || registered.Blob != shardKey {
+		t.Fatalf("recovered shard registration = %#v, %v, %v", registered, found, err)
+	}
 	if logicalShard.Files[0].SHA256 == nil {
 		t.Fatal("fixture lacks SHA-256")
 	}

@@ -78,6 +78,10 @@ Compatibility is continuously checked by the requirement matrix in
   bytes, but it does not expose file bytes or a dedup shard. Publishing a
   validated shard under `OperationWriteShard` creates that grant namespace's
   own logical file and dedup links to its transitive Xorbs.
+- Every successful logical shard publication also creates a durable
+  namespace-scoped shard registration. It commits atomically with that
+  publication's file, dedup, and SHA indexes and is available through bounded
+  operational iteration; the physical shard blob remains globally addressed.
 - File reconstruction and shard registration authorize their top-level
   operation once; transitive Xorb lookups inherit the enclosing scoped file or
   shard-write grant. The interface deliberately does not authorize each
@@ -116,14 +120,16 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
   beneath the private root are rejected when they are symlinks;
 - SQLite is created privately, uses WAL with `synchronous=FULL`, applies safety
   pragmas to every pooled connection, enforces key storage classes and lengths
-  through schema version 3, publishes dedup, scoped SHA, and file records in one
-  immediate transaction, and persists renewable blob stages and file leases;
+  through schema version 4, publishes shard registrations, dedup, scoped SHA,
+  and file records in one immediate transaction, and persists renewable blob
+  stages and file leases; migration to v4 boundedly backfills registrations
+  from shard sources visible in existing file and dedup indexes;
 - file and dedup indexes deterministically retain their first valid source,
   while Xorb and scoped SHA identities reject immutable conflicts;
 - optional operational listers provide opaque, operation- and filter-specific
   keyset cursors for blobs, Xorbs, scoped file and dedup records, scoped SHA
-  associations, blob stages, and file leases; SQLite query-plan tests prove
-  composite-primary-key seeks, while expiration scans seek dedicated
+  associations, shard registrations, blob stages, and file leases; SQLite
+  query-plan tests prove composite-primary-key seeks, while expiration scans seek dedicated
   `(expires_at, namespace, id)` indexes with cursors bound to a stable cutoff;
 - memory and SQLite conditionally delete expired stage/lease metadata in the
   same atomic comparison as deletion, so a stale scan cannot remove a renewed
