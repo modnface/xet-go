@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const sqliteSchemaVersion = 1
+const sqliteSchemaVersion = 2
 
 // SQLiteIndexStore is a durable single-node IndexStore. Payload bytes remain
 // in a BlobStore; SQLite contains only validated layouts, recipes, and scoped
@@ -145,10 +145,18 @@ func (s *SQLiteIndexStore) initialize(ctx context.Context) error {
 		}
 		return nil
 	}
-	if _, err := tx.ExecContext(ctx, sqliteSchemaV1); err != nil {
-		return fmt.Errorf("xet CAS server: migrate SQLite schema: %w", err)
+	if version < 1 {
+		if _, err := tx.ExecContext(ctx, sqliteSchemaV1); err != nil {
+			return fmt.Errorf("xet CAS server: migrate SQLite schema to version 1: %w", err)
+		}
+		version = 1
 	}
-	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
+	if version < 2 {
+		if _, err := tx.ExecContext(ctx, sqliteSchemaV2); err != nil {
+			return fmt.Errorf("xet CAS server: migrate SQLite schema to version 2: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
 		return fmt.Errorf("xet CAS server: record SQLite schema version: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -181,6 +189,48 @@ CREATE TABLE sha256_associations (
     file_hash BLOB NOT NULL CHECK(length(file_hash) = 32),
     PRIMARY KEY(namespace, sum, size)
 ) WITHOUT ROWID;
+`
+
+const sqliteSchemaV2 = `
+ALTER TABLE xorbs RENAME TO xorbs_v1;
+CREATE TABLE xorbs (
+    hash BLOB PRIMARY KEY NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 32),
+    record BLOB NOT NULL CHECK(typeof(record) = 'blob')
+) WITHOUT ROWID;
+INSERT INTO xorbs(hash, record) SELECT hash, record FROM xorbs_v1;
+DROP TABLE xorbs_v1;
+
+ALTER TABLE files RENAME TO files_v1;
+CREATE TABLE files (
+    namespace TEXT NOT NULL CHECK(typeof(namespace) = 'text'),
+    hash BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 32),
+    record BLOB NOT NULL CHECK(typeof(record) = 'blob'),
+    PRIMARY KEY(namespace, hash)
+) WITHOUT ROWID;
+INSERT INTO files(namespace, hash, record) SELECT namespace, hash, record FROM files_v1;
+DROP TABLE files_v1;
+
+ALTER TABLE dedup RENAME TO dedup_v1;
+CREATE TABLE dedup (
+    namespace TEXT NOT NULL CHECK(typeof(namespace) = 'text'),
+    chunk_hash BLOB NOT NULL CHECK(typeof(chunk_hash) = 'blob' AND length(chunk_hash) = 32),
+    record BLOB NOT NULL CHECK(typeof(record) = 'blob'),
+    PRIMARY KEY(namespace, chunk_hash)
+) WITHOUT ROWID;
+INSERT INTO dedup(namespace, chunk_hash, record) SELECT namespace, chunk_hash, record FROM dedup_v1;
+DROP TABLE dedup_v1;
+
+ALTER TABLE sha256_associations RENAME TO sha256_associations_v1;
+CREATE TABLE sha256_associations (
+    namespace TEXT NOT NULL CHECK(typeof(namespace) = 'text'),
+    sum BLOB NOT NULL CHECK(typeof(sum) = 'blob' AND length(sum) = 32),
+    size INTEGER NOT NULL CHECK(typeof(size) = 'integer' AND size >= 0),
+    file_hash BLOB NOT NULL CHECK(typeof(file_hash) = 'blob' AND length(file_hash) = 32),
+    PRIMARY KEY(namespace, sum, size)
+) WITHOUT ROWID;
+INSERT INTO sha256_associations(namespace, sum, size, file_hash)
+SELECT namespace, sum, size, file_hash FROM sha256_associations_v1;
+DROP TABLE sha256_associations_v1;
 `
 
 func (s *SQLiteIndexStore) Close() error { return s.db.Close() }
@@ -468,6 +518,299 @@ SELECT file_hash FROM sha256_associations WHERE namespace = ? AND sum = ? AND si
 		return fmt.Errorf("xet CAS server: commit SQLite shard publication: %w", err)
 	}
 	return nil
+}
+
+func (s *SQLiteIndexStore) ListXorbs(ctx context.Context, request PageRequest) (XorbRecordPage, error) {
+	limit, err := pageLimit(request)
+	if err != nil {
+		return XorbRecordPage{}, err
+	}
+	query := "SELECT hash, record, typeof(hash), typeof(record) FROM xorbs ORDER BY hash LIMIT ?"
+	arguments := []any{limit + 1}
+	if request.Cursor != "" {
+		cursor, err := decodeHashCursor(request.Cursor, cursorIndexXorb)
+		if err != nil {
+			return XorbRecordPage{}, err
+		}
+		query = "SELECT hash, record, typeof(hash), typeof(record) FROM xorbs WHERE hash > ? ORDER BY hash LIMIT ?"
+		arguments = []any{hashBytes(cursor), limit + 1}
+	}
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return XorbRecordPage{}, fmt.Errorf("xet CAS server: list SQLite xorbs: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // rows.Err and the explicit close below determine the result.
+	page := XorbRecordPage{Items: make([]XorbRecord, 0, limit)}
+	for rows.Next() {
+		var hashData, recordData []byte
+		var hashType, recordType string
+		if err := rows.Scan(&hashData, &recordData, &hashType, &recordType); err != nil {
+			return XorbRecordPage{}, fmt.Errorf("xet CAS server: scan SQLite xorb page: %w", err)
+		}
+		if hashType != "blob" || recordType != "blob" {
+			return XorbRecordPage{}, fmt.Errorf("%w: malformed SQLite xorb storage class", ErrCorrupt)
+		}
+		hash, err := sqliteHash(hashData)
+		if err != nil {
+			return XorbRecordPage{}, err
+		}
+		var record XorbRecord
+		if err := decodeIndexRecord(recordData, &record); err != nil {
+			return XorbRecordPage{}, err
+		}
+		if record.Layout.Hash != hash || record.Blob.Kind != BlobXorb || record.Blob.Hash != hash {
+			return XorbRecordPage{}, fmt.Errorf("%w: SQLite xorb identity mismatch", ErrCorrupt)
+		}
+		page.Items = append(page.Items, record)
+	}
+	if err := finishSQLiteRows(rows); err != nil {
+		return XorbRecordPage{}, fmt.Errorf("xet CAS server: finish SQLite xorb page: %w", err)
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.NextCursor = encodeHashCursor(cursorIndexXorb, page.Items[len(page.Items)-1].Layout.Hash)
+	}
+	return page, nil
+}
+
+func (s *SQLiteIndexStore) ListFiles(
+	ctx context.Context,
+	namespace *string,
+	request PageRequest,
+) (FileRecordPage, error) {
+	cursorKind := cursorFileAll
+	if namespace != nil {
+		cursorKind = cursorFileScoped
+	}
+	limit, cursorNamespace, cursorHash, hasCursor, err := scopedHashPage(request, namespace, cursorKind)
+	if err != nil {
+		return FileRecordPage{}, err
+	}
+	query, arguments := scopedHashQuery(
+		"SELECT namespace, hash, record, typeof(namespace), typeof(hash), typeof(record) FROM files", "hash", namespace,
+		cursorNamespace, cursorHash, hasCursor, limit,
+	)
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return FileRecordPage{}, fmt.Errorf("xet CAS server: list SQLite files: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // rows.Err and the explicit close below determine the result.
+	page := FileRecordPage{Items: make([]ScopedFileRecord, 0, limit)}
+	for rows.Next() {
+		var scope string
+		var hashData, recordData []byte
+		var scopeType, hashType, recordType string
+		if err := rows.Scan(&scope, &hashData, &recordData, &scopeType, &hashType, &recordType); err != nil {
+			return FileRecordPage{}, fmt.Errorf("xet CAS server: scan SQLite file page: %w", err)
+		}
+		if scopeType != "text" || hashType != "blob" || recordType != "blob" {
+			return FileRecordPage{}, fmt.Errorf("%w: malformed SQLite file storage class", ErrCorrupt)
+		}
+		hash, err := sqliteHash(hashData)
+		if err != nil {
+			return FileRecordPage{}, err
+		}
+		var record FileRecord
+		if err := decodeIndexRecord(recordData, &record); err != nil {
+			return FileRecordPage{}, err
+		}
+		if record.File.File.Hash != hash || record.Shard.Kind != BlobShard {
+			return FileRecordPage{}, fmt.Errorf("%w: SQLite file identity mismatch", ErrCorrupt)
+		}
+		page.Items = append(page.Items, ScopedFileRecord{Namespace: scope, Record: record})
+	}
+	if err := finishSQLiteRows(rows); err != nil {
+		return FileRecordPage{}, fmt.Errorf("xet CAS server: finish SQLite file page: %w", err)
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, last.Record.File.File.Hash[:])
+	}
+	return page, nil
+}
+
+func (s *SQLiteIndexStore) ListDedup(
+	ctx context.Context,
+	namespace *string,
+	request PageRequest,
+) (DedupRecordPage, error) {
+	cursorKind := cursorDedupAll
+	if namespace != nil {
+		cursorKind = cursorDedupScoped
+	}
+	limit, cursorNamespace, cursorHash, hasCursor, err := scopedHashPage(request, namespace, cursorKind)
+	if err != nil {
+		return DedupRecordPage{}, err
+	}
+	query, arguments := scopedHashQuery(
+		"SELECT namespace, chunk_hash, record, typeof(namespace), typeof(chunk_hash), typeof(record) FROM dedup", "chunk_hash", namespace,
+		cursorNamespace, cursorHash, hasCursor, limit,
+	)
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return DedupRecordPage{}, fmt.Errorf("xet CAS server: list SQLite dedup: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // rows.Err and the explicit close below determine the result.
+	page := DedupRecordPage{Items: make([]ScopedDedupRecord, 0, limit)}
+	for rows.Next() {
+		var scope string
+		var hashData, recordData []byte
+		var scopeType, hashType, recordType string
+		if err := rows.Scan(&scope, &hashData, &recordData, &scopeType, &hashType, &recordType); err != nil {
+			return DedupRecordPage{}, fmt.Errorf("xet CAS server: scan SQLite dedup page: %w", err)
+		}
+		if scopeType != "text" || hashType != "blob" || recordType != "blob" {
+			return DedupRecordPage{}, fmt.Errorf("%w: malformed SQLite dedup storage class", ErrCorrupt)
+		}
+		hash, err := sqliteHash(hashData)
+		if err != nil {
+			return DedupRecordPage{}, err
+		}
+		var record DedupRecord
+		if err := decodeIndexRecord(recordData, &record); err != nil {
+			return DedupRecordPage{}, err
+		}
+		if record.Shard.Kind != BlobShard {
+			return DedupRecordPage{}, fmt.Errorf("%w: SQLite dedup shard kind mismatch", ErrCorrupt)
+		}
+		page.Items = append(page.Items, ScopedDedupRecord{Namespace: scope, Chunk: hash, Record: record})
+	}
+	if err := finishSQLiteRows(rows); err != nil {
+		return DedupRecordPage{}, fmt.Errorf("xet CAS server: finish SQLite dedup page: %w", err)
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, last.Chunk[:])
+	}
+	return page, nil
+}
+
+func (s *SQLiteIndexStore) ListSHA256(
+	ctx context.Context,
+	namespace *string,
+	request PageRequest,
+) (SHA256AssociationPage, error) {
+	cursorKind := cursorSHA256All
+	if namespace != nil {
+		cursorKind = cursorSHA256Scoped
+	}
+	limit, cursorNamespace, cursorSum, cursorSize, hasCursor, err := scopedSHAPage(request, namespace, cursorKind)
+	if err != nil {
+		return SHA256AssociationPage{}, err
+	}
+	var databaseCursorSize int64
+	if hasCursor {
+		databaseCursorSize, err = uint64ToSQLite(cursorSize)
+		if err != nil {
+			return SHA256AssociationPage{}, err
+		}
+	}
+	query, arguments := scopedSHAQuery(namespace, cursorNamespace, cursorSum, databaseCursorSize, hasCursor, limit)
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return SHA256AssociationPage{}, fmt.Errorf("xet CAS server: list SQLite SHA-256 associations: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // rows.Err and the explicit close below determine the result.
+	page := SHA256AssociationPage{Items: make([]ScopedSHA256Association, 0, limit)}
+	for rows.Next() {
+		var scope string
+		var sumData, fileData []byte
+		var databaseSize any
+		var scopeType, sumType, sizeType, fileType string
+		if err := rows.Scan(
+			&scope, &sumData, &databaseSize, &fileData,
+			&scopeType, &sumType, &sizeType, &fileType,
+		); err != nil {
+			return SHA256AssociationPage{}, fmt.Errorf("xet CAS server: scan SQLite SHA-256 page: %w", err)
+		}
+		size, sizeOK := databaseSize.(int64)
+		if scopeType != "text" || sumType != "blob" || sizeType != "integer" || fileType != "blob" ||
+			!sizeOK || len(sumData) != 32 || len(fileData) != len(xethash.Hash{}) || size < 0 {
+			return SHA256AssociationPage{}, fmt.Errorf("%w: malformed SQLite SHA-256 association", ErrCorrupt)
+		}
+		var sum [32]byte
+		var file xethash.Hash
+		copy(sum[:], sumData)
+		copy(file[:], fileData)
+		page.Items = append(page.Items, ScopedSHA256Association{Namespace: scope, Record: SHA256Association{
+			Sum: sum, Size: uint64(size), File: file,
+		}})
+	}
+	if err := finishSQLiteRows(rows); err != nil {
+		return SHA256AssociationPage{}, fmt.Errorf("xet CAS server: finish SQLite SHA-256 page: %w", err)
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, shaCursorKey(last.Record.Sum, last.Record.Size))
+	}
+	return page, nil
+}
+
+func scopedHashQuery(
+	base, column string,
+	namespace *string,
+	cursorNamespace string,
+	cursorHash xethash.Hash,
+	hasCursor bool,
+	limit int,
+) (string, []any) {
+	order := " ORDER BY namespace, " + column + " LIMIT ?"
+	if namespace != nil {
+		if hasCursor {
+			return base + " WHERE namespace = ? AND " + column + " > ?" + order,
+				[]any{*namespace, hashBytes(cursorHash), limit + 1}
+		}
+		return base + " WHERE namespace = ?" + order, []any{*namespace, limit + 1}
+	}
+	if hasCursor {
+		return base + " WHERE (namespace, " + column + ") > (?, ?)" + order,
+			[]any{cursorNamespace, hashBytes(cursorHash), limit + 1}
+	}
+	return base + order, []any{limit + 1}
+}
+
+func scopedSHAQuery(
+	namespace *string,
+	cursorNamespace string,
+	cursorSum [32]byte,
+	cursorSize int64,
+	hasCursor bool,
+	limit int,
+) (string, []any) {
+	const base = `SELECT namespace, sum, size, file_hash,
+typeof(namespace), typeof(sum), typeof(size), typeof(file_hash) FROM sha256_associations`
+	const order = " ORDER BY namespace, sum, size LIMIT ?"
+	if namespace != nil {
+		if hasCursor {
+			return base + ` WHERE namespace = ? AND (sum, size) > (?, ?)` + order,
+				[]any{*namespace, cursorSum[:], cursorSize, limit + 1}
+		}
+		return base + " WHERE namespace = ?" + order, []any{*namespace, limit + 1}
+	}
+	if hasCursor {
+		return base + ` WHERE (namespace, sum, size) > (?, ?, ?)` + order,
+			[]any{cursorNamespace, cursorSum[:], cursorSize, limit + 1}
+	}
+	return base + order, []any{limit + 1}
+}
+
+func sqliteHash(data []byte) (xethash.Hash, error) {
+	if len(data) != len(xethash.Hash{}) {
+		return xethash.Hash{}, fmt.Errorf("%w: invalid SQLite hash length", ErrCorrupt)
+	}
+	var hash xethash.Hash
+	copy(hash[:], data)
+	return hash, nil
+}
+
+func finishSQLiteRows(rows *sql.Rows) error {
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return rows.Close()
 }
 
 func (s *SQLiteIndexStore) runTestHook(stage string) error {

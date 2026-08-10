@@ -5,7 +5,10 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
@@ -42,12 +45,50 @@ type BlobKey struct {
 
 type BlobInfo struct{ Size int64 }
 
+const (
+	DefaultPageSize = 100
+	MaxPageSize     = 1_000
+)
+
+// PageRequest controls bounded operational iteration. Cursor is an opaque
+// continuation value returned by the same method and backend. A zero Limit
+// selects DefaultPageSize. Multi-page iteration is weakly consistent rather
+// than a snapshot: stable records are returned once, but concurrent inserts
+// at or before an emitted cursor may be missed. Destructive maintenance must
+// combine iteration with writer quiescence, an epoch or lease, or an age/grace
+// barrier.
+type PageRequest struct {
+	Cursor string
+	Limit  int
+}
+
+type BlobEntry struct {
+	Key  BlobKey
+	Info BlobInfo
+}
+
+type BlobPage struct {
+	Items      []BlobEntry
+	NextCursor string
+}
+
 // BlobStore stores immutable protocol objects. PutIfAbsent must return
 // ErrConflict if a key already contains different bytes.
 type BlobStore interface {
 	PutIfAbsent(context.Context, BlobKey, io.Reader, int64) (inserted bool, err error)
 	Head(context.Context, BlobKey) (BlobInfo, bool, error)
 	Get(context.Context, BlobKey, *xetcas.HTTPRange) (io.ReadCloser, error)
+}
+
+// BlobLister is the optional operational-iteration capability implemented by
+// stores that support audit, migration, and garbage collection. Results are
+// ordered deterministically within one backend and bounded by PageRequest.
+// The filesystem implementation reads and sorts one four-hex-character hash
+// leaf at a time, so a page does not imply O(Limit) backend work. Listing
+// physical objects is an administrative capability; this interface performs
+// no tenant authorization.
+type BlobLister interface {
+	ListBlobs(context.Context, BlobKind, PageRequest) (BlobPage, error)
 }
 
 type XorbRecord struct {
@@ -73,6 +114,42 @@ type SHA256Association struct {
 	Sum  [32]byte
 	Size uint64
 	File xethash.Hash
+}
+
+type ScopedFileRecord struct {
+	Namespace string
+	Record    FileRecord
+}
+
+type FileRecordPage struct {
+	Items      []ScopedFileRecord
+	NextCursor string
+}
+
+type ScopedDedupRecord struct {
+	Namespace string
+	Chunk     xethash.Hash
+	Record    DedupRecord
+}
+
+type DedupRecordPage struct {
+	Items      []ScopedDedupRecord
+	NextCursor string
+}
+
+type ScopedSHA256Association struct {
+	Namespace string
+	Record    SHA256Association
+}
+
+type SHA256AssociationPage struct {
+	Items      []ScopedSHA256Association
+	NextCursor string
+}
+
+type XorbRecordPage struct {
+	Items      []XorbRecord
+	NextCursor string
 }
 
 // ShardPublication is the complete set of logical index records exposed by
@@ -103,6 +180,88 @@ type IndexStore interface {
 	ResolveSHA256(context.Context, string, [32]byte, uint64) (xethash.Hash, bool, error)
 	PutSHA256(context.Context, string, [32]byte, uint64, xethash.Hash) error
 	PublishShard(context.Context, ShardPublication) error
+}
+
+// IndexLister is the optional operational-iteration capability implemented by
+// durable indexes. A nil namespace lists all namespaces; a non-nil namespace,
+// including a pointer to the empty string, restricts the page to that exact
+// scope. Cursors are opaque and may only be reused with the same method and
+// namespace filter. All-namespace listing is an administrative capability;
+// this interface performs no tenant authorization.
+type IndexLister interface {
+	ListXorbs(context.Context, PageRequest) (XorbRecordPage, error)
+	ListFiles(context.Context, *string, PageRequest) (FileRecordPage, error)
+	ListDedup(context.Context, *string, PageRequest) (DedupRecordPage, error)
+	ListSHA256(context.Context, *string, PageRequest) (SHA256AssociationPage, error)
+}
+
+func pageLimit(request PageRequest) (int, error) {
+	if request.Limit == 0 {
+		return DefaultPageSize, nil
+	}
+	if request.Limit < 0 || request.Limit > MaxPageSize {
+		return 0, fmt.Errorf("%w: page limit must be 0 or between 1 and %d", ErrInvalid, MaxPageSize)
+	}
+	return request.Limit, nil
+}
+
+const (
+	cursorBlobXorb byte = iota + 1
+	cursorBlobShard
+	cursorIndexXorb
+	cursorFileAll
+	cursorFileScoped
+	cursorDedupAll
+	cursorDedupScoped
+	cursorSHA256All
+	cursorSHA256Scoped
+)
+
+func encodeHashCursor(kind byte, hash xethash.Hash) string {
+	data := make([]byte, 1+len(hash))
+	data[0] = kind
+	copy(data[1:], hash[:])
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func decodeHashCursor(cursor string, kind byte) (xethash.Hash, error) {
+	data, err := decodeCursor(cursor)
+	if err != nil || len(data) != 1+len(xethash.Hash{}) || data[0] != kind {
+		return xethash.Hash{}, fmt.Errorf("%w: malformed page cursor", ErrInvalid)
+	}
+	var hash xethash.Hash
+	copy(hash[:], data[1:])
+	return hash, nil
+}
+
+func encodeScopedCursor(kind byte, namespace string, key []byte) string {
+	data := make([]byte, 5+len(namespace)+len(key))
+	data[0] = kind
+	binary.BigEndian.PutUint32(data[1:5], uint32(len(namespace)))
+	copy(data[5:], namespace)
+	copy(data[5+len(namespace):], key)
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func decodeScopedCursor(cursor string, kind byte, keySize int) (string, []byte, error) {
+	data, err := decodeCursor(cursor)
+	if err != nil || len(data) < 5 || data[0] != kind {
+		return "", nil, fmt.Errorf("%w: malformed page cursor", ErrInvalid)
+	}
+	namespaceSize := uint64(binary.BigEndian.Uint32(data[1:5]))
+	if namespaceSize > uint64(len(data)-5) || uint64(len(data))-5-namespaceSize != uint64(keySize) {
+		return "", nil, fmt.Errorf("%w: malformed page cursor", ErrInvalid)
+	}
+	offset := 5 + int(namespaceSize)
+	return string(data[5:offset]), append([]byte(nil), data[offset:]...), nil
+}
+
+func decodeCursor(cursor string) ([]byte, error) {
+	data, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil || base64.RawURLEncoding.EncodeToString(data) != cursor {
+		return nil, fmt.Errorf("%w: malformed page cursor", ErrInvalid)
+	}
+	return data, nil
 }
 
 type Operation string

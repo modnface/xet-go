@@ -109,14 +109,20 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
   temporary files older than the configured grace period, and path components
   beneath the private root are rejected when they are symlinks;
 - SQLite is created privately, uses WAL with `synchronous=FULL`, applies safety
-  pragmas to every pooled connection, and publishes dedup, scoped SHA, and file
-  records in one immediate transaction;
+  pragmas to every pooled connection, enforces key storage classes and lengths
+  through schema version 2, and publishes dedup, scoped SHA, and file records in
+  one immediate transaction;
 - file and dedup indexes deterministically retain their first valid source,
-  while Xorb and scoped SHA identities reject immutable conflicts; and
+  while Xorb and scoped SHA identities reject immutable conflicts;
+- optional operational listers provide opaque, operation- and filter-specific
+  keyset cursors for blobs, Xorbs, scoped file and dedup records, and scoped SHA
+  associations; SQLite query-plan tests prove composite-primary-key seeks, and
+  filesystem pages seek the hash-prefix tree without collecting the whole
+  store (one four-hex-character leaf remains the minimum sorted work unit); and
 - the same backend contract suite runs against memory/filesystem and
   memory/SQLite, including cancellation, namespace isolation, concurrent
-  publication, injected publication failures, close/reopen, and full
-  reconstruction after restart.
+  publication and pagination mutation, corrupt-row detection, injected
+  publication failures, close/reopen, and full reconstruction after restart.
 
 Strict directory durability is currently implemented only on Linux and macOS.
 Other platforms return `ErrDurabilityUnsupported` before changing the requested
@@ -128,10 +134,9 @@ Remaining production storage boundaries are:
 
 1. staged-object protection, pins/leases, and grace-based cleanup for a crash
    between immutable blob publication and SQL commit;
-2. bounded paginated iteration over blobs, Xorbs, file identities, dedup, SHA,
-   staged records, and reachability roots;
+2. paginated iteration for future staged records and catalog reachability roots;
 3. audit, repair, resumable mark-and-sweep, and guarded garbage collection built
-   on those iteration and protection primitives;
+   on the current blob/index iteration plus those protection and root primitives;
 4. S3-compatible immutable/conditional blob publication and signed range reads;
 5. PostgreSQL migrations and an index implementation with the same atomic and
    namespace-scoped contract as SQLite; and

@@ -345,6 +345,772 @@ func TestIndexStoreContracts(t *testing.T) {
 	})
 }
 
+func runBlobListerContract(t *testing.T, factory blobStoreFactory) {
+	t.Helper()
+	store := factory(t)
+	lister, ok := store.(BlobLister)
+	if !ok {
+		t.Fatalf("%T does not implement BlobLister", store)
+	}
+	ctx := context.Background()
+	want := make(map[string]int64)
+	for i := range 7 {
+		body := bytes.Repeat([]byte{byte(i + 1)}, i+1)
+		hash := xethash.Chunk(append([]byte("listed blob"), byte(i)))
+		key := BlobKey{Kind: BlobXorb, Hash: hash}
+		if _, err := store.PutIfAbsent(ctx, key, bytes.NewReader(body), int64(len(body))); err != nil {
+			t.Fatal(err)
+		}
+		want[hash.String()] = int64(len(body))
+	}
+	shardKey := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("listed shard"))}
+	if _, err := store.PutIfAbsent(ctx, shardKey, bytes.NewReader([]byte("shard")), 5); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := make(map[string]struct{})
+	request := PageRequest{Limit: 2}
+	for {
+		page, err := lister.ListBlobs(ctx, BlobXorb, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Items) > request.Limit {
+			t.Fatalf("page has %d items, limit %d", len(page.Items), request.Limit)
+		}
+		for _, item := range page.Items {
+			key := item.Key.Hash.String()
+			if item.Key.Kind != BlobXorb || item.Info.Size != want[key] {
+				t.Fatalf("blob item = %#v", item)
+			}
+			if _, duplicate := seen[key]; duplicate {
+				t.Fatalf("duplicate blob %s", key)
+			}
+			seen[key] = struct{}{}
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		if page.NextCursor == request.Cursor {
+			t.Fatal("blob cursor did not advance")
+		}
+		request.Cursor = page.NextCursor
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("listed %d blobs, want %d", len(seen), len(want))
+	}
+	shards, err := lister.ListBlobs(ctx, BlobShard, PageRequest{Limit: 1})
+	if err != nil || len(shards.Items) != 1 || shards.Items[0].Key != shardKey || shards.NextCursor != "" {
+		t.Fatalf("shard page = %#v, %v", shards, err)
+	}
+	firstXorb, err := lister.ListBlobs(ctx, BlobXorb, PageRequest{Limit: 1})
+	if err != nil || firstXorb.NextCursor == "" {
+		t.Fatalf("first xorb page = %#v, %v", firstXorb, err)
+	}
+	if _, err := lister.ListBlobs(ctx, BlobShard, PageRequest{Cursor: firstXorb.NextCursor, Limit: 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cross-kind blob cursor = %v", err)
+	}
+	for name, request := range map[string]PageRequest{
+		"negative limit": {Limit: -1},
+		"large limit":    {Limit: MaxPageSize + 1},
+		"bad cursor":     {Cursor: "bad", Limit: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := lister.ListBlobs(ctx, BlobXorb, request); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+	if _, err := lister.ListBlobs(ctx, BlobKind("unknown"), PageRequest{}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid blob kind = %v", err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := lister.ListBlobs(canceled, BlobXorb, PageRequest{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled blob list = %v", err)
+	}
+	duringScan := &cancelAfterCheckContext{Context: ctx, after: 2}
+	if _, err := lister.ListBlobs(duringScan, BlobXorb, PageRequest{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("blob list canceled during scan = %v", err)
+	}
+}
+
+func TestBlobListerContracts(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		runBlobListerContract(t, func(testing.TB) BlobStore { return NewMemoryStore() })
+	})
+	t.Run("filesystem", func(t *testing.T) {
+		requireLocalDurability(t)
+		runBlobListerContract(t, func(t testing.TB) BlobStore {
+			store, err := NewFilesystemBlobStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			return store
+		})
+	})
+}
+
+func TestFilesystemBlobListerSafety(t *testing.T) {
+	requireLocalDurability(t)
+	newStore := func(t *testing.T) (*FilesystemBlobStore, string) {
+		t.Helper()
+		store, err := NewFilesystemBlobStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		root := filepath.Join(store.root, filesystemLayoutVersion, string(BlobXorb))
+		return store, root
+	}
+
+	t.Run("empty", func(t *testing.T) {
+		store, _ := newStore(t)
+		page, err := store.ListBlobs(context.Background(), BlobXorb, PageRequest{})
+		if err != nil || len(page.Items) != 0 || page.NextCursor != "" {
+			t.Fatalf("empty page = %#v, %v", page, err)
+		}
+	})
+
+	t.Run("intermediate symlink", func(t *testing.T) {
+		store, root := newStore(t)
+		external := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(external, string(BlobXorb)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(external, filepath.Join(store.root, filesystemLayoutVersion)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ListBlobs(context.Background(), BlobXorb, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("list through intermediate symlink %q = %v", root, err)
+		}
+	})
+
+	t.Run("replaced store root", func(t *testing.T) {
+		store, _ := newStore(t)
+		original := store.root + ".original"
+		if err := os.Rename(store.root, original); err != nil {
+			t.Fatal(err)
+		}
+		external := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(external, filesystemLayoutVersion, string(BlobXorb)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(external, store.root); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = os.Remove(store.root)
+			_ = os.Rename(original, store.root)
+		})
+		if _, err := store.ListBlobs(context.Background(), BlobXorb, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("list through replaced root = %v", err)
+		}
+	})
+
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, string)
+	}{
+		{"kind root is a file", func(t *testing.T, root string) {
+			if err := os.MkdirAll(filepath.Dir(root), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(root, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"malformed first prefix", func(t *testing.T, root string) {
+			if err := os.MkdirAll(filepath.Join(root, "zz"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"symlink prefix", func(t *testing.T, root string) {
+			if err := os.MkdirAll(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(t.TempDir(), filepath.Join(root, "00")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"malformed second prefix", func(t *testing.T, root string) {
+			if err := os.MkdirAll(filepath.Join(root, "00", "zz"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"malformed object name", func(t *testing.T, root string) {
+			objectRoot := filepath.Join(root, "00", "00")
+			if err := os.MkdirAll(objectRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(objectRoot, "not-a-hash"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"misplaced object", func(t *testing.T, root string) {
+			objectRoot := filepath.Join(root, "11", "11")
+			if err := os.MkdirAll(objectRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			name := strings.Repeat("0", xethash.StringSize)
+			if err := os.WriteFile(filepath.Join(objectRoot, name), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"symlink object", func(t *testing.T, root string) {
+			objectRoot := filepath.Join(root, "00", "00")
+			if err := os.MkdirAll(objectRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			name := strings.Repeat("0", xethash.StringSize)
+			if err := os.Symlink(filepath.Join(t.TempDir(), "target"), filepath.Join(objectRoot, name)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"non-regular object", func(t *testing.T, root string) {
+			name := strings.Repeat("0", xethash.StringSize)
+			if err := os.MkdirAll(filepath.Join(root, "00", "00", name), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, root := newStore(t)
+			test.setup(t, root)
+			if _, err := store.ListBlobs(context.Background(), BlobXorb, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("corrupt filesystem list = %v", err)
+			}
+		})
+	}
+
+	t.Run("temporary objects are hidden", func(t *testing.T) {
+		store, root := newStore(t)
+		objectRoot := filepath.Join(root, "00", "00")
+		if err := os.MkdirAll(objectRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(objectRoot, tempPrefix+"active"), []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		page, err := store.ListBlobs(context.Background(), BlobXorb, PageRequest{})
+		if err != nil || len(page.Items) != 0 {
+			t.Fatalf("temporary object page = %#v, %v", page, err)
+		}
+	})
+
+	t.Run("cursor seeks past earlier prefixes", func(t *testing.T) {
+		store, root := newStore(t)
+		if err := os.MkdirAll(filepath.Join(root, "00", "zz"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		cursor := encodeHashCursor(cursorBlobXorb, xethash.MustParse(strings.Repeat("8", xethash.StringSize)))
+		page, err := store.ListBlobs(context.Background(), BlobXorb, PageRequest{Cursor: cursor, Limit: 1})
+		if err != nil || len(page.Items) != 0 {
+			t.Fatalf("seek page = %#v, %v", page, err)
+		}
+	})
+
+	t.Run("cursor seeks within a first-level prefix", func(t *testing.T) {
+		store, root := newStore(t)
+		if err := os.MkdirAll(filepath.Join(root, "00", "00"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		text := "0088" + strings.Repeat("0", xethash.StringSize-4)
+		cursor := encodeHashCursor(cursorBlobXorb, xethash.MustParse(text))
+		page, err := store.ListBlobs(context.Background(), BlobXorb, PageRequest{Cursor: cursor, Limit: 1})
+		if err != nil || len(page.Items) != 0 {
+			t.Fatalf("same-prefix seek page = %#v, %v", page, err)
+		}
+	})
+
+	t.Run("cancellation during traversal", func(t *testing.T) {
+		store, root := newStore(t)
+		objectRoot := filepath.Join(root, "00", "00")
+		if err := os.MkdirAll(objectRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(objectRoot, strings.Repeat("0", xethash.StringSize)), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, after := range []int{2, 3, 4} {
+			ctx := &cancelAfterCheckContext{Context: context.Background(), after: after}
+			if _, err := store.ListBlobs(ctx, BlobXorb, PageRequest{}); !errors.Is(err, context.Canceled) {
+				t.Fatalf("list canceled at check %d = %v", after, err)
+			}
+		}
+	})
+}
+
+func runIndexListerContract(t *testing.T, factory indexStoreFactory) {
+	t.Helper()
+	store := factory(t)
+	lister, ok := store.(IndexLister)
+	if !ok {
+		t.Fatalf("%T does not implement IndexLister", store)
+	}
+	ctx := context.Background()
+	const recordsPerNamespace = 3
+	namespaces := []string{"", "alpha", "beta"}
+	for i := range 7 {
+		hash := xethash.Chunk(append([]byte("listed xorb"), byte(i)))
+		if err := store.PutXorb(ctx, XorbRecord{
+			Blob: BlobKey{Kind: BlobXorb, Hash: hash}, Layout: xorb.Ingested{Hash: hash},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for namespaceIndex, namespace := range namespaces {
+		for i := range recordsPerNamespace {
+			fileHash := xethash.Chunk([]byte(fmt.Sprintf("listed file %d %d", namespaceIndex, i)))
+			chunkHash := xethash.Chunk([]byte(fmt.Sprintf("listed dedup %d %d", namespaceIndex, i)))
+			shardKey := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte(fmt.Sprintf("listed shard %d %d", namespaceIndex, i)))}
+			if err := store.PutFile(ctx, namespace, FileRecord{
+				File: shard.RegisteredFile{File: shard.File{Hash: fileHash}}, Shard: shardKey,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.PutDedup(ctx, namespace, chunkHash, DedupRecord{Shard: shardKey}); err != nil {
+				t.Fatal(err)
+			}
+			var sum [32]byte
+			sum[0] = byte(namespaceIndex)
+			if err := store.PutSHA256(ctx, namespace, sum, uint64(i+1), fileHash); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	var xorbCursor string
+	seenXorbs := make(map[xethash.Hash]struct{})
+	for {
+		page, err := lister.ListXorbs(ctx, PageRequest{Cursor: xorbCursor, Limit: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, record := range page.Items {
+			if _, duplicate := seenXorbs[record.Layout.Hash]; duplicate {
+				t.Fatalf("duplicate xorb %s", record.Layout.Hash)
+			}
+			seenXorbs[record.Layout.Hash] = struct{}{}
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		xorbCursor = page.NextCursor
+	}
+	if len(seenXorbs) != 7 {
+		t.Fatalf("listed %d xorbs, want 7", len(seenXorbs))
+	}
+
+	countFiles := func(namespace *string) int {
+		t.Helper()
+		count := 0
+		request := PageRequest{Limit: 2}
+		for {
+			page, err := lister.ListFiles(ctx, namespace, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			count += len(page.Items)
+			if page.NextCursor == "" {
+				return count
+			}
+			request.Cursor = page.NextCursor
+		}
+	}
+	if got := countFiles(nil); got != len(namespaces)*recordsPerNamespace {
+		t.Fatalf("all file count = %d", got)
+	}
+	for _, namespace := range namespaces {
+		if got := countFiles(&namespace); got != recordsPerNamespace {
+			t.Fatalf("namespace %q file count = %d", namespace, got)
+		}
+	}
+
+	countDedup, countSHA := 0, 0
+	dedupRequest, shaRequest := PageRequest{Limit: 2}, PageRequest{Limit: 2}
+	for {
+		page, err := lister.ListDedup(ctx, nil, dedupRequest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		countDedup += len(page.Items)
+		if page.NextCursor == "" {
+			break
+		}
+		dedupRequest.Cursor = page.NextCursor
+	}
+	for {
+		page, err := lister.ListSHA256(ctx, nil, shaRequest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		countSHA += len(page.Items)
+		if page.NextCursor == "" {
+			break
+		}
+		shaRequest.Cursor = page.NextCursor
+	}
+	wantScoped := len(namespaces) * recordsPerNamespace
+	if countDedup != wantScoped || countSHA != wantScoped {
+		t.Fatalf("dedup/SHA counts = %d/%d, want %d", countDedup, countSHA, wantScoped)
+	}
+	for _, namespace := range namespaces {
+		dedupCount, shaCount := 0, 0
+		dedupRequest, shaRequest := PageRequest{Limit: 1}, PageRequest{Limit: 1}
+		for {
+			page, err := lister.ListDedup(ctx, &namespace, dedupRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dedupCount += len(page.Items)
+			if page.NextCursor == "" {
+				break
+			}
+			dedupRequest.Cursor = page.NextCursor
+		}
+		for {
+			page, err := lister.ListSHA256(ctx, &namespace, shaRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			shaCount += len(page.Items)
+			if page.NextCursor == "" {
+				break
+			}
+			shaRequest.Cursor = page.NextCursor
+		}
+		if dedupCount != recordsPerNamespace || shaCount != recordsPerNamespace {
+			t.Fatalf("namespace %q dedup/SHA counts = %d/%d", namespace, dedupCount, shaCount)
+		}
+	}
+
+	alpha := "alpha"
+	first, err := lister.ListFiles(ctx, &alpha, PageRequest{Limit: 1})
+	if err != nil || first.NextCursor == "" {
+		t.Fatalf("first filtered page = %#v, %v", first, err)
+	}
+	beta := "beta"
+	if _, err := lister.ListFiles(ctx, &beta, PageRequest{Cursor: first.NextCursor, Limit: 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cross-namespace cursor = %v", err)
+	}
+	if _, err := lister.ListFiles(ctx, nil, PageRequest{Cursor: first.NextCursor, Limit: 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cross-filter cursor = %v", err)
+	}
+	if _, err := lister.ListDedup(ctx, &alpha, PageRequest{Cursor: first.NextCursor, Limit: 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cross-method cursor = %v", err)
+	}
+	if _, err := lister.ListSHA256(ctx, &alpha, PageRequest{Cursor: first.NextCursor, Limit: 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cross-method SHA cursor = %v", err)
+	}
+	firstSHA, err := lister.ListSHA256(ctx, &alpha, PageRequest{Limit: 1})
+	if err != nil || firstSHA.NextCursor == "" {
+		t.Fatalf("first filtered SHA page = %#v, %v", firstSHA, err)
+	}
+	if _, err := lister.ListSHA256(ctx, &beta, PageRequest{Cursor: firstSHA.NextCursor, Limit: 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cross-namespace SHA cursor = %v", err)
+	}
+	mutationPage, err := lister.ListFiles(ctx, nil, PageRequest{Limit: 1})
+	if err != nil || mutationPage.NextCursor == "" {
+		t.Fatalf("mutation test first page = %#v, %v", mutationPage, err)
+	}
+	behind, ahead := xethash.Zero, xethash.Hash{}
+	for i := range ahead {
+		ahead[i] = 0xff
+	}
+	mutationNamespace := mutationPage.Items[0].Namespace
+	for _, hash := range []xethash.Hash{behind, ahead} {
+		if err := store.PutFile(ctx, mutationNamespace, FileRecord{
+			File: shard.RegisteredFile{File: shard.File{Hash: hash}}, Shard: BlobKey{Kind: BlobShard},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	foundBehind, foundAhead := false, false
+	request := PageRequest{Cursor: mutationPage.NextCursor, Limit: 2}
+	for {
+		page, err := lister.ListFiles(ctx, nil, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range page.Items {
+			foundBehind = foundBehind || item.Record.File.File.Hash == behind
+			foundAhead = foundAhead || item.Record.File.File.Hash == ahead
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		request.Cursor = page.NextCursor
+	}
+	if foundBehind || !foundAhead {
+		t.Fatalf("concurrent inserts behind/ahead cursor found = %v/%v", foundBehind, foundAhead)
+	}
+	for _, operation := range []func(context.Context) error{
+		func(ctx context.Context) error { _, err := lister.ListXorbs(ctx, PageRequest{}); return err },
+		func(ctx context.Context) error { _, err := lister.ListFiles(ctx, nil, PageRequest{}); return err },
+		func(ctx context.Context) error { _, err := lister.ListDedup(ctx, nil, PageRequest{}); return err },
+		func(ctx context.Context) error { _, err := lister.ListSHA256(ctx, nil, PageRequest{}); return err },
+	} {
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		if err := operation(canceled); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled index list = %v", err)
+		}
+	}
+	if _, err := lister.ListXorbs(ctx, PageRequest{Cursor: "bad"}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("malformed xorb cursor = %v", err)
+	}
+	if _, err := lister.ListXorbs(ctx, PageRequest{Limit: MaxPageSize + 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid xorb limit = %v", err)
+	}
+	if _, err := lister.ListFiles(ctx, nil, PageRequest{Limit: MaxPageSize + 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid file limit = %v", err)
+	}
+	if _, err := lister.ListSHA256(ctx, nil, PageRequest{Cursor: encodeScopedCursor(cursorSHA256All, "", make([]byte, 40)), Limit: MaxPageSize + 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid index limit = %v", err)
+	}
+}
+
+func TestIndexListerContracts(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		runIndexListerContract(t, func(testing.TB) IndexStore { return NewMemoryStore() })
+	})
+	t.Run("sqlite", func(t *testing.T) {
+		requireLocalDurability(t)
+		runIndexListerContract(t, func(t testing.TB) IndexStore {
+			store, err := OpenSQLiteIndexStore(filepath.Join(t.TempDir(), "index.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			return store
+		})
+	})
+}
+
+func TestPageCursorValidation(t *testing.T) {
+	if _, _, err := decodeScopedCursor(
+		encodeScopedCursor(cursorFileAll, "scope", []byte{1}), cursorFileAll, len(xethash.Hash{}),
+	); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("wrong-sized scoped cursor = %v", err)
+	}
+	if _, err := decodeCursor("AA=="); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("non-canonical cursor = %v", err)
+	}
+}
+
+func TestMemoryIndexListerCancellationDuringScan(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	hash := xethash.Chunk([]byte("cancel index listing"))
+	if err := store.PutXorb(ctx, XorbRecord{Blob: BlobKey{Kind: BlobXorb, Hash: hash}, Layout: xorb.Ingested{Hash: hash}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutFile(ctx, "scope", FileRecord{File: shard.RegisteredFile{File: shard.File{Hash: hash}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutDedup(ctx, "scope", hash, DedupRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutSHA256(ctx, "scope", [32]byte{}, 1, hash); err != nil {
+		t.Fatal(err)
+	}
+	for name, operation := range map[string]func(context.Context) error{
+		"xorbs": func(ctx context.Context) error { _, err := store.ListXorbs(ctx, PageRequest{}); return err },
+		"files": func(ctx context.Context) error { _, err := store.ListFiles(ctx, nil, PageRequest{}); return err },
+		"dedup": func(ctx context.Context) error { _, err := store.ListDedup(ctx, nil, PageRequest{}); return err },
+		"SHA":   func(ctx context.Context) error { _, err := store.ListSHA256(ctx, nil, PageRequest{}); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := &cancelAfterCheckContext{Context: context.Background(), after: 2}
+			if err := operation(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("index list canceled during scan = %v", err)
+			}
+		})
+	}
+}
+
+func TestSQLiteIndexListerBackendAndCorruptionErrors(t *testing.T) {
+	requireLocalDurability(t)
+	ctx := context.Background()
+	t.Run("closed", func(t *testing.T) {
+		store, err := OpenSQLiteIndexStore(filepath.Join(t.TempDir(), "index.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for name, operation := range map[string]func() error{
+			"xorbs": func() error { _, err := store.ListXorbs(ctx, PageRequest{}); return err },
+			"files": func() error { _, err := store.ListFiles(ctx, nil, PageRequest{}); return err },
+			"dedup": func() error { _, err := store.ListDedup(ctx, nil, PageRequest{}); return err },
+			"SHA":   func() error { _, err := store.ListSHA256(ctx, nil, PageRequest{}); return err },
+		} {
+			t.Run(name, func(t *testing.T) {
+				if err := operation(); err == nil {
+					t.Fatal("listing against closed SQLite store succeeded")
+				}
+			})
+		}
+	})
+
+	t.Run("malformed xorb key", func(t *testing.T) {
+		store, err := OpenSQLiteIndexStore(filepath.Join(t.TempDir(), "index.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close() //nolint:errcheck // Test cleanup.
+		connection, err := store.db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer connection.Close() //nolint:errcheck // Test cleanup.
+		if _, err := connection.ExecContext(ctx, "PRAGMA ignore_check_constraints=ON"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := connection.ExecContext(ctx, "INSERT INTO xorbs(hash, record) VALUES(?, ?)", []byte{1}, []byte("{}")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ListXorbs(ctx, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("malformed SQLite xorb key = %v", err)
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		insert func(*testing.T, *sql.Conn)
+		list   func(*SQLiteIndexStore) error
+	}{
+		{"xorb text hash", func(t *testing.T, connection *sql.Conn) {
+			hash := xethash.Chunk([]byte("text xorb hash"))
+			record, err := encodeIndexRecord(XorbRecord{
+				Blob: BlobKey{Kind: BlobXorb, Hash: hash}, Layout: xorb.Ingested{Hash: hash},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := connection.ExecContext(ctx, "INSERT INTO xorbs(hash, record) VALUES(?, ?)", string(hash[:]), record); err != nil {
+				t.Fatal(err)
+			}
+		}, func(store *SQLiteIndexStore) error {
+			_, err := store.ListXorbs(ctx, PageRequest{})
+			return err
+		}},
+		{"file blob namespace", func(t *testing.T, connection *sql.Conn) {
+			hash := xethash.Chunk([]byte("blob file namespace"))
+			record, err := encodeIndexRecord(FileRecord{
+				File: shard.RegisteredFile{File: shard.File{Hash: hash}}, Shard: BlobKey{Kind: BlobShard},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := connection.ExecContext(ctx, "INSERT INTO files(namespace, hash, record) VALUES(?, ?, ?)", []byte("scope"), hashBytes(hash), record); err != nil {
+				t.Fatal(err)
+			}
+		}, func(store *SQLiteIndexStore) error {
+			_, err := store.ListFiles(ctx, nil, PageRequest{})
+			return err
+		}},
+		{"dedup text hash", func(t *testing.T, connection *sql.Conn) {
+			hash := xethash.Chunk([]byte("text dedup hash"))
+			record, err := encodeIndexRecord(DedupRecord{Shard: BlobKey{Kind: BlobShard}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := connection.ExecContext(ctx, "INSERT INTO dedup(namespace, chunk_hash, record) VALUES(?, ?, ?)", "scope", string(hash[:]), record); err != nil {
+				t.Fatal(err)
+			}
+		}, func(store *SQLiteIndexStore) error {
+			_, err := store.ListDedup(ctx, nil, PageRequest{})
+			return err
+		}},
+		{"SHA real size", func(t *testing.T, connection *sql.Conn) {
+			if _, err := connection.ExecContext(ctx, `
+INSERT INTO sha256_associations(namespace, sum, size, file_hash) VALUES(?, ?, ?, ?)`,
+				"scope", make([]byte, 32), 1.5, make([]byte, 32)); err != nil {
+				t.Fatal(err)
+			}
+		}, func(store *SQLiteIndexStore) error {
+			_, err := store.ListSHA256(ctx, nil, PageRequest{})
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := OpenSQLiteIndexStore(filepath.Join(t.TempDir(), "index.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close() //nolint:errcheck // Test cleanup.
+			connection, err := store.db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close() //nolint:errcheck // Test cleanup.
+			if _, err := connection.ExecContext(ctx, "PRAGMA ignore_check_constraints=ON"); err != nil {
+				t.Fatal(err)
+			}
+			test.insert(t, connection)
+			if err := test.list(store); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("malformed SQLite storage class = %v", err)
+			}
+		})
+	}
+}
+
+func TestSQLiteIndexListerQueryPlans(t *testing.T) {
+	requireLocalDurability(t)
+	store, err := OpenSQLiteIndexStore(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close() //nolint:errcheck // Test cleanup.
+	hash := xethash.Chunk([]byte("SQLite query plan cursor"))
+	var sum [32]byte
+	copy(sum[:], hash[:])
+	fileQuery, fileArguments := scopedHashQuery(
+		"SELECT namespace, hash, record FROM files", "hash", nil, "scope", hash, true, 1,
+	)
+	shaQuery, shaArguments := scopedSHAQuery(nil, "scope", sum, 1, true, 1)
+	for name, plan := range map[string]struct {
+		table     string
+		query     string
+		arguments []any
+	}{
+		"files": {table: "files", query: fileQuery, arguments: fileArguments},
+		"SHA":   {table: "sha256_associations", query: shaQuery, arguments: shaArguments},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rows, err := store.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+plan.query, plan.arguments...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close() //nolint:errcheck // Test failure is decisive.
+			foundSearch := false
+			for rows.Next() {
+				var id, parent, unused int
+				var detail string
+				if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(detail, "MULTI-INDEX OR") || strings.Contains(detail, "USE TEMP B-TREE") {
+					t.Fatalf("unbounded query plan: %s", detail)
+				}
+				if strings.Contains(detail, "SEARCH "+plan.table+" USING PRIMARY KEY") {
+					foundSearch = true
+				}
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if !foundSearch {
+				t.Fatal("query plan did not seek through the composite primary key")
+			}
+		})
+	}
+}
+
 func TestFilesystemBlobStoreRestartRecoveryAndSafety(t *testing.T) {
 	requireLocalDurability(t)
 	barrierRoot := t.TempDir()
@@ -1230,6 +1996,9 @@ func TestSQLiteIndexStoreSecurityConcurrencyAndCorruption(t *testing.T) {
 		if _, _, err := store.GetXorb(ctx, hash); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("corrupt SQLite record = %v", err)
 		}
+		if _, err := store.ListXorbs(ctx, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("list corrupt SQLite xorb = %v", err)
+		}
 		fileHash := xethash.Chunk([]byte("corrupt SQLite file"))
 		if err := store.PutFile(ctx, "scope", FileRecord{File: shard.RegisteredFile{File: shard.File{Hash: fileHash}}}); err != nil {
 			t.Fatal(err)
@@ -1239,6 +2008,9 @@ func TestSQLiteIndexStoreSecurityConcurrencyAndCorruption(t *testing.T) {
 		}
 		if _, _, err := store.GetFile(ctx, "scope", fileHash); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("corrupt SQLite file = %v", err)
+		}
+		if _, err := store.ListFiles(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("list corrupt SQLite file = %v", err)
 		}
 		mismatchedFile := FileRecord{File: shard.RegisteredFile{File: shard.File{Hash: xethash.Zero}}}
 		encodedFile, err := encodeIndexRecord(mismatchedFile)
@@ -1251,6 +2023,22 @@ func TestSQLiteIndexStoreSecurityConcurrencyAndCorruption(t *testing.T) {
 		if _, _, err := store.GetFile(ctx, "scope", fileHash); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("mismatched SQLite file = %v", err)
 		}
+		if _, err := store.ListFiles(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("list mismatched SQLite file = %v", err)
+		}
+		wrongShardKind := FileRecord{
+			File: shard.RegisteredFile{File: shard.File{Hash: fileHash}}, Shard: BlobKey{Kind: BlobXorb},
+		}
+		encodedFile, err = encodeIndexRecord(wrongShardKind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.ExecContext(ctx, "UPDATE files SET record = ? WHERE namespace = ? AND hash = ?", encodedFile, "scope", hashBytes(fileHash)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ListFiles(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("list mismatched SQLite file shard kind = %v", err)
+		}
 		chunkHash := xethash.Chunk([]byte("corrupt SQLite dedup"))
 		if err := store.PutDedup(ctx, "scope", chunkHash, DedupRecord{}); err != nil {
 			t.Fatal(err)
@@ -1260,6 +2048,19 @@ func TestSQLiteIndexStoreSecurityConcurrencyAndCorruption(t *testing.T) {
 		}
 		if _, _, err := store.GetDedup(ctx, "scope", chunkHash); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("corrupt SQLite dedup = %v", err)
+		}
+		if _, err := store.ListDedup(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("list corrupt SQLite dedup = %v", err)
+		}
+		encodedDedup, err := encodeIndexRecord(DedupRecord{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.ExecContext(ctx, "UPDATE dedup SET record = ? WHERE namespace = ? AND chunk_hash = ?", encodedDedup, "scope", hashBytes(chunkHash)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ListDedup(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("list mismatched SQLite dedup shard kind = %v", err)
 		}
 		connection, err := store.db.Conn(ctx)
 		if err != nil {
@@ -1277,6 +2078,9 @@ INSERT INTO sha256_associations(namespace, sum, size, file_hash) VALUES(?, ?, ?,
 		}
 		if _, _, err := store.ResolveSHA256(ctx, "scope", shortSum, 1); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("truncated SQLite SHA file hash = %v", err)
+		}
+		if _, err := store.ListSHA256(ctx, nil, PageRequest{}); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("list truncated SQLite SHA file hash = %v", err)
 		}
 		if err := store.PutSHA256(ctx, "scope", shortSum, 1, hash); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("put over truncated SQLite SHA file hash = %v", err)
@@ -1331,13 +2135,96 @@ INSERT INTO sha256_associations(namespace, sum, size, file_hash) VALUES(?, ?, ?,
 		}
 	})
 
+	t.Run("version one migration", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "index.db")
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := xethash.Chunk([]byte("SQLite version one migration"))
+		record := XorbRecord{Blob: BlobKey{Kind: BlobXorb, Hash: hash}, Layout: xorb.Ingested{Hash: hash}}
+		encoded, err := encodeIndexRecord(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, sqliteSchemaV1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, "INSERT INTO xorbs(hash, record) VALUES(?, ?)", hashBytes(hash), encoded); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		store, err := OpenSQLiteIndexStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close() //nolint:errcheck // Test cleanup.
+		got, found, err := store.GetXorb(ctx, hash)
+		if err != nil || !found || !reflect.DeepEqual(got, record) {
+			t.Fatalf("migrated xorb = %#v, %v, %v", got, found, err)
+		}
+		var version int
+		if err := store.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != sqliteSchemaVersion {
+			t.Fatalf("migrated schema version = %d, %v", version, err)
+		}
+		if _, err := store.db.ExecContext(ctx,
+			"INSERT INTO xorbs(hash, record) VALUES(?, ?)", strings.Repeat("x", 32), []byte("{}")); err == nil {
+			t.Fatal("version two schema accepted a text hash")
+		}
+	})
+
+	t.Run("version one corrupt migration rolls back", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "index.db")
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, sqliteSchemaV1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx,
+			"INSERT INTO xorbs(hash, record) VALUES(?, ?)", strings.Repeat("x", 32), []byte("{}")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenSQLiteIndexStore(path); err == nil {
+			t.Fatal("corrupt version one SQLite index migrated")
+		}
+		db, err = sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close() //nolint:errcheck // Test cleanup.
+		var version, count int
+		if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRowContext(ctx, "SELECT count(*) FROM xorbs").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if version != 1 || count != 1 {
+			t.Fatalf("rolled-back version one index = version %d, rows %d", version, count)
+		}
+	})
+
 	t.Run("future migration", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "index.db")
 		store, err := OpenSQLiteIndexStore(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.db.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
+		if _, err := store.db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", sqliteSchemaVersion+1)); err != nil {
 			t.Fatal(err)
 		}
 		if err := store.Close(); err != nil {

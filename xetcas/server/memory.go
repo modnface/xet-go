@@ -3,9 +3,11 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"reflect"
+	"sort"
 	"sync"
 
 	"github.com/jmwoliver/xet-go/shard"
@@ -114,6 +116,48 @@ func (s *MemoryStore) Get(ctx context.Context, key BlobKey, wanted *xetcas.HTTPR
 	}
 	reader := io.NopCloser(bytes.NewReader(value))
 	return &contextReadCloser{ctx: ctx, Reader: reader, close: reader}, nil
+}
+
+func (s *MemoryStore) ListBlobs(ctx context.Context, kind BlobKind, request PageRequest) (BlobPage, error) {
+	if kind != BlobXorb && kind != BlobShard {
+		return BlobPage{}, fmt.Errorf("%w: unsupported blob kind %q", ErrInvalid, kind)
+	}
+	limit, err := pageLimit(request)
+	if err != nil {
+		return BlobPage{}, err
+	}
+	cursorKind := cursorBlobXorb
+	if kind == BlobShard {
+		cursorKind = cursorBlobShard
+	}
+	var cursor xethash.Hash
+	if request.Cursor != "" {
+		cursor, err = decodeHashCursor(request.Cursor, cursorKind)
+		if err != nil {
+			return BlobPage{}, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return BlobPage{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]BlobEntry, 0, min(limit+1, len(s.blobs)))
+	for key, value := range s.blobs {
+		if err := ctx.Err(); err != nil {
+			return BlobPage{}, err
+		}
+		if key.Kind == kind && (request.Cursor == "" || bytes.Compare(key.Hash[:], cursor[:]) > 0) {
+			items = append(items, BlobEntry{Key: key, Info: BlobInfo{Size: int64(len(value))}})
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return bytes.Compare(items[i].Key.Hash[:], items[j].Key.Hash[:]) < 0 })
+	page := BlobPage{Items: items}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.NextCursor = encodeHashCursor(cursorKind, page.Items[len(page.Items)-1].Key.Hash)
+	}
+	return page, nil
 }
 
 func (s *MemoryStore) GetXorb(ctx context.Context, hash xethash.Hash) (XorbRecord, bool, error) {
@@ -279,6 +323,269 @@ func (s *MemoryStore) PublishShard(ctx context.Context, publication ShardPublica
 		}
 	}
 	return nil
+}
+
+func (s *MemoryStore) ListXorbs(ctx context.Context, request PageRequest) (XorbRecordPage, error) {
+	limit, err := pageLimit(request)
+	if err != nil {
+		return XorbRecordPage{}, err
+	}
+	var cursor xethash.Hash
+	if request.Cursor != "" {
+		cursor, err = decodeHashCursor(request.Cursor, cursorIndexXorb)
+		if err != nil {
+			return XorbRecordPage{}, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return XorbRecordPage{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]XorbRecord, 0, min(limit+1, len(s.xorbs)))
+	for hash, record := range s.xorbs {
+		if err := ctx.Err(); err != nil {
+			return XorbRecordPage{}, err
+		}
+		if request.Cursor == "" || bytes.Compare(hash[:], cursor[:]) > 0 {
+			items = append(items, cloneXorbRecord(record))
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return bytes.Compare(items[i].Layout.Hash[:], items[j].Layout.Hash[:]) < 0
+	})
+	page := XorbRecordPage{Items: items}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.NextCursor = encodeHashCursor(cursorIndexXorb, page.Items[len(page.Items)-1].Layout.Hash)
+	}
+	return page, nil
+}
+
+func (s *MemoryStore) ListFiles(
+	ctx context.Context,
+	namespace *string,
+	request PageRequest,
+) (FileRecordPage, error) {
+	cursorKind := cursorFileAll
+	if namespace != nil {
+		cursorKind = cursorFileScoped
+	}
+	limit, cursorNamespace, cursorHash, hasCursor, err := scopedHashPage(request, namespace, cursorKind)
+	if err != nil {
+		return FileRecordPage{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return FileRecordPage{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]ScopedFileRecord, 0, min(limit+1, len(s.files)))
+	for key, record := range s.files {
+		if err := ctx.Err(); err != nil {
+			return FileRecordPage{}, err
+		}
+		if namespace != nil && key.namespace != *namespace {
+			continue
+		}
+		if hasCursor && compareScopedHash(key.namespace, key.hash, cursorNamespace, cursorHash) <= 0 {
+			continue
+		}
+		items = append(items, ScopedFileRecord{Namespace: key.namespace, Record: cloneFileRecord(record)})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return compareScopedHash(items[i].Namespace, items[i].Record.File.File.Hash,
+			items[j].Namespace, items[j].Record.File.File.Hash) < 0
+	})
+	page := FileRecordPage{Items: items}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, last.Record.File.File.Hash[:])
+	}
+	return page, nil
+}
+
+func (s *MemoryStore) ListDedup(
+	ctx context.Context,
+	namespace *string,
+	request PageRequest,
+) (DedupRecordPage, error) {
+	cursorKind := cursorDedupAll
+	if namespace != nil {
+		cursorKind = cursorDedupScoped
+	}
+	limit, cursorNamespace, cursorHash, hasCursor, err := scopedHashPage(request, namespace, cursorKind)
+	if err != nil {
+		return DedupRecordPage{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return DedupRecordPage{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]ScopedDedupRecord, 0, min(limit+1, len(s.dedup)))
+	for key, record := range s.dedup {
+		if err := ctx.Err(); err != nil {
+			return DedupRecordPage{}, err
+		}
+		if namespace != nil && key.namespace != *namespace {
+			continue
+		}
+		if hasCursor && compareScopedHash(key.namespace, key.hash, cursorNamespace, cursorHash) <= 0 {
+			continue
+		}
+		items = append(items, ScopedDedupRecord{Namespace: key.namespace, Chunk: key.hash, Record: record})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return compareScopedHash(items[i].Namespace, items[i].Chunk, items[j].Namespace, items[j].Chunk) < 0
+	})
+	page := DedupRecordPage{Items: items}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, last.Chunk[:])
+	}
+	return page, nil
+}
+
+func (s *MemoryStore) ListSHA256(
+	ctx context.Context,
+	namespace *string,
+	request PageRequest,
+) (SHA256AssociationPage, error) {
+	cursorKind := cursorSHA256All
+	if namespace != nil {
+		cursorKind = cursorSHA256Scoped
+	}
+	limit, cursorNamespace, cursorSum, cursorSize, hasCursor, err := scopedSHAPage(request, namespace, cursorKind)
+	if err != nil {
+		return SHA256AssociationPage{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return SHA256AssociationPage{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]ScopedSHA256Association, 0, min(limit+1, len(s.sha256)))
+	for key, file := range s.sha256 {
+		if err := ctx.Err(); err != nil {
+			return SHA256AssociationPage{}, err
+		}
+		if namespace != nil && key.namespace != *namespace {
+			continue
+		}
+		if hasCursor && compareScopedSHA(key.namespace, key.sum, key.size,
+			cursorNamespace, cursorSum, cursorSize) <= 0 {
+			continue
+		}
+		items = append(items, ScopedSHA256Association{Namespace: key.namespace, Record: SHA256Association{
+			Sum: key.sum, Size: key.size, File: file,
+		}})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		left, right := items[i], items[j]
+		return compareScopedSHA(left.Namespace, left.Record.Sum, left.Record.Size,
+			right.Namespace, right.Record.Sum, right.Record.Size) < 0
+	})
+	page := SHA256AssociationPage{Items: items}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor = encodeScopedCursor(cursorKind, last.Namespace, shaCursorKey(last.Record.Sum, last.Record.Size))
+	}
+	return page, nil
+}
+
+func scopedHashPage(
+	request PageRequest,
+	namespace *string,
+	cursorKind byte,
+) (int, string, xethash.Hash, bool, error) {
+	limit, err := pageLimit(request)
+	if err != nil {
+		return 0, "", xethash.Hash{}, false, err
+	}
+	if request.Cursor == "" {
+		return limit, "", xethash.Hash{}, false, nil
+	}
+	cursorNamespace, key, err := decodeScopedCursor(request.Cursor, cursorKind, len(xethash.Hash{}))
+	if err != nil {
+		return 0, "", xethash.Hash{}, false, err
+	}
+	if namespace != nil && cursorNamespace != *namespace {
+		return 0, "", xethash.Hash{}, false, fmt.Errorf("%w: cursor namespace differs from filter", ErrInvalid)
+	}
+	var cursorHash xethash.Hash
+	copy(cursorHash[:], key)
+	return limit, cursorNamespace, cursorHash, true, nil
+}
+
+func scopedSHAPage(
+	request PageRequest,
+	namespace *string,
+	cursorKind byte,
+) (int, string, [32]byte, uint64, bool, error) {
+	limit, err := pageLimit(request)
+	if err != nil {
+		return 0, "", [32]byte{}, 0, false, err
+	}
+	if request.Cursor == "" {
+		return limit, "", [32]byte{}, 0, false, nil
+	}
+	cursorNamespace, key, err := decodeScopedCursor(request.Cursor, cursorKind, 40)
+	if err != nil {
+		return 0, "", [32]byte{}, 0, false, err
+	}
+	if namespace != nil && cursorNamespace != *namespace {
+		return 0, "", [32]byte{}, 0, false, fmt.Errorf("%w: cursor namespace differs from filter", ErrInvalid)
+	}
+	var sum [32]byte
+	copy(sum[:], key[:32])
+	return limit, cursorNamespace, sum, binary.BigEndian.Uint64(key[32:]), true, nil
+}
+
+func compareScopedHash(leftNamespace string, leftHash xethash.Hash, rightNamespace string, rightHash xethash.Hash) int {
+	if leftNamespace < rightNamespace {
+		return -1
+	}
+	if leftNamespace > rightNamespace {
+		return 1
+	}
+	return bytes.Compare(leftHash[:], rightHash[:])
+}
+
+func compareScopedSHA(
+	leftNamespace string,
+	leftSum [32]byte,
+	leftSize uint64,
+	rightNamespace string,
+	rightSum [32]byte,
+	rightSize uint64,
+) int {
+	if leftNamespace < rightNamespace {
+		return -1
+	}
+	if leftNamespace > rightNamespace {
+		return 1
+	}
+	if result := bytes.Compare(leftSum[:], rightSum[:]); result != 0 {
+		return result
+	}
+	if leftSize < rightSize {
+		return -1
+	}
+	if leftSize > rightSize {
+		return 1
+	}
+	return 0
+}
+
+func shaCursorKey(sum [32]byte, size uint64) []byte {
+	key := make([]byte, 40)
+	copy(key, sum[:])
+	binary.BigEndian.PutUint64(key[32:], size)
+	return key
 }
 
 func cloneXorbRecord(value XorbRecord) XorbRecord {

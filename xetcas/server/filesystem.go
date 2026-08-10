@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jmwoliver/xet-go/xetcas"
+	"github.com/jmwoliver/xet-go/xethash"
 )
 
 const (
@@ -287,6 +288,159 @@ func (s *FilesystemBlobStore) Get(ctx context.Context, key BlobKey, wanted *xetc
 	}
 	section := io.NewSectionReader(f, int64(wanted.Start), int64(wanted.End-wanted.Start+1))
 	return &contextReadCloser{ctx: ctx, Reader: section, close: f}, nil
+}
+
+func (s *FilesystemBlobStore) ListBlobs(
+	ctx context.Context,
+	kind BlobKind,
+	request PageRequest,
+) (BlobPage, error) {
+	if err := s.beginOperation(); err != nil {
+		return BlobPage{}, err
+	}
+	defer s.endOperation()
+	if kind != BlobXorb && kind != BlobShard {
+		return BlobPage{}, fmt.Errorf("%w: unsupported blob kind %q", ErrInvalid, kind)
+	}
+	limit, err := pageLimit(request)
+	if err != nil {
+		return BlobPage{}, err
+	}
+	cursorKind := cursorBlobXorb
+	if kind == BlobShard {
+		cursorKind = cursorBlobShard
+	}
+	var cursorHash xethash.Hash
+	if request.Cursor != "" {
+		cursorHash, err = decodeHashCursor(request.Cursor, cursorKind)
+		if err != nil {
+			return BlobPage{}, err
+		}
+	}
+	cursor := cursorHash.String()
+	if err := ctx.Err(); err != nil {
+		return BlobPage{}, err
+	}
+	root := filepath.Join(s.root, filesystemLayoutVersion, string(kind))
+	rootInfo, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return BlobPage{Items: []BlobEntry{}}, nil
+	}
+	if err != nil {
+		return BlobPage{}, err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return BlobPage{}, fmt.Errorf("%w: blob kind root is not a real directory", ErrCorrupt)
+	}
+	if err := validateObjectPath(s.root, root); err != nil {
+		return BlobPage{}, fmt.Errorf("%w: unsafe blob kind path: %v", ErrCorrupt, err)
+	}
+	page := BlobPage{Items: make([]BlobEntry, 0, limit)}
+	err = s.walkBlobPage(ctx, root, kind, cursor, request.Cursor != "", limit, &page)
+	if err != nil {
+		return BlobPage{}, err
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.NextCursor = encodeHashCursor(cursorKind, page.Items[len(page.Items)-1].Key.Hash)
+	}
+	return page, nil
+}
+
+func (s *FilesystemBlobStore) walkBlobPage(
+	ctx context.Context,
+	root string,
+	kind BlobKind,
+	cursor string,
+	hasCursor bool,
+	limit int,
+	page *BlobPage,
+) error {
+	firstLevel, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, first := range firstLevel {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := validateBlobPrefix(first); err != nil {
+			return err
+		}
+		if hasCursor && first.Name() < cursor[:2] {
+			continue
+		}
+		firstPath := filepath.Join(root, first.Name())
+		secondLevel, err := os.ReadDir(firstPath)
+		if err != nil {
+			return err
+		}
+		for _, second := range secondLevel {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := validateBlobPrefix(second); err != nil {
+				return err
+			}
+			prefix := first.Name() + second.Name()
+			if hasCursor && prefix < cursor[:4] {
+				continue
+			}
+			objectRoot := filepath.Join(firstPath, second.Name())
+			objects, err := os.ReadDir(objectRoot)
+			if err != nil {
+				return err
+			}
+			for _, entry := range objects {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if entry.Type()&os.ModeSymlink != 0 {
+					return fmt.Errorf("%w: symlink beneath blob kind root", ErrCorrupt)
+				}
+				if strings.HasPrefix(entry.Name(), tempPrefix) {
+					continue
+				}
+				hash, err := xethash.Parse(entry.Name())
+				if err != nil || hash.String() != entry.Name() || entry.Name()[:4] != prefix {
+					return fmt.Errorf("%w: malformed blob object name %q", ErrCorrupt, entry.Name())
+				}
+				if hasCursor && entry.Name() <= cursor {
+					continue
+				}
+				info, err := entry.Info()
+				if err != nil {
+					return err
+				}
+				if !info.Mode().IsRegular() {
+					return fmt.Errorf("%w: blob object is not a regular file", ErrCorrupt)
+				}
+				page.Items = append(page.Items, BlobEntry{
+					Key:  BlobKey{Kind: kind, Hash: hash},
+					Info: BlobInfo{Size: info.Size()},
+				})
+				if len(page.Items) > limit {
+					return nil
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateBlobPrefix(entry os.DirEntry) error {
+	if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() {
+		return fmt.Errorf("%w: invalid blob prefix path %q", ErrCorrupt, entry.Name())
+	}
+	name := entry.Name()
+	if len(name) != 2 || !isLowerHex(name[0]) || !isLowerHex(name[1]) {
+		return fmt.Errorf("%w: malformed blob prefix %q", ErrCorrupt, name)
+	}
+	return nil
+}
+
+func isLowerHex(value byte) bool {
+	return value >= '0' && value <= '9' || value >= 'a' && value <= 'f'
 }
 
 type contextReadCloser struct {

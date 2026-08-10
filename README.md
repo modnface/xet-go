@@ -203,11 +203,26 @@ cas, err := server.New(server.Options{
 Filesystem writes use exact-length temporary files, file sync, non-replacing
 hard-link publication, and directory durability barriers. SQLite uses WAL,
 `synchronous=FULL`, immediate write transactions, and one atomic
-`PublishShard` transaction. Both constructors reject symlinked leaf paths and
+`PublishShard` transaction. Schema version 2 enforces SQLite storage classes as
+well as key lengths, so text/blob aliases cannot split one logical index key.
+Both constructors reject symlinked leaf paths and
 return `ErrDurabilityUnsupported` without modifying their target on platforms
 where strict directory durability is not implemented. Cross-store staging and
 garbage collection are not yet implemented: a failed SQL publication can leave
 an unreachable immutable blob, but cannot expose a partial logical file.
+
+Stores may additionally implement `BlobLister` and `IndexLister` for bounded,
+keyset-paginated operational scans. The memory, filesystem, and SQLite stores
+provide these capabilities for blobs, Xorbs, namespace-scoped files and dedup
+records, and namespace-scoped SHA associations. Cursors are opaque and tied to
+one operation, blob kind, and namespace-filter mode. SQLite seeks through its
+composite primary keys; filesystem scans seek the two-level hash-prefix tree
+and stop after finding one page, while reading and sorting one
+four-hex-character leaf as the smallest unit of work. Listers expose physical
+or all-namespace state without performing tenant authorization and belong
+behind an administrative boundary. Pages are weakly consistent rather than a
+snapshot, so destructive maintenance still requires quiescence, an epoch or
+lease, or a grace barrier.
 
 Embedders can stream reconstructed content without interpreting protocol JSON
 or making an internal HTTP request:
