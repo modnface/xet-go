@@ -121,8 +121,8 @@ func ensureSQLitePath(path string) error {
 }
 
 func (s *SQLiteIndexStore) initialize(ctx context.Context) error {
-	var journalMode string
-	if err := s.db.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&journalMode); err != nil {
+	journalMode, err := configureSQLiteWAL(ctx, s.db)
+	if err != nil {
 		return fmt.Errorf("xet CAS server: configure SQLite WAL: %w", err)
 	}
 	if journalMode != "wal" {
@@ -169,6 +169,38 @@ func (s *SQLiteIndexStore) initialize(ctx context.Context) error {
 		return fmt.Errorf("xet CAS server: commit SQLite migration: %w", err)
 	}
 	return nil
+}
+
+func configureSQLiteWAL(ctx context.Context, db *sql.DB) (string, error) {
+	const retryWindow = 5 * time.Second
+	deadline := time.Now().Add(retryWindow)
+	delay := time.Millisecond
+	for {
+		var journalMode string
+		err := db.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&journalMode)
+		if err == nil || !isSQLiteBusy(err) || time.Now().Add(delay).After(deadline) {
+			return journalMode, err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+		delay = min(delay*2, 100*time.Millisecond)
+	}
+}
+
+func isSQLiteBusy(err error) bool {
+	const sqliteBusy = 5
+	var coder interface{ Code() int }
+	return errors.As(err, &coder) && coder.Code()&0xff == sqliteBusy
 }
 
 const sqliteSchemaV1 = `
