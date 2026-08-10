@@ -28,6 +28,7 @@ var (
 	ErrCorrupt                     = errors.New("xet CAS server: corrupt content")
 	ErrDurabilityUnsupported       = errors.New("xet CAS server: strict filesystem durability is unsupported")
 	ErrProtectionExpiryUnsupported = errors.New("xet CAS server: protection expiry operations are unsupported")
+	ErrAuditUnsupported            = errors.New("xet CAS server: selected audit inventory is unsupported")
 )
 
 type BlobKind string
@@ -94,6 +95,8 @@ type BlobLister interface {
 
 type XorbRecord struct {
 	Blob   BlobKey
+	// Layout contains metadata only. Service publication stores Complete in
+	// Blob and clears Layout.Complete before publishing the index record.
 	Layout xorb.Ingested
 }
 
@@ -239,6 +242,173 @@ type FileLeasePage struct {
 	NextCursor string
 }
 
+// AuditKind selects one bounded administrative metadata inventory. Namespace
+// must be nil for global physical-blob and Xorb-record inventories. A nil
+// namespace on a scoped kind lists all namespaces; a non-nil value selects
+// that exact namespace. Audit iteration performs no tenant authorization and
+// never reads, hashes, or decodes payload bytes.
+type AuditKind string
+
+const (
+	// AuditKindBlobXorb checks a listed physical Xorb key and size against
+	// its global Xorb layout record and metadata-derived canonical size.
+	AuditKindBlobXorb AuditKind = "blob-xorb"
+	// AuditKindBlobShard checks a listed physical shard key and reported
+	// size. Reachability is indeterminate without a global reverse index.
+	AuditKindBlobShard AuditKind = "blob-shard"
+	// AuditKindXorbRecord checks layout identity and bounds plus existence and
+	// exact reported size of its canonical physical Xorb object.
+	AuditKindXorbRecord AuditKind = "xorb-record"
+	// AuditKindShardRecord checks a scoped registration and the existence and
+	// reported size bounds of its physical shard object.
+	AuditKindShardRecord AuditKind = "shard-record"
+	// AuditKindFileRecord checks its scoped shard publication, complete file
+	// recipe through canonical registration validation, every referenced Xorb
+	// layout and reported object size, and any SHA association it declares.
+	AuditKindFileRecord AuditKind = "file-record"
+	// AuditKindDedupRecord checks its nonzero chunk identity, scoped shard
+	// publication, and physical shard object's existence and reported bounds.
+	AuditKindDedupRecord AuditKind = "dedup-record"
+	// AuditKindSHA256Association checks its scoped file target with the same
+	// deep metadata checks as AuditKindFileRecord and compares derived size.
+	// It does not hash reconstructed file bytes.
+	AuditKindSHA256Association AuditKind = "sha256-association"
+	// AuditKindBlobStage validates protection metadata and checks the staged
+	// physical object's existence and reported size bounds.
+	AuditKindBlobStage AuditKind = "blob-stage"
+	// AuditKindFileLease validates protection metadata and checks its scoped
+	// file target with the same deep metadata checks as AuditKindFileRecord.
+	AuditKindFileLease AuditKind = "file-lease"
+)
+
+// AuditRequest requests at most one bounded, weakly consistent inventory page.
+type AuditRequest struct {
+	Kind      AuditKind
+	Namespace *string
+	Page      PageRequest
+}
+
+// AuditSubject is a closed union of compact inventory identities. Audit pages
+// deliberately do not copy potentially large Xorb layouts or file recipes.
+type AuditSubject interface{ auditSubject() }
+
+type auditSubjectMarker struct{}
+
+func (auditSubjectMarker) auditSubject() {}
+
+type BlobAuditSubject struct {
+	auditSubjectMarker
+	Entry BlobEntry
+}
+
+type XorbRecordAuditSubject struct {
+	auditSubjectMarker
+	Blob BlobKey
+}
+
+type ShardRecordAuditSubject struct {
+	auditSubjectMarker
+	Namespace string
+	Blob      BlobKey
+}
+
+type FileRecordAuditSubject struct {
+	auditSubjectMarker
+	Namespace string
+	File      xethash.Hash
+	Shard     BlobKey
+}
+
+type DedupRecordAuditSubject struct {
+	auditSubjectMarker
+	Namespace string
+	Chunk     xethash.Hash
+	Shard     BlobKey
+}
+
+type SHA256AssociationAuditSubject struct {
+	auditSubjectMarker
+	Namespace string
+	Sum       [32]byte
+	Size      uint64
+	File      xethash.Hash
+}
+
+type BlobStageAuditSubject struct {
+	auditSubjectMarker
+	Stage BlobStage
+}
+
+type FileLeaseAuditSubject struct {
+	auditSubjectMarker
+	Lease FileLease
+}
+
+// AuditStatus describes only the metadata and forward point checks documented
+// for one AuditKind at the time of their individual lookups. It never proves
+// payload bytes, reachability, retention, liveness, or deletion safety.
+type AuditStatus string
+
+const (
+	AuditStatusNoIssueFound  AuditStatus = "no-issue-found"
+	AuditStatusIssue         AuditStatus = "issue"
+	AuditStatusIndeterminate AuditStatus = "indeterminate"
+	AuditStatusFailed        AuditStatus = "failed"
+)
+
+type AuditFinding string
+
+const (
+	AuditFindingNone                          AuditFinding = ""
+	AuditFindingBlobMissing                   AuditFinding = "blob-missing"
+	AuditFindingBlobSizeInvalid               AuditFinding = "blob-size-invalid"
+	AuditFindingXorbRecordMissing             AuditFinding = "xorb-record-missing"
+	AuditFindingShardRecordMissing            AuditFinding = "shard-record-missing"
+	AuditFindingFileRecordMissing             AuditFinding = "file-record-missing"
+	AuditFindingSHA256AssociationMissing      AuditFinding = "sha256-association-missing"
+	AuditFindingRecordInvalid                 AuditFinding = "record-invalid"
+	AuditFindingShardReverseLookupUnavailable AuditFinding = "shard-reverse-lookup-unavailable"
+	AuditFindingCheckFailed                   AuditFinding = "check-failed"
+)
+
+type AuditTargetKind string
+
+const (
+	AuditTargetBlob        AuditTargetKind = "blob"
+	AuditTargetXorbRecord  AuditTargetKind = "xorb-record"
+	AuditTargetShardRecord AuditTargetKind = "shard-record"
+	AuditTargetFileRecord  AuditTargetKind = "file-record"
+	AuditTargetSHA256      AuditTargetKind = "sha256-association"
+)
+
+type AuditTarget struct {
+	Kind      AuditTargetKind
+	Namespace string
+	Blob      BlobKey
+	Hash      xethash.Hash
+	Sum       [32]byte
+	Size      uint64
+}
+
+type AuditResult struct {
+	Subject AuditSubject
+	Status  AuditStatus
+	Finding AuditFinding
+	Target  *AuditTarget
+	// Err is nil for no-issue-found, missing-target, and indeterminate outcomes.
+	// Corrupt/invalid records and failed backend checks retain their typed error.
+	Err error
+}
+
+// AuditPage contains diagnostic results from one page. If AuditInventory
+// returns a non-nil error, Items may contain checks completed before failure,
+// but NextCursor is always empty and callers must retry the original request.
+type AuditPage struct {
+	Kind       AuditKind
+	Items      []AuditResult
+	NextCursor string
+}
+
 // ShardPublication is the complete set of logical index records exposed by
 // one validated shard. PublishShard must commit all records atomically within
 // Namespace or expose none of them.
@@ -346,6 +516,7 @@ const (
 	cursorFileLeaseScoped
 	cursorBlobStageExpired
 	cursorFileLeaseExpired
+	cursorAuditEnvelope
 )
 
 // validateShardPublication is shared by durable backends so contradictory
@@ -513,7 +684,8 @@ func protectionExpiryPage(
 }
 
 func normalizeBlobStage(stage BlobStage) (BlobStage, error) {
-	if stage.ID == (ProtectionID{}) || stage.Blob.Kind != BlobXorb && stage.Blob.Kind != BlobShard {
+	if stage.ID == (ProtectionID{}) || stage.Blob.Hash == xethash.Zero ||
+		stage.Blob.Kind != BlobXorb && stage.Blob.Kind != BlobShard {
 		return BlobStage{}, fmt.Errorf("%w: invalid blob stage identity", ErrInvalid)
 	}
 	createdAt, err := normalizeProtectionTime(stage.CreatedAt)

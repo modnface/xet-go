@@ -221,13 +221,13 @@ file lease before traversing the reconstruction graph. Signed reconstruction
 responses retain a detached lease through the maximum `SignedRange.ExpiresAt`
 returned by the signer plus `ReadLeaseTTL` as a grace interval. This is why a
 `RangeURLSigner` must return both the URL and its authoritative expiration.
-Reachability audit and destructive garbage collection are not yet implemented;
-`ProtectionExpiryStore` only lists and conditionally removes expired protection
-metadata. Its cursors are bound to a stable cutoff, and compare-before-delete
-preserves a record renewed after it was listed. These methods never delete blob
-payloads: an expired or removed stage must not be treated as permission to
-delete bytes without the documented classification, age/grace, and reachability
-checks.
+Catalog reachability and destructive garbage collection are not yet
+implemented. `ProtectionExpiryStore` only lists and conditionally removes
+expired protection metadata. Its cursors are bound to a stable cutoff, and
+compare-before-delete preserves a record renewed after it was listed. These
+methods never delete blob payloads: an expired or removed stage must not be
+treated as permission to delete bytes without the documented classification,
+age/grace, and reachability checks.
 
 `Service.RecoverExpiredBlobStages` is the restart-safe publication reconciler.
 It reads one expiry page at a stable cutoff, exactly and boundedly reads each
@@ -252,11 +252,37 @@ operation, blob kind, namespace-filter mode, and, for expiry scans, cutoff.
 SQLite seeks through its
 composite primary keys; filesystem scans seek the two-level hash-prefix tree
 and stop after finding one page, while reading and sorting one
-four-hex-character leaf as the smallest unit of work. Listers expose physical
-or all-namespace state without performing tenant authorization and belong
-behind an administrative boundary. Pages are weakly consistent rather than a
-snapshot, so destructive maintenance still requires quiescence, an epoch or
-lease, or a grace barrier.
+four-hex-character leaf as the smallest unit of work. The memory backend scans
+its unordered maps but retains at most `Limit+1` keys and clones only selected
+Xorb layouts and file recipes, so retained page memory is bounded even though
+scan work is O(N). Listers expose physical or all-namespace state without
+performing tenant authorization and belong behind an administrative boundary.
+Pages are weakly consistent rather than a snapshot, so destructive maintenance
+still requires quiescence, an epoch or lease, or a grace barrier.
+
+`Service.AuditInventory` composes those listers into one bounded, read-only
+administrative page of forward metadata checks. It covers physical Xorb and
+shard objects; global Xorb layouts; namespace-scoped shard, file, dedup, and
+SHA-256 records; and blob stages and file leases. File, SHA, and lease checks
+reuse canonical shard registration validation, including recipe identities,
+term verification, derived size, referenced Xorb metadata, and backing-object
+sizes. Scoped dependencies are always resolved in the listed record's
+namespace. The operation never calls the tenant `Authorizer`; expose it only
+behind a separate administrative authorization boundary.
+
+An audit result of `AuditStatusNoIssueFound` means only that the documented
+metadata and `BlobStore.Head` checks found no issue at their individual lookup
+times. Audit does not read, decode, or hash payload bytes, recompute a file's
+SHA-256, prove that a shard payload contains a listed file or dedup term,
+establish catalog reachability, or authorize retention or deletion. Physical
+shard reachability is therefore explicitly indeterminate. Registrations,
+stages, and leases are evidence and protection roots, never deletion authority.
+Pages are weakly consistent; concurrent publication can produce transient
+results or inserts behind a cursor. Backend point failures remain per-item
+diagnostics and iteration advances past them, so operators must retain and
+retry failed subjects explicitly. Cancellation may return completed diagnostic
+items, but never a continuation; retry from the original request cursor. There
+is no repair or payload-sweep API.
 
 Embedders can stream reconstructed content without interpreting protocol JSON
 or making an internal HTTP request:

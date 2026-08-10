@@ -31,7 +31,8 @@
 | Shard progress | v2 NDJSON emits validation/commit/result or terminal error frames and periodically repeats the latest frame as a heartbeat |
 | Server work limits | Configurable file/xorb/term/chunk-reference budgets, context-aware planners, bounded compact-gap memory, and pre-buffer ingestion admission |
 | Typed reconstruction | `Service.OpenFile` streams full files or ranges directly from global physical Xorbs reached through a namespace-scoped file recipe, with chunk/length validation, optional whole-file SHA-256, backpressure, cancellation, and deterministic closure |
-| Local durable storage | Linux/macOS immutable filesystem blobs plus a pure-Go SQLite WAL index; strict file/directory barriers, process-root locking, restart persistence, transactional shard-index publication, and schema-v3 lifecycle protections |
+| Local durable storage | Linux/macOS immutable filesystem blobs plus a pure-Go SQLite WAL index; strict file/directory barriers, process-root locking, restart persistence, transactional shard-index publication, and schema-v4 lifecycle and shard-registration metadata |
+| Administrative audit | Bounded, weakly consistent, read-only forward metadata checks across blob/index/protection inventories; no tenant authorization, payload hashing, catalog reachability, repair, or deletion authority |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
 | Credential refresh | Refresh 30 seconds before expiry, coalesce concurrent refresh, and retry exactly once after a 401 invalidation |
@@ -102,6 +103,12 @@ Compatibility is continuously checked by the requirement matrix in
 - Every index write is idempotent. File and dedup indexes are non-unique
   secondary indexes and may retain any already-valid durable source. A SHA key
   is immutable within its namespace.
+- SHA associations are independent `(namespace, digest, size) -> file`
+  mappings. Because a file index may retain an earlier valid recipe without
+  optional SHA metadata, auditing a SHA row validates its scoped file target
+  and derived size rather than requiring the retained recipe to repeat that
+  SHA. A retained file recipe that does declare SHA metadata must resolve back
+  through the corresponding scoped association.
 - The service's publication order makes retry after a lost response safe.
   Object and index stores still do not share a transaction: failed or ambiguous
   index publication retains the durable stage as a recovery/GC root. Durable
@@ -141,7 +148,18 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
   original stage conditionally removed; missing, corrupt, blocked, conflicting,
   and backend-failed stages remain protected;
 - filesystem pages seek the hash-prefix tree without collecting the whole
-  store (one four-hex-character leaf remains the minimum sorted work unit); and
+  store (one four-hex-character leaf remains the minimum sorted work unit);
+- memory pages scan unordered maps but retain only `Limit+1` ordered keys and
+  clone only selected large records, bounding retained memory independently of
+  inventory size;
+- one bounded administrative audit page can perform forward checks over every
+  current blob/index/protection inventory. `no-issue-found` means only that the
+  kind-specific metadata and `Head` checks succeeded at lookup time. It does
+  not read or hash payload bytes, prove shard contents, recompute file SHA-256,
+  determine catalog reachability, or authorize deletion. Physical shard
+  reachability remains indeterminate; point failures advance as retained
+  diagnostics, while cancellation withholds the cursor and requires retry from
+  the original request; and
 - the same backend contract suite runs against memory/filesystem and
   memory/SQLite, including cancellation, namespace isolation, concurrent
   publication and pagination mutation, corrupt-row detection, injected
@@ -159,8 +177,9 @@ Remaining production storage boundaries are:
    blocked recovery stages (expiration or protection deletion alone never
    authorizes object deletion);
 2. catalog reachability roots and read/maintenance epochs for destructive work;
-3. audit, repair, resumable mark-and-sweep, and guarded garbage collection built
-   on the current blob/index/protection iteration plus those root primitives;
+3. payload-byte audit, repair, resumable mark-and-sweep, and guarded garbage
+   collection built on the current bounded metadata audit and explicit root
+   primitives;
 4. S3-compatible immutable/conditional blob publication and signed range reads;
 5. PostgreSQL migrations and an index/protection implementation with the same
    atomic and namespace-scoped contract as SQLite; and

@@ -177,10 +177,10 @@ func (s *MemoryStore) ListBlobs(ctx context.Context, kind BlobKind, request Page
 			return BlobPage{}, err
 		}
 		if key.Kind == kind && (request.Cursor == "" || bytes.Compare(key.Hash[:], cursor[:]) > 0) {
-			items = append(items, BlobEntry{Key: key, Info: BlobInfo{Size: int64(len(value))}})
+			items = keepFirst(items, BlobEntry{Key: key, Info: BlobInfo{Size: int64(len(value))}}, limit+1,
+				func(left, right BlobEntry) int { return bytes.Compare(left.Key.Hash[:], right.Key.Hash[:]) })
 		}
 	}
-	sort.Slice(items, func(i, j int) bool { return bytes.Compare(items[i].Key.Hash[:], items[j].Key.Hash[:]) < 0 })
 	page := BlobPage{Items: items}
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
@@ -409,18 +409,23 @@ func (s *MemoryStore) ListXorbs(ctx context.Context, request PageRequest) (XorbR
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	items := make([]XorbRecord, 0, min(limit+1, len(s.xorbs)))
-	for hash, record := range s.xorbs {
+	keys := make([]xethash.Hash, 0, min(limit+1, len(s.xorbs)))
+	for hash := range s.xorbs {
 		if err := ctx.Err(); err != nil {
 			return XorbRecordPage{}, err
 		}
 		if request.Cursor == "" || bytes.Compare(hash[:], cursor[:]) > 0 {
-			items = append(items, cloneXorbRecord(record))
+			keys = keepFirst(keys, hash, limit+1,
+				func(left, right xethash.Hash) int { return bytes.Compare(left[:], right[:]) })
 		}
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return bytes.Compare(items[i].Layout.Hash[:], items[j].Layout.Hash[:]) < 0
-	})
+	items := make([]XorbRecord, len(keys))
+	for i, hash := range keys {
+		if err := ctx.Err(); err != nil {
+			return XorbRecordPage{}, err
+		}
+		items[i] = cloneXorbRecord(s.xorbs[hash])
+	}
 	page := XorbRecordPage{Items: items}
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
@@ -443,7 +448,7 @@ func (s *MemoryStore) ListShards(ctx context.Context, namespace *string, request
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	items := make([]ScopedShardRecord, 0, min(limit+1, len(s.shards)))
+	keys := make([]scopedHash, 0, min(limit+1, len(s.shards)))
 	for key, record := range s.shards {
 		if err := ctx.Err(); err != nil {
 			return ShardRecordPage{}, err
@@ -454,11 +459,17 @@ func (s *MemoryStore) ListShards(ctx context.Context, namespace *string, request
 		if err := validateShardRecord(key.hash, record); err != nil {
 			return ShardRecordPage{}, err
 		}
-		items = append(items, ScopedShardRecord{Namespace: key.namespace, Record: record})
+		keys = keepFirst(keys, key, limit+1, func(left, right scopedHash) int {
+			return compareScopedHash(left.namespace, left.hash, right.namespace, right.hash)
+		})
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return compareScopedHash(items[i].Namespace, items[i].Record.Blob.Hash, items[j].Namespace, items[j].Record.Blob.Hash) < 0
-	})
+	items := make([]ScopedShardRecord, len(keys))
+	for i, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return ShardRecordPage{}, err
+		}
+		items[i] = ScopedShardRecord{Namespace: key.namespace, Record: s.shards[key]}
+	}
 	page := ShardRecordPage{Items: items}
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
@@ -486,7 +497,7 @@ func (s *MemoryStore) ListFiles(
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	items := make([]ScopedFileRecord, 0, min(limit+1, len(s.files)))
+	keys := make([]scopedHash, 0, min(limit+1, len(s.files)))
 	for key, record := range s.files {
 		if err := ctx.Err(); err != nil {
 			return FileRecordPage{}, err
@@ -500,12 +511,17 @@ func (s *MemoryStore) ListFiles(
 		if err := validateFileRecord(key.hash, record); err != nil {
 			return FileRecordPage{}, err
 		}
-		items = append(items, ScopedFileRecord{Namespace: key.namespace, Record: cloneFileRecord(record)})
+		keys = keepFirst(keys, key, limit+1, func(left, right scopedHash) int {
+			return compareScopedHash(left.namespace, left.hash, right.namespace, right.hash)
+		})
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return compareScopedHash(items[i].Namespace, items[i].Record.File.File.Hash,
-			items[j].Namespace, items[j].Record.File.File.Hash) < 0
-	})
+	items := make([]ScopedFileRecord, len(keys))
+	for i, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return FileRecordPage{}, err
+		}
+		items[i] = ScopedFileRecord{Namespace: key.namespace, Record: cloneFileRecord(s.files[key])}
+	}
 	page := FileRecordPage{Items: items}
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
@@ -533,7 +549,7 @@ func (s *MemoryStore) ListDedup(
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	items := make([]ScopedDedupRecord, 0, min(limit+1, len(s.dedup)))
+	keys := make([]scopedHash, 0, min(limit+1, len(s.dedup)))
 	for key, record := range s.dedup {
 		if err := ctx.Err(); err != nil {
 			return DedupRecordPage{}, err
@@ -547,11 +563,17 @@ func (s *MemoryStore) ListDedup(
 		if err := validateDedupRecord(record); err != nil {
 			return DedupRecordPage{}, err
 		}
-		items = append(items, ScopedDedupRecord{Namespace: key.namespace, Chunk: key.hash, Record: record})
+		keys = keepFirst(keys, key, limit+1, func(left, right scopedHash) int {
+			return compareScopedHash(left.namespace, left.hash, right.namespace, right.hash)
+		})
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return compareScopedHash(items[i].Namespace, items[i].Chunk, items[j].Namespace, items[j].Chunk) < 0
-	})
+	items := make([]ScopedDedupRecord, len(keys))
+	for i, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return DedupRecordPage{}, err
+		}
+		items[i] = ScopedDedupRecord{Namespace: key.namespace, Chunk: key.hash, Record: s.dedup[key]}
+	}
 	page := DedupRecordPage{Items: items}
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
@@ -579,8 +601,8 @@ func (s *MemoryStore) ListSHA256(
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	items := make([]ScopedSHA256Association, 0, min(limit+1, len(s.sha256)))
-	for key, file := range s.sha256 {
+	keys := make([]shaKey, 0, min(limit+1, len(s.sha256)))
+	for key := range s.sha256 {
 		if err := ctx.Err(); err != nil {
 			return SHA256AssociationPage{}, err
 		}
@@ -591,15 +613,19 @@ func (s *MemoryStore) ListSHA256(
 			cursorNamespace, cursorSum, cursorSize) <= 0 {
 			continue
 		}
-		items = append(items, ScopedSHA256Association{Namespace: key.namespace, Record: SHA256Association{
-			Sum: key.sum, Size: key.size, File: file,
-		}})
+		keys = keepFirst(keys, key, limit+1, func(left, right shaKey) int {
+			return compareScopedSHA(left.namespace, left.sum, left.size, right.namespace, right.sum, right.size)
+		})
 	}
-	sort.Slice(items, func(i, j int) bool {
-		left, right := items[i], items[j]
-		return compareScopedSHA(left.Namespace, left.Record.Sum, left.Record.Size,
-			right.Namespace, right.Record.Sum, right.Record.Size) < 0
-	})
+	items := make([]ScopedSHA256Association, len(keys))
+	for i, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return SHA256AssociationPage{}, err
+		}
+		items[i] = ScopedSHA256Association{Namespace: key.namespace, Record: SHA256Association{
+			Sum: key.sum, Size: key.size, File: s.sha256[key],
+		}}
+	}
 	page := SHA256AssociationPage{Items: items}
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
@@ -705,11 +731,10 @@ func (s *MemoryStore) ListBlobStages(
 		if hasCursor && compareScopedProtection(key.namespace, key.id, cursorNamespace, cursorID) <= 0 {
 			continue
 		}
-		items = append(items, stage)
+		items = keepFirst(items, stage, limit+1, func(left, right BlobStage) int {
+			return compareScopedProtection(left.Namespace, left.ID, right.Namespace, right.ID)
+		})
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return compareScopedProtection(items[i].Namespace, items[i].ID, items[j].Namespace, items[j].ID) < 0
-	})
 	page := BlobStagePage{Items: items}
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
@@ -820,11 +845,10 @@ func (s *MemoryStore) ListFileLeases(
 		if hasCursor && compareScopedProtection(key.namespace, key.id, cursorNamespace, cursorID) <= 0 {
 			continue
 		}
-		items = append(items, lease)
+		items = keepFirst(items, lease, limit+1, func(left, right FileLease) int {
+			return compareScopedProtection(left.Namespace, left.ID, right.Namespace, right.ID)
+		})
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return compareScopedProtection(items[i].Namespace, items[i].ID, items[j].Namespace, items[j].ID) < 0
-	})
 	page := FileLeasePage{Items: items}
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
@@ -858,7 +882,7 @@ func (s *MemoryStore) ListExpiredBlobStages(
 		) <= 0 {
 			continue
 		}
-		items = keepFirstProtections(items, stage, limit+1, func(left, right BlobStage) int {
+		items = keepFirst(items, stage, limit+1, func(left, right BlobStage) int {
 			return compareProtectionExpiry(
 				left.ExpiresAt, left.Namespace, left.ID, right.ExpiresAt, right.Namespace, right.ID,
 			)
@@ -929,7 +953,7 @@ func (s *MemoryStore) ListExpiredFileLeases(
 		) <= 0 {
 			continue
 		}
-		items = keepFirstProtections(items, lease, limit+1, func(left, right FileLease) int {
+		items = keepFirst(items, lease, limit+1, func(left, right FileLease) int {
 			return compareProtectionExpiry(
 				left.ExpiresAt, left.Namespace, left.ID, right.ExpiresAt, right.Namespace, right.ID,
 			)
@@ -976,7 +1000,10 @@ func (s *MemoryStore) DeleteExpiredFileLease(
 	return true, nil
 }
 
-func keepFirstProtections[T any](items []T, value T, limit int, compare func(T, T) int) []T {
+// keepFirst retains the lowest sorted values seen so far while bounding the
+// backing array to limit. It is used when paginating unordered in-memory maps
+// so retained memory is O(limit), even though finding a page remains O(N).
+func keepFirst[T any](items []T, value T, limit int, compare func(T, T) int) []T {
 	position := sort.Search(len(items), func(index int) bool {
 		return compare(items[index], value) >= 0
 	})

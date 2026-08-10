@@ -986,6 +986,70 @@ func TestPageCursorValidation(t *testing.T) {
 	}
 }
 
+func TestKeepFirstBoundsUnorderedSelection(t *testing.T) {
+	const retained = 4
+	items := make([]int, 0, retained)
+	for index := range 10_001 {
+		// 7,919 is coprime with 10,001, producing a deterministic permutation
+		// that exercises insertion, replacement, and rejection positions.
+		value := index * 7_919 % 10_001
+		items = keepFirst(items, value, retained, func(left, right int) int { return left - right })
+		if len(items) > retained || cap(items) > retained {
+			t.Fatalf("retained selector size/capacity = %d/%d", len(items), cap(items))
+		}
+	}
+	if want := []int{0, 1, 2, 3}; !reflect.DeepEqual(items, want) {
+		t.Fatalf("retained selector = %v, want %v", items, want)
+	}
+}
+
+func TestMemoryFileListerSelectsBeforeCloning(t *testing.T) {
+	store := NewMemoryStore()
+	const records = 300
+	namespace := "bounded"
+	terms := make([]shard.Term, 128)
+	store.mu.Lock()
+	for i := range records {
+		var hash xethash.Hash
+		binary.BigEndian.PutUint16(hash[:2], uint16(i))
+		key := scopedHash{namespace: namespace, hash: hash}
+		store.files[key] = FileRecord{
+			File:  shard.RegisteredFile{File: shard.File{Hash: hash, Terms: terms}},
+			Shard: BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte(fmt.Sprintf("bounded shard %d", i)))},
+		}
+	}
+	store.mu.Unlock()
+
+	page, err := store.ListFiles(context.Background(), &namespace, PageRequest{Limit: 3})
+	if err != nil || len(page.Items) != 3 || page.NextCursor == "" {
+		t.Fatalf("first bounded file page = %#v, %v", page, err)
+	}
+	for i, item := range page.Items {
+		if got := binary.BigEndian.Uint16(item.Record.File.File.Hash[:2]); got != uint16(i) {
+			t.Fatalf("first bounded file page item %d = %d", i, got)
+		}
+	}
+	page.Items[0].Record.File.File.Terms[0].End = 99
+	store.mu.RLock()
+	first := store.files[scopedHash{namespace: namespace, hash: page.Items[0].Record.File.File.Hash}]
+	store.mu.RUnlock()
+	if first.File.File.Terms[0].End == 99 {
+		t.Fatal("listed file recipe aliases the retained memory record")
+	}
+
+	page, err = store.ListFiles(context.Background(), &namespace, PageRequest{
+		Cursor: page.NextCursor, Limit: 3,
+	})
+	if err != nil || len(page.Items) != 3 || page.NextCursor == "" {
+		t.Fatalf("second bounded file page = %#v, %v", page, err)
+	}
+	for i, item := range page.Items {
+		if got := binary.BigEndian.Uint16(item.Record.File.File.Hash[:2]); got != uint16(i+3) {
+			t.Fatalf("second bounded file page item %d = %d", i, got)
+		}
+	}
+}
+
 func TestMemoryIndexListerCancellationDuringScan(t *testing.T) {
 	store := NewMemoryStore()
 	ctx := context.Background()
@@ -1463,17 +1527,29 @@ func runProtectionStoreContract(t *testing.T, store ProtectionStore) {
 	}
 	for name, invalid := range map[string]BlobStage{
 		"kind": {
-			ID: testProtectionID(910), Blob: BlobKey{Kind: "invalid"},
+			ID: testProtectionID(910), Blob: BlobKey{
+				Kind: "invalid", Hash: xethash.Chunk([]byte("invalid stage kind")),
+			},
+			CreatedAt: createdAt, ExpiresAt: expiresAt,
+		},
+		"hash": {
+			ID: testProtectionID(914), Blob: BlobKey{Kind: BlobXorb},
 			CreatedAt: createdAt, ExpiresAt: expiresAt,
 		},
 		"creation": {
-			ID: testProtectionID(911), Blob: BlobKey{Kind: BlobXorb}, ExpiresAt: expiresAt,
+			ID: testProtectionID(911), Blob: BlobKey{
+				Kind: BlobXorb, Hash: xethash.Chunk([]byte("stage without creation")),
+			}, ExpiresAt: expiresAt,
 		},
 		"expiration": {
-			ID: testProtectionID(912), Blob: BlobKey{Kind: BlobXorb}, CreatedAt: createdAt,
+			ID: testProtectionID(912), Blob: BlobKey{
+				Kind: BlobXorb, Hash: xethash.Chunk([]byte("stage without expiration")),
+			}, CreatedAt: createdAt,
 		},
 		"reversed": {
-			ID: testProtectionID(913), Blob: BlobKey{Kind: BlobXorb},
+			ID: testProtectionID(913), Blob: BlobKey{
+				Kind: BlobXorb, Hash: xethash.Chunk([]byte("stage with reversed expiration")),
+			},
 			CreatedAt: createdAt, ExpiresAt: createdAt.Add(-time.Second),
 		},
 	} {
@@ -1538,7 +1614,9 @@ func runProtectionStoreContract(t *testing.T, store ProtectionStore) {
 	}
 
 	conflictingStage := BlobStage{
-		ID: testProtectionID(1), Blob: BlobKey{Kind: BlobShard}, CreatedAt: createdAt, ExpiresAt: expiresAt,
+		ID: testProtectionID(1), Blob: BlobKey{
+			Kind: BlobShard, Hash: xethash.Chunk([]byte("retargeted stage")),
+		}, CreatedAt: createdAt, ExpiresAt: expiresAt,
 	}
 	if err := store.PutBlobStage(ctx, conflictingStage); !errors.Is(err, ErrConflict) {
 		t.Fatalf("retargeted blob stage = %v", err)
@@ -1664,7 +1742,9 @@ func runProtectionStoreContract(t *testing.T, store ProtectionStore) {
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 	validStage := BlobStage{
-		ID: testProtectionID(930), Blob: BlobKey{Kind: BlobXorb},
+		ID: testProtectionID(930), Blob: BlobKey{
+			Kind: BlobXorb, Hash: xethash.Chunk([]byte("canceled stage")),
+		},
 		CreatedAt: createdAt, ExpiresAt: expiresAt,
 	}
 	validLease := FileLease{
