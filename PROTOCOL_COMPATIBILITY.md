@@ -27,7 +27,7 @@
 | Global protection hash | Keyed BLAKE3, despite historical “HMAC” naming |
 | Upload shard accounting | Zero serialized-xorb size is accepted and preserved because released xet-core upload sessions emit it; durable size/layout come from the independently validated xorb |
 | CAS server | Storage-neutral blob/index/signer/authorizer interfaces; canonical xorb and shard publication; v1/v2, batch, dedup, HEAD, and sparse-delta routes |
-| Shard publication | Canonical blob, namespace-scoped non-unique dedup indexes and SHA-256, then namespace-scoped first-valid reconstructable file records; in-process tests prove idempotent replay after partial failure, not cross-store atomicity |
+| Shard publication | Canonical blob followed by one atomic namespace-scoped `PublishShard` for non-unique dedup, immutable SHA-256, and first-valid file records; object/index cross-store atomicity still requires staged recovery |
 | Shard progress | v2 NDJSON emits validation/commit/result or terminal error frames and periodically repeats the latest frame as a heartbeat |
 | Server work limits | Configurable file/xorb/term/chunk-reference budgets, context-aware planners, bounded compact-gap memory, and pre-buffer ingestion admission |
 | Typed reconstruction | `Service.OpenFile` streams full files or ranges directly from global physical Xorbs reached through a namespace-scoped file recipe, with chunk/length validation, optional whole-file SHA-256, backpressure, cancellation, and deterministic closure |
@@ -86,8 +86,9 @@ Compatibility is continuously checked by the requirement matrix in
   ranges, coalesces adjacent reads in logical order, and validates decoded
   chunks before returning bytes.
 - Xorb publication stores canonical immutable bytes before publishing layout
-  metadata. Shard publication stores the canonical shard before dedup and SHA
-  secondary indexes and publishes reconstructable file records last.
+  metadata. Shard publication stores the canonical shard before atomically
+  publishing all namespace-scoped dedup, SHA, and reconstructable file records
+  through one index-store call.
 - Every index write is idempotent. File and dedup indexes are non-unique
   secondary indexes and may retain any already-valid durable source. A SHA key
   is immutable within its namespace.

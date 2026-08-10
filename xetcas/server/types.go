@@ -63,6 +63,27 @@ type DedupRecord struct {
 	Shard BlobKey
 }
 
+type DedupAssociation struct {
+	Chunk xethash.Hash
+	Value DedupRecord
+}
+
+type SHA256Association struct {
+	Sum  [32]byte
+	Size uint64
+	File xethash.Hash
+}
+
+// ShardPublication is the complete set of logical index records exposed by
+// one validated shard. PublishShard must commit all records atomically within
+// Namespace or expose none of them.
+type ShardPublication struct {
+	Namespace string
+	Dedup     []DedupAssociation
+	SHA256    []SHA256Association
+	Files     []FileRecord
+}
+
 // IndexStore keeps physical xorb metadata global while scoping every logical
 // file, dedup, and SHA association to an authorized storage namespace. File
 // and dedup keys are non-unique secondary indexes: the same logical content
@@ -80,6 +101,7 @@ type IndexStore interface {
 	PutDedup(context.Context, string, xethash.Hash, DedupRecord) error
 	ResolveSHA256(context.Context, string, [32]byte, uint64) (xethash.Hash, bool, error)
 	PutSHA256(context.Context, string, [32]byte, uint64, xethash.Hash) error
+	PublishShard(context.Context, ShardPublication) error
 }
 
 type Operation string

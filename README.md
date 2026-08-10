@@ -199,7 +199,7 @@ while closing active backend readers.
 Xorb bodies are decoded and identity-checked before canonical complete storage.
 Shard registration resolves durable xorb metadata and recomputes term and file
 identities instead of trusting client accounting. Publication writes the full
-shard and secondary indexes before exposing file reconstruction records. v2
+shard, then atomically publishes its scoped dedup, SHA, and file indexes. v2
 shard responses stream NDJSON heartbeats and a terminal result or error.
 Registration has configurable file, xorb, term, and aggregate chunk-reference
 budgets; ingestion admission is bounded before request bodies are buffered.

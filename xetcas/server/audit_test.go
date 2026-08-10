@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -226,6 +227,50 @@ func TestMemoryStoreBlobContractsAndClonesIndexes(t *testing.T) {
 	}
 	if got, found, err := store.ResolveSHA256(ctx, "scope", sum, 5); err != nil || !found || got != fileHash {
 		t.Fatalf("SHA resolve = %s, %v, %v", got, found, err)
+	}
+}
+
+func TestMemoryStorePublishesShardIndexesAtomically(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	fileHash := xethash.Chunk([]byte("atomic file"))
+	chunkHash := xethash.Chunk([]byte("atomic chunk"))
+	sum := sha256.Sum256([]byte("atomic bytes"))
+	publication := ShardPublication{
+		Namespace: "scope",
+		Dedup: []DedupAssociation{{
+			Chunk: chunkHash,
+			Value: DedupRecord{Shard: BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("shard"))}},
+		}},
+		SHA256: []SHA256Association{
+			{Sum: sum, Size: 12, File: fileHash},
+			{Sum: sum, Size: 12, File: xethash.Chunk([]byte("conflict"))},
+		},
+		Files: []FileRecord{{File: shard.RegisteredFile{File: shard.File{Hash: fileHash}, Size: 12}}},
+	}
+	if err := store.PublishShard(ctx, publication); !errors.Is(err, ErrConflict) {
+		t.Fatalf("conflicting publication = %v", err)
+	}
+	if _, found, err := store.GetDedup(ctx, "scope", chunkHash); err != nil || found {
+		t.Fatalf("dedup visible after rollback = %v, %v", found, err)
+	}
+	if _, found, err := store.GetFile(ctx, "scope", fileHash); err != nil || found {
+		t.Fatalf("file visible after rollback = %v, %v", found, err)
+	}
+	publication.SHA256 = publication.SHA256[:1]
+	if err := store.PublishShard(ctx, publication); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PublishShard(ctx, publication); err != nil {
+		t.Fatalf("idempotent publication = %v", err)
+	}
+	if got, found, err := store.ResolveSHA256(ctx, "scope", sum, 12); err != nil || !found || got != fileHash {
+		t.Fatalf("published SHA = %s, %v, %v", got, found, err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := store.PublishShard(canceled, ShardPublication{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled publication = %v", err)
 	}
 }
 

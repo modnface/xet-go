@@ -299,22 +299,25 @@ func (s *Service) publishShard(ctx context.Context, grant Grant, data []byte) (S
 	if err != nil {
 		return ShardResult{}, err
 	}
+	publication := ShardPublication{
+		Namespace: grant.Namespace,
+		Dedup:     make([]DedupAssociation, 0, len(registration.GlobalDedupChunks)),
+		SHA256:    make([]SHA256Association, 0, len(registration.Files)),
+		Files:     make([]FileRecord, 0, len(registration.Files)),
+	}
 	for _, hash := range registration.GlobalDedupChunks {
-		if err := s.index.PutDedup(ctx, grant.Namespace, hash, DedupRecord{Shard: shardKey}); err != nil {
-			return ShardResult{}, fmt.Errorf("xet CAS server: publish dedup chunk %s: %w", hash, err)
-		}
+		publication.Dedup = append(publication.Dedup, DedupAssociation{Chunk: hash, Value: DedupRecord{Shard: shardKey}})
 	}
 	for _, file := range registration.Files {
 		if file.File.SHA256 != nil {
-			if err := s.index.PutSHA256(ctx, grant.Namespace, *file.File.SHA256, file.Size, file.File.Hash); err != nil {
-				return ShardResult{}, fmt.Errorf("xet CAS server: publish SHA-256 for %s: %w", file.File.Hash, err)
-			}
+			publication.SHA256 = append(publication.SHA256, SHA256Association{
+				Sum: *file.File.SHA256, Size: file.Size, File: file.File.Hash,
+			})
 		}
+		publication.Files = append(publication.Files, FileRecord{File: file, Shard: shardKey})
 	}
-	for _, file := range registration.Files {
-		if err := s.index.PutFile(ctx, grant.Namespace, FileRecord{File: file, Shard: shardKey}); err != nil {
-			return ShardResult{}, fmt.Errorf("xet CAS server: publish file %s: %w", file.File.Hash, err)
-		}
+	if err := s.index.PublishShard(ctx, publication); err != nil {
+		return ShardResult{}, fmt.Errorf("xet CAS server: publish shard indexes: %w", err)
 	}
 	return ShardResult{
 		Shard: shardKey, Inserted: inserted, Files: len(registration.Files),

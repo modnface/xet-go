@@ -170,6 +170,43 @@ func (s *MemoryStore) PutSHA256(_ context.Context, namespace string, sum [32]byt
 	return nil
 }
 
+func (s *MemoryStore) PublishShard(ctx context.Context, publication ShardPublication) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Preflight every immutable SHA association before changing any map. File
+	// and dedup records deliberately retain their first already-valid source.
+	pendingSHA := make(map[shaKey]xethash.Hash, len(publication.SHA256))
+	for _, association := range publication.SHA256 {
+		key := shaKey{namespace: publication.Namespace, sum: association.Sum, size: association.Size}
+		if previous, ok := s.sha256[key]; ok && previous != association.File {
+			return ErrConflict
+		}
+		if previous, ok := pendingSHA[key]; ok && previous != association.File {
+			return ErrConflict
+		}
+		pendingSHA[key] = association.File
+	}
+	for key, hash := range pendingSHA {
+		s.sha256[key] = hash
+	}
+	for _, association := range publication.Dedup {
+		key := scopedHash{namespace: publication.Namespace, hash: association.Chunk}
+		if _, ok := s.dedup[key]; !ok {
+			s.dedup[key] = association.Value
+		}
+	}
+	for _, record := range publication.Files {
+		key := scopedHash{namespace: publication.Namespace, hash: record.File.File.Hash}
+		if _, ok := s.files[key]; !ok {
+			s.files[key] = cloneFileRecord(record)
+		}
+	}
+	return nil
+}
+
 func cloneXorbRecord(value XorbRecord) XorbRecord {
 	value.Layout.Complete = append([]byte(nil), value.Layout.Complete...)
 	value.Layout.Chunks = append([]xorb.IngestedChunk(nil), value.Layout.Chunks...)

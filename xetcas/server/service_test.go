@@ -759,6 +759,15 @@ func (f *faultIndex) PutFile(ctx context.Context, namespace string, value FileRe
 	return f.IndexStore.PutFile(ctx, namespace, value)
 }
 
+func (f *faultIndex) PublishShard(ctx context.Context, publication ShardPublication) error {
+	for _, stage := range []string{"dedup", "sha", "file"} {
+		if err := f.take(stage); err != nil {
+			return err
+		}
+	}
+	return f.IndexStore.PublishShard(ctx, publication)
+}
+
 func TestServiceRepairsLostPublicationResponses(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryStore()
