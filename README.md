@@ -55,6 +55,12 @@ opaque CAS namespaces, so callers select repositories rather than raw storage
 scopes. `OpenFile` resolves one immutable snapshot entry and returns the same
 typed metadata and stream shape for ordinary and Xet-backed files, including
 half-open ranges, stable entity tags, cancellation, and typed backend errors.
+`PutBlob` immutably verifies ordinary content. `PublishSnapshot` canonicalizes
+the complete tree, observes each expected ordinary key and namespace-scoped
+Xet index dependency and reported size, then delegates the snapshot/ref update
+to the catalog's atomic publication transaction. The preflight is not an
+object-store transaction: it does not rehash payload bytes or prevent
+out-of-band deletion after a successful check.
 The local filesystem + SQLite profile is restart-tested with old-revision Xet
 reads and durable cross-repository namespace isolation. Authentication and
 Hugging Face-compatible HTTP translation remain separate higher boundaries.
@@ -650,7 +656,7 @@ read resolves one of those scoped records before reaching physical content.
 | `content/filesystem` | Linux/macOS crash-consistent immutable ordinary-content publication and streaming |
 | `content/s3` | S3-compatible conditionally immutable ordinary-content publication and verified full/range streaming |
 | `auth` | Pluggable Hub identity/policy contracts and scoped short-lived CAS bearer credentials |
-| `bucket` | Hosting-neutral repository façade and uniform ordinary/Xet file streaming with derived CAS namespace isolation |
+| `bucket` | Hosting-neutral repository publication/ref façade and uniform ordinary/Xet file streaming with derived CAS namespace isolation |
 | `chunker` | Streaming official GearHash content-defined chunking |
 | `xethash` | Canonical hashes, BLAKE3 domains, Merkle aggregation, and compact subtrees |
 | `xorb` | Network and complete/cache xorb codecs for none, LZ4, BG4-LZ4, and production auto selection |

@@ -447,6 +447,61 @@ func (s *Service) OpenFileInNamespace(
 	return s.openFileInNamespace(ctx, namespace, hash, requested)
 }
 
+// VerifyFileInNamespace checks metadata-level durable availability for a
+// trusted repository scope without creating a read lease or opening payload
+// streams. HTTP handlers and untrusted callers must use authorized operations.
+func (s *Service) VerifyFileInNamespace(
+	ctx context.Context,
+	namespace string,
+	hash xethash.Hash,
+	size uint64,
+	sum *[32]byte,
+) error {
+	if ctx == nil {
+		return errors.New("xet CAS server: nil verify-file context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if namespace == "" {
+		return fmt.Errorf("%w: trusted verification requires a namespace", ErrInvalid)
+	}
+	file, err := s.scopedFile(ctx, namespace, hash)
+	if err != nil {
+		return err
+	}
+	if err := s.validateRecipeWork(ctx, file.File); err != nil {
+		return err
+	}
+	subject := FileRecordAuditSubject{Namespace: namespace, File: hash, Shard: file.Shard}
+	availableSize, result := s.auditFileTarget(ctx, subject, namespace, hash, file)
+	if result != nil {
+		if result.Err != nil {
+			return result.Err
+		}
+		return fmt.Errorf("%w: scoped file dependency is missing (%s)", ErrNotFound, result.Finding)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if availableSize != size {
+		return fmt.Errorf("%w: scoped file size %d differs from required size %d", ErrNotFound, availableSize, size)
+	}
+	if sum != nil {
+		associated, found, err := s.index.ResolveSHA256(ctx, namespace, *sum, size)
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !found || associated != hash {
+			return fmt.Errorf("%w: scoped SHA-256 association is unavailable", ErrNotFound)
+		}
+	}
+	return ctx.Err()
+}
+
 func (s *Service) openFileInNamespace(
 	ctx context.Context,
 	namespace string,

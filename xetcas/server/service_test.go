@@ -211,6 +211,27 @@ func TestServiceOpenFileStreamsFullAndRange(t *testing.T) {
 	}
 	want := objectContents(none)
 	fileHash := value.Files[0].Hash
+	sum := sha256.Sum256(want)
+	if err := service.VerifyFileInNamespace(ctx, "tenant-a", fileHash, uint64(len(want)), &sum); err != nil {
+		t.Fatalf("file availability = %v", err)
+	}
+	if leases, err := store.ListFileLeases(ctx, nil, PageRequest{}); err != nil || len(leases.Items) != 0 {
+		t.Fatalf("availability verification created leases = %#v, %v", leases, err)
+	}
+	if err := service.VerifyFileInNamespace(ctx, "tenant-b", fileHash, uint64(len(want)), &sum); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-namespace availability = %v", err)
+	}
+	if err := service.VerifyFileInNamespace(ctx, "", fileHash, uint64(len(want)), &sum); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("empty availability namespace = %v", err)
+	}
+	if err := service.VerifyFileInNamespace(nil, "tenant-a", fileHash, uint64(len(want)), &sum); err == nil { //nolint:staticcheck // Verify nil-context rejection.
+		t.Fatal("nil-context availability succeeded")
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := service.VerifyFileInNamespace(canceled, "tenant-a", fileHash, uint64(len(want)), &sum); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled availability = %v", err)
+	}
 
 	opened, err := service.OpenFile(ctx, "", fileHash, nil)
 	if err != nil {
@@ -294,6 +315,107 @@ func TestServiceOpenFileStreamsFullAndRange(t *testing.T) {
 	if _, err := service.OpenFile(nil, "", fileHash, nil); err == nil { //nolint:staticcheck // Verify nil-context rejection.
 		t.Fatal("nil-context open succeeded")
 	}
+}
+
+func TestVerifyFileInNamespaceRequiresPhysicalDependencies(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	service := testService(t, store, nil)
+	none, _, value, shardBody := uploadFixture(t)
+	if _, err := service.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UploadShard(ctx, "", bytes.NewReader(shardBody), int64(len(shardBody))); err != nil {
+		t.Fatal(err)
+	}
+	fileHash := value.Files[0].Hash
+	fileSize := uint64(len(objectContents(none)))
+	fileSum := value.Files[0].SHA256
+	spy := &availabilityBlobStore{BlobStore: store}
+	service.blobs = spy
+	if err := service.VerifyFileInNamespace(ctx, "tenant-a", fileHash, fileSize, fileSum); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.VerifyFileInNamespace(ctx, "tenant-a", fileHash, fileSize, nil); err != nil {
+		t.Fatalf("optional SHA omitted = %v", err)
+	}
+	if err := service.VerifyFileInNamespace(ctx, "tenant-a", fileHash, fileSize+1, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("wrong required size = %v", err)
+	}
+	wrongSum := *fileSum
+	wrongSum[0] ^= 0xff
+	if err := service.VerifyFileInNamespace(ctx, "tenant-a", fileHash, fileSize, &wrongSum); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("wrong required SHA-256 = %v", err)
+	}
+	if spy.heads.Load() < 2 || spy.gets.Load() != 0 {
+		t.Fatalf("availability storage calls = %d heads, %d gets", spy.heads.Load(), spy.gets.Load())
+	}
+
+	limits := service.registration
+	service.registration.MaxTerms = 0
+	if err := service.VerifyFileInNamespace(ctx, "tenant-a", fileHash, fileSize, fileSum); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("over-budget availability = %v", err)
+	}
+	service.registration = limits
+
+	canceled, cancel := context.WithCancel(ctx)
+	service.index = cancelingResolveIndex{IndexStore: store, cancel: cancel}
+	if err := service.VerifyFileInNamespace(canceled, "tenant-a", fileHash, fileSize, fileSum); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation during final dependency = %v", err)
+	}
+	service.index = store
+
+	store.mu.Lock()
+	xorbKey := BlobKey{Kind: BlobXorb, Hash: none.Hash}
+	complete := append([]byte(nil), store.blobs[xorbKey]...)
+	store.blobs[xorbKey] = complete[:len(complete)-1]
+	store.mu.Unlock()
+	if err := service.VerifyFileInNamespace(ctx, "tenant-a", fileHash, fileSize, fileSum); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("wrong physical Xorb size = %v", err)
+	}
+	store.mu.Lock()
+	delete(store.blobs, BlobKey{Kind: BlobXorb, Hash: none.Hash})
+	store.mu.Unlock()
+	if err := service.VerifyFileInNamespace(ctx, "tenant-a", fileHash, fileSize, fileSum); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing physical Xorb = %v", err)
+	}
+}
+
+type availabilityBlobStore struct {
+	BlobStore
+	heads atomic.Int32
+	gets  atomic.Int32
+}
+
+func (store *availabilityBlobStore) Head(ctx context.Context, key BlobKey) (BlobInfo, bool, error) {
+	store.heads.Add(1)
+	return store.BlobStore.Head(ctx, key)
+}
+
+func (store *availabilityBlobStore) Get(
+	ctx context.Context,
+	key BlobKey,
+	wanted *xetcas.HTTPRange,
+) (io.ReadCloser, error) {
+	store.gets.Add(1)
+	return store.BlobStore.Get(ctx, key, wanted)
+}
+
+type cancelingResolveIndex struct {
+	IndexStore
+	cancel context.CancelFunc
+}
+
+func (index cancelingResolveIndex) ResolveSHA256(
+	_ context.Context,
+	namespace string,
+	sum [32]byte,
+	size uint64,
+) (xethash.Hash, bool, error) {
+	hash, found, err := index.IndexStore.ResolveSHA256(context.Background(), namespace, sum, size)
+	index.cancel()
+	return hash, found, err
 }
 
 func TestServiceOpenFileCancellationAndCorruption(t *testing.T) {

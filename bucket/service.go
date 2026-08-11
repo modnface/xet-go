@@ -39,16 +39,23 @@ type CASFileOpener interface {
 	OpenFileInNamespace(context.Context, string, xethash.Hash, *xetcas.FileRange) (*casserver.OpenedFile, error)
 }
 
+// CASFileService opens files and verifies exact file requirements in a trusted
+// repository scope without exposing raw namespaces to bucket callers.
+type CASFileService interface {
+	CASFileOpener
+	VerifyFileInNamespace(context.Context, string, xethash.Hash, uint64, *[32]byte) error
+}
+
 type Options struct {
 	Catalog catalog.Catalog
 	Content content.Store
-	CAS     CASFileOpener
+	CAS     CASFileService
 }
 
 type Service struct {
 	catalog catalog.Catalog
 	content content.Store
-	cas     CASFileOpener
+	cas     CASFileService
 }
 
 func New(options Options) (*Service, error) {
@@ -122,6 +129,107 @@ func (service *Service) ListSnapshots(
 	}
 	result, err := service.catalog.ListSnapshots(ctx, repo, query)
 	return result, mapCatalogError(err)
+}
+
+func (service *Service) GetRef(ctx context.Context, repo model.RepoKey, name model.RefName) (model.Ref, error) {
+	if err := validContext(ctx); err != nil {
+		return model.Ref{}, err
+	}
+	result, err := service.catalog.GetRef(ctx, repo, name)
+	return result, mapCatalogError(err)
+}
+
+func (service *Service) CompareAndSwapRef(
+	ctx context.Context,
+	repo model.RepoKey,
+	name model.RefName,
+	expected *model.OID,
+	newOID model.OID,
+) error {
+	if err := validContext(ctx); err != nil {
+		return err
+	}
+	return mapCatalogError(service.catalog.CompareAndSwapRef(ctx, repo, name, expected, newOID))
+}
+
+// PutBlob verifies and immutably publishes one ordinary content object.
+func (service *Service) PutBlob(ctx context.Context, blob content.Blob, body io.Reader) (bool, error) {
+	if err := validContext(ctx); err != nil {
+		return false, err
+	}
+	if body == nil {
+		return false, fmt.Errorf("%w: ordinary content body is nil", ErrInvalid)
+	}
+	inserted, err := service.content.Put(ctx, blob, body)
+	return inserted, mapContentPublicationError(err)
+}
+
+// PublishSnapshot validates a complete immutable tree, preflights every
+// referenced ordinary and Xet key/index dependency and reported size, then
+// atomically publishes snapshot metadata and advances its expected catalog
+// ref. The preflight is not an object-store transaction and does not rehash
+// payload bytes.
+func (service *Service) PublishSnapshot(
+	ctx context.Context,
+	snapshot model.Snapshot,
+	expectation catalog.RefExpectation,
+) error {
+	if err := validContext(ctx); err != nil {
+		return err
+	}
+	canonical, err := model.CanonicalSnapshot(snapshot)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	namespace, err := RepositoryNamespace(canonical.Repo)
+	if err != nil {
+		return err
+	}
+	verifiedBlobs := make(map[content.Blob]struct{})
+	type xetRequirement struct {
+		hash   xethash.Hash
+		size   uint64
+		sum    [32]byte
+		hasSum bool
+	}
+	verifiedXet := make(map[xetRequirement]struct{})
+	for _, entry := range canonical.Files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		switch entry.Ref.Kind() {
+		case model.FileKindBlob:
+			sum, _ := entry.Ref.SHA256()
+			blob := content.Blob{SHA256: sum, Size: entry.Ref.FileSize()}
+			if _, alreadyVerified := verifiedBlobs[blob]; alreadyVerified {
+				continue
+			}
+			info, found, err := service.content.Head(ctx, sum)
+			if err != nil {
+				return mapContentPublicationError(err)
+			}
+			if !found || info.Size != blob.Size {
+				return fmt.Errorf("%w: ordinary file %q is not available with its declared identity and size", ErrContentNotUploaded, entry.Path)
+			}
+			verifiedBlobs[blob] = struct{}{}
+		case model.FileKindXet:
+			hash, _ := entry.Ref.XetHash()
+			sum, hasSum := entry.Ref.SHA256()
+			requirement := xetRequirement{hash: hash, size: uint64(entry.Ref.FileSize()), sum: sum, hasSum: hasSum}
+			if _, alreadyVerified := verifiedXet[requirement]; alreadyVerified {
+				continue
+			}
+			var wantedSum *[32]byte
+			if hasSum {
+				wantedSum = &sum
+			}
+			if err = service.cas.VerifyFileInNamespace(ctx, namespace, hash, requirement.size, wantedSum); err != nil {
+				return mapCASPublicationError(entry.Path, err)
+			}
+			verifiedXet[requirement] = struct{}{}
+		}
+	}
+	return mapCatalogError(service.catalog.PublishSnapshot(ctx, canonical, expectation))
 }
 
 func (service *Service) ListFiles(
@@ -347,6 +455,40 @@ func mapContentReadError(err error) error {
 		return fmt.Errorf("%w: %w", ErrUnavailable, err)
 	default:
 		return fmt.Errorf("%w: content: %w", ErrUnavailable, err)
+	}
+}
+
+func mapContentPublicationError(err error) error {
+	switch {
+	case err == nil, errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
+	case errors.Is(err, content.ErrInvalid):
+		return fmt.Errorf("%w: %w", ErrInvalid, err)
+	case errors.Is(err, content.ErrConflict), errors.Is(err, content.ErrCorrupt):
+		return fmt.Errorf("%w: %w", ErrCorrupt, err)
+	case errors.Is(err, content.ErrDurabilityUnsupported):
+		return fmt.Errorf("%w: %w", ErrUnsupported, err)
+	case errors.Is(err, content.ErrUnavailable):
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
+	default:
+		return fmt.Errorf("%w: content: %w", ErrUnavailable, err)
+	}
+}
+
+func mapCASPublicationError(path model.FilePath, err error) error {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
+	case errors.Is(err, casserver.ErrNotFound):
+		return fmt.Errorf("%w: Xet file %q is not durably available", ErrContentNotUploaded, path)
+	case errors.Is(err, casserver.ErrConflict), errors.Is(err, casserver.ErrCorrupt):
+		return fmt.Errorf("%w: Xet file %q: %w", ErrCorrupt, path, err)
+	case errors.Is(err, casserver.ErrInvalid):
+		return fmt.Errorf("%w: Xet file %q: %w", ErrInvalid, path, err)
+	case errors.Is(err, casserver.ErrTooLarge), errors.Is(err, casserver.ErrDurabilityUnsupported):
+		return fmt.Errorf("%w: Xet file %q: %w", ErrUnsupported, path, err)
+	default:
+		return fmt.Errorf("%w: Xet file %q: %w", ErrUnavailable, path, err)
 	}
 }
 

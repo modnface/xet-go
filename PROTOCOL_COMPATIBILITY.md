@@ -30,7 +30,7 @@
 | Shard publication | Renewable namespace-scoped stage, canonical blob, then one atomic `PublishShard` for non-unique dedup, immutable SHA-256, and first-valid file records; failed/ambiguous publication retains the stage |
 | Shard progress | v2 NDJSON emits validation/commit/result or terminal error frames and periodically repeats the latest frame as a heartbeat |
 | Server work limits | Configurable file/xorb/term/chunk-reference budgets, context-aware planners, bounded compact-gap memory, and pre-buffer ingestion admission |
-| Typed reconstruction | `Service.OpenFile` streams full files or ranges directly from global physical Xorbs reached through a namespace-scoped file recipe, with chunk/length validation, optional whole-file SHA-256, backpressure, cancellation, and deterministic closure |
+| Typed reconstruction | `Service.OpenFile` streams full files or ranges directly from global physical Xorbs reached through a namespace-scoped file recipe, with chunk/length validation, optional whole-file SHA-256, backpressure, cancellation, and deterministic closure. `VerifyFileInNamespace` separately preflights an exact required identity, size, and optional namespace-scoped SHA association plus physical dependency existence/sizes without a lease or payload read. |
 | Local durable storage | Linux/macOS immutable filesystem blobs plus a pure-Go SQLite WAL index; strict file/directory barriers, process-root locking, restart persistence, transactional shard-index publication, and schema-v4 lifecycle and shard-registration metadata |
 | S3-compatible CAS bytes | Isolated AWS SDK v2 adapter with versioned canonical keys, exact-length spooling, conditional immutable publication plus byte-identical collision verification, strict range metadata, bounded lexical inventory, and SigV4 URLs bound to one exact range |
 | PostgreSQL CAS metadata | Isolated pgx adapter with versioned private-schema migrations, global Xorb metadata, namespace-scoped logical indexes/protections, transactional shard publication, stable lock ordering, nanosecond expiry, and bounded keyset inventory |
@@ -42,7 +42,7 @@
 | SQLite model catalog | The catalog contract on a versioned pure-Go SQLite schema; WAL plus `synchronous=FULL`; context-aware immediate write serialization across independent handles; atomic snapshot/file/ref publication; restart persistence; retained-row validation; and bounded snapshot-bound keyset cursors. No Hub-control-plane claim |
 | PostgreSQL model catalog | The same contract on versioned private-schema migrations; UTF-8 server/client enforcement; explicit `C`-collated key ordering; per-repository serialization across independent pools; atomic, target-state-idempotent snapshot/file/ref publication; exact nanosecond timestamps; strict retained-schema/row validation; and operation-bound keyset cursors. No Hub-control-plane or compatible commit-OID claim |
 | Ordinary content | CAS-independent SHA-256-plus-length identities; exact verified immutable uploads; idempotent memory, Linux/macOS filesystem, and S3-compatible publication; full/hash-verified and half-open range streams; cancellation and typed errors. Filesystem publication uses same-directory temp, file-sync, hard-link, and full ancestor-directory barriers. S3 publication uses verified local spooling, `If-None-Match: *`, exact collision comparison, required-only SDK checksums, and strict response-range metadata; no multipart, cache, listing, deletion, or repository authorization claim |
-| Model-bucket façade | Hosting-neutral catalog delegation and one typed full/range file-open API over ordinary blobs and Xet reconstruction; repository keys derive opaque logical CAS namespaces, callers cannot choose a raw scope, optional SHA metadata remains optional, and local filesystem + SQLite restart tests retain old revisions while denying cross-repository hash reachability. No Hub authentication, compatible HTTP DTO, or commit-hash claim |
+| Model-bucket façade | Hosting-neutral repository/ref operations, immutable ordinary publication, metadata-preflighted catalog-atomic snapshot/ref publication, and one typed full/range file-open API over ordinary blobs and Xet reconstruction; repository keys derive opaque logical CAS namespaces, callers cannot choose a raw scope, optional SHA metadata remains optional, and local filesystem + SQLite restart tests publish and retain old revisions while denying cross-repository hash reachability. Preflight checks retained metadata and reported physical object sizes, not payload hashes or cross-store transactional durability. No Hub authentication, compatible HTTP DTO, or commit-hash claim |
 | Scoped CAS credentials | Hosting-neutral separation of Hub authentication, repository authorization, and CAS bearer verification; HMAC-SHA256 credentials bind subject, exact audience, derived repository namespace, read/write permissions, whole-second validity, key ID, and random token ID. Strict bounded parsing rejects unknown, duplicate, case-folded, malformed, or noncanonical fields. Write scope includes the namespace-scoped dedup query required by official uploads but excludes file/Xorb reads. This private opaque-bearer format is not a hosted-token wire-parity claim and is replayable until expiry. |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
@@ -117,6 +117,16 @@ Compatibility is continuously checked by the requirement matrix in
   bounded planner. The typed stream additionally reads chunk-aligned physical
   ranges, coalesces adjacent reads in logical order, and validates decoded
   chunks before returning bytes.
+- `bucket.PublishSnapshot` canonicalizes a complete tree before checking
+  dependencies. Ordinary references require an object observed at the
+  SHA-256-derived key with its reported size. Xet references use the same
+  derived repository namespace as reads and require a valid scoped
+  file/shard/SHA index graph plus every referenced physical Xorb/shard object's
+  reported size. Only after all checks pass does the catalog atomically retain
+  the immutable snapshot and compare-and-swap its ref. This prevents
+  publication after an observed preflight failure but does not turn SQL and
+  object storage into one transaction, prevent out-of-band deletion after a
+  check, or replace payload audit/rehashing.
 - Reconstruction publishes a namespace-scoped file lease before the first file
   or Xorb-index lookup. Active typed streams renew that lease until settlement;
   signed reconstruction descriptors retain it through the signer's maximum

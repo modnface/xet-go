@@ -70,7 +70,7 @@ func TestServiceStreamsOrdinaryAndXetFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inserted, putErr := ordinary.Put(ctx, content.Blob{SHA256: ordinarySum, Size: int64(len(ordinaryBody))}, bytes.NewReader(ordinaryBody)); putErr != nil || !inserted {
+	if inserted, putErr := service.PutBlob(ctx, content.Blob{SHA256: ordinarySum, Size: int64(len(ordinaryBody))}, bytes.NewReader(ordinaryBody)); putErr != nil || !inserted {
 		t.Fatalf("ordinary put = %v, %v", inserted, putErr)
 	}
 	emptySum := sha256.Sum256(nil)
@@ -78,7 +78,7 @@ func TestServiceStreamsOrdinaryAndXetFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inserted, putErr := ordinary.Put(ctx, content.Blob{SHA256: emptySum, Size: 0}, bytes.NewReader(nil)); putErr != nil || !inserted {
+	if inserted, putErr := service.PutBlob(ctx, content.Blob{SHA256: emptySum, Size: 0}, bytes.NewReader(nil)); putErr != nil || !inserted {
 		t.Fatalf("empty ordinary put = %v, %v", inserted, putErr)
 	}
 
@@ -94,10 +94,11 @@ func TestServiceStreamsOrdinaryAndXetFiles(t *testing.T) {
 		Files: []model.FileEntry{
 			{Path: "weights/model.safetensors", Ref: xetRef},
 			{Path: "config.json", Ref: ordinaryRef},
+			{Path: "config-copy.json", Ref: ordinaryRef},
 			{Path: "empty.txt", Ref: emptyRef},
 		},
 	}
-	if err = metadata.PublishSnapshot(ctx, snapshot, catalog.ExpectRef("main", nil)); err != nil {
+	if err = service.PublishSnapshot(ctx, snapshot, catalog.ExpectRef("main", nil)); err != nil {
 		t.Fatal(err)
 	}
 	revision, err := model.ParseRevision("main")
@@ -120,11 +121,21 @@ func TestServiceStreamsOrdinaryAndXetFiles(t *testing.T) {
 	if page, err := service.ListSnapshots(ctx, repo, catalog.SnapshotQuery{}); err != nil || len(page.Items) != 1 {
 		t.Fatalf("list snapshots = %#v, %v", page, err)
 	}
-	if page, err := service.ListFiles(ctx, repo, revision, catalog.FileQuery{}); err != nil || len(page.Items) != 3 || page.SnapshotOID != oid {
+	if ref, err := service.GetRef(ctx, repo, "main"); err != nil || ref.OID != oid {
+		t.Fatalf("get main ref = %#v, %v", ref, err)
+	}
+	if err := service.CompareAndSwapRef(ctx, repo, "release", nil, oid); err != nil {
+		t.Fatalf("create release ref: %v", err)
+	}
+	if ref, err := service.GetRef(ctx, repo, "release"); err != nil || ref.OID != oid {
+		t.Fatalf("get release ref = %#v, %v", ref, err)
+	}
+	if page, err := service.ListFiles(ctx, repo, revision, catalog.FileQuery{}); err != nil || len(page.Items) != 4 || page.SnapshotOID != oid {
 		t.Fatalf("list files = %#v, %v", page, err)
 	}
 
 	assertOpenFile(t, service, repo, revision, "config.json", nil, ordinaryBody, model.FileKindBlob, "sha256:")
+	assertOpenFile(t, service, repo, revision, "config-copy.json", nil, ordinaryBody, model.FileKindBlob, "sha256:")
 	assertOpenFile(t, service, repo, revision, "empty.txt", nil, nil, model.FileKindBlob, "sha256:")
 	ordinaryRange := content.Range{Start: 2, End: int64(len(ordinaryBody) - 3)}
 	assertOpenFile(t, service, repo, revision, "config.json", &ordinaryRange,
@@ -147,10 +158,23 @@ func TestServiceStreamsOrdinaryAndXetFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	otherOID := testOID(t, '3')
-	if err = metadata.PublishSnapshot(ctx, model.Snapshot{
+	otherSnapshot := model.Snapshot{
 		Repo: other, OID: otherOID, CreatedAt: time.Unix(1_700_000_003, 0),
 		Author: model.Identity{Name: "Other"}, Message: "same Xet identity, different repository",
 		Files: []model.FileEntry{{Path: "weights/model.safetensors", Ref: xetRef}},
+	}
+	if err = service.PublishSnapshot(ctx, otherSnapshot, catalog.ExpectRef("main", nil)); !errors.Is(err, ErrContentNotUploaded) {
+		t.Fatalf("cross-repository publication = %v", err)
+	}
+	if _, err := service.GetSnapshot(ctx, other, otherOID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-repository publication exposed snapshot = %v", err)
+	}
+	if _, err := service.GetRef(ctx, other, "main"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-repository publication exposed ref = %v", err)
+	}
+	if err = metadata.PublishSnapshot(ctx, model.Snapshot{
+		Repo: otherSnapshot.Repo, OID: otherSnapshot.OID, CreatedAt: otherSnapshot.CreatedAt,
+		Author: otherSnapshot.Author, Message: otherSnapshot.Message, Files: otherSnapshot.Files,
 	}, catalog.ExpectRef("main", nil)); err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +183,7 @@ func TestServiceStreamsOrdinaryAndXetFiles(t *testing.T) {
 	}
 
 	secondOID := testOID(t, '4')
-	if err = metadata.PublishSnapshot(ctx, model.Snapshot{
+	if err = service.PublishSnapshot(ctx, model.Snapshot{
 		Repo: repo, OID: secondOID, Parent: &oid, CreatedAt: time.Unix(1_700_000_004, 0),
 		Author: model.Identity{Name: "Test Author"}, Message: "delete ordinary files",
 		Files: []model.FileEntry{{Path: "weights/model.safetensors", Ref: xetRef}},
@@ -225,6 +249,20 @@ func TestServiceConfigurationAndErrors(t *testing.T) {
 		"snapshots": func() error {
 			_, err := service.ListSnapshots(nil, validRepo, catalog.SnapshotQuery{}) //nolint:staticcheck // Verify nil-context rejection.
 			return err
+		},
+		"ref": func() error {
+			_, err := service.GetRef(nil, validRepo, "main") //nolint:staticcheck // Verify that the API rejects a nil context.
+			return err
+		},
+		"compare ref": func() error {
+			return service.CompareAndSwapRef(nil, validRepo, "main", nil, validOID) //nolint:staticcheck // Verify that the API rejects a nil context.
+		},
+		"put blob": func() error {
+			_, err := service.PutBlob(nil, content.Blob{}, bytes.NewReader(nil)) //nolint:staticcheck // Verify that the API rejects a nil context.
+			return err
+		},
+		"publish": func() error {
+			return service.PublishSnapshot(nil, model.Snapshot{}, catalog.RefExpectation{}) //nolint:staticcheck // Verify that the API rejects a nil context.
 		},
 		"files": func() error {
 			_, err := service.ListFiles(nil, validRepo, validRevision, catalog.FileQuery{}) //nolint:staticcheck // Verify nil-context rejection.
@@ -309,6 +347,236 @@ func TestServiceConfigurationAndErrors(t *testing.T) {
 		if mapper(nil) != nil {
 			t.Fatal("nil error mapping is inconsistent")
 		}
+	}
+}
+
+func TestServicePublishSnapshotRequiresDurableContent(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepo(t, "owner", "publication")
+	metadata := catalogmemory.New()
+	ordinary := contentmemory.New()
+	casStore := casserver.NewMemoryStore()
+	cas, err := casserver.New(casserver.Options{
+		Blobs: casStore, Index: casStore,
+		Authorizer: casserver.AllowAllAuthorizer{Namespace: mustRepositoryNamespace(t, repo)},
+		Signer: casserver.RangeURLSignerFunc(func(context.Context, casserver.BlobKey, xetcas.HTTPRange) (casserver.SignedRange, error) {
+			return casserver.SignedRange{URL: "https://storage.example/object", ExpiresAt: time.Now().Add(time.Hour)}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(Options{Catalog: metadata, Content: ordinary, CAS: cas})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.CreateRepository(ctx, model.Repository{Key: repo, CreatedAt: time.Unix(1_700_100_000, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("available")
+	sum := sha256.Sum256(body)
+	ref, err := model.NewBlobFileRef(sum, int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstOID := testOID(t, '6')
+	first := model.Snapshot{
+		Repo: repo, OID: firstOID, CreatedAt: time.Unix(1_700_100_001, 0),
+		Author: model.Identity{Name: "Publisher"}, Message: "first",
+		Files: []model.FileEntry{{Path: "config.json", Ref: ref}},
+	}
+	if err := service.PublishSnapshot(ctx, first, catalog.ExpectRef("main", nil)); !errors.Is(err, ErrContentNotUploaded) {
+		t.Fatalf("missing ordinary content = %v", err)
+	}
+	if _, err := service.GetRef(ctx, repo, "main"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("failed publication exposed main = %v", err)
+	}
+	if _, err := service.PutBlob(ctx, content.Blob{SHA256: sum, Size: int64(len(body))}, nil); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("nil ordinary body = %v", err)
+	}
+	if _, err := service.PutBlob(ctx, content.Blob{SHA256: sum, Size: int64(len(body))}, bytes.NewReader([]byte("different"))); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("invalid ordinary body = %v", err)
+	}
+	if inserted, err := service.PutBlob(ctx, content.Blob{SHA256: sum, Size: int64(len(body))}, bytes.NewReader(body)); err != nil || !inserted {
+		t.Fatalf("publish ordinary body = %v, %v", inserted, err)
+	}
+	if err := service.PublishSnapshot(ctx, first, catalog.ExpectRef("main", nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	missingXetHash := xethash.Chunk([]byte("missing Xet file"))
+	missingXet, err := model.NewXetFileRef(missingXetHash, 123, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondOID := testOID(t, '7')
+	second := model.Snapshot{
+		Repo: repo, OID: secondOID, Parent: &firstOID, CreatedAt: time.Unix(1_700_100_002, 0),
+		Author: model.Identity{Name: "Publisher"}, Message: "missing Xet dependency",
+		Files: []model.FileEntry{{Path: "weights/model.safetensors", Ref: missingXet}},
+	}
+	if err := service.PublishSnapshot(ctx, second, catalog.ExpectRef("main", &firstOID)); !errors.Is(err, ErrContentNotUploaded) {
+		t.Fatalf("missing Xet content = %v", err)
+	}
+	if _, err := service.GetSnapshot(ctx, repo, secondOID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("failed publication exposed snapshot = %v", err)
+	}
+	if ref, err := service.GetRef(ctx, repo, "main"); err != nil || ref.OID != firstOID {
+		t.Fatalf("failed publication changed main = %#v, %v", ref, err)
+	}
+	invalid := first
+	invalid.OID = model.OID{}
+	if err := service.PublishSnapshot(ctx, invalid, catalog.ExpectRef("main", &firstOID)); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid snapshot = %v", err)
+	}
+}
+
+func TestServicePublishSnapshotRejectsMismatchedXetMetadata(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepo(t, "owner", "xet-metadata")
+	metadata := catalogmemory.New()
+	ordinary := contentmemory.New()
+	casStore := casserver.NewMemoryStore()
+	cas, err := casserver.New(casserver.Options{
+		Blobs: casStore, Index: casStore,
+		Authorizer: casserver.AllowAllAuthorizer{Namespace: mustRepositoryNamespace(t, repo)},
+		Signer: casserver.RangeURLSignerFunc(func(context.Context, casserver.BlobKey, xetcas.HTTPRange) (casserver.SignedRange, error) {
+			return casserver.SignedRange{URL: "https://storage.example/object", ExpiresAt: time.Now().Add(time.Hour)}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(Options{Catalog: metadata, Content: ordinary, CAS: cas})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.CreateRepository(ctx, model.Repository{Key: repo, CreatedAt: time.Unix(1_700_200_000, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	body, hash, sum := publishXetFixture(t, ctx, cas)
+	wrongSize, err := model.NewXetFileRef(hash, int64(len(body))+1, &sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongSum := sum
+	wrongSum[0] ^= 0xff
+	wrongSHA, err := model.NewXetFileRef(hash, int64(len(body)), &wrongSum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, ref := range map[string]model.FileRef{"size": wrongSize, "SHA-256": wrongSHA} {
+		t.Run(name, func(t *testing.T) {
+			snapshot := model.Snapshot{
+				Repo: repo, OID: testOID(t, 'a'), CreatedAt: time.Unix(1_700_200_001, 0),
+				Author: model.Identity{Name: "Publisher"}, Message: "mismatch",
+				Files: []model.FileEntry{{Path: "weights.bin", Ref: ref}},
+			}
+			if err := service.PublishSnapshot(ctx, snapshot, catalog.ExpectRef("main", nil)); !errors.Is(err, ErrContentNotUploaded) {
+				t.Fatalf("mismatched %s = %v", name, err)
+			}
+		})
+	}
+}
+
+func TestServicePublishSnapshotUsesScopedSHAAssociation(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepo(t, "owner", "xet-sha-association")
+	metadata := catalogmemory.New()
+	ordinary := contentmemory.New()
+	casStore := casserver.NewMemoryStore()
+	namespace := mustRepositoryNamespace(t, repo)
+	cas, err := casserver.New(casserver.Options{
+		Blobs: casStore, Index: casStore,
+		Authorizer: casserver.AllowAllAuthorizer{Namespace: namespace},
+		Signer: casserver.RangeURLSignerFunc(func(context.Context, casserver.BlobKey, xetcas.HTTPRange) (casserver.SignedRange, error) {
+			return casserver.SignedRange{URL: "https://storage.example/object", ExpiresAt: time.Now().Add(time.Hour)}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, hash, sum := publishXetFixtureWithSHA(t, ctx, cas, false)
+	if _, secondHash, secondSum := publishXetFixtureWithSHA(t, ctx, cas, true); secondHash != hash || secondSum != sum {
+		t.Fatal("SHA-bearing retry changed logical Xet identity")
+	}
+	retained, found, err := casStore.GetFile(ctx, namespace, hash)
+	if err != nil || !found || retained.File.File.SHA256 != nil {
+		t.Fatalf("retained first-valid recipe = %#v, %v, %v", retained, found, err)
+	}
+	tracking := &trackingCASFileService{CASFileService: cas}
+	service, err := New(Options{Catalog: metadata, Content: ordinary, CAS: tracking})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.CreateRepository(ctx, model.Repository{Key: repo, CreatedAt: time.Unix(1_700_300_000, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	withoutSHA, err := model.NewXetFileRef(hash, int64(len(body)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withSHA, err := model.NewXetFileRef(hash, int64(len(body)), &sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := model.Snapshot{
+		Repo: repo, OID: testOID(t, 'b'), CreatedAt: time.Unix(1_700_300_001, 0),
+		Author: model.Identity{Name: "Publisher"}, Message: "both optional SHA forms",
+		Files: []model.FileEntry{
+			{Path: "without-sha.bin", Ref: withoutSHA},
+			{Path: "with-sha.bin", Ref: withSHA},
+			{Path: "with-sha-copy.bin", Ref: withSHA},
+		},
+	}
+	if err := service.PublishSnapshot(ctx, snapshot, catalog.ExpectRef("main", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if tracking.verifications != 2 {
+		t.Fatalf("exact Xet requirements verified %d times, want 2", tracking.verifications)
+	}
+}
+
+func TestPublicationErrorMapping(t *testing.T) {
+	for name, test := range map[string]struct {
+		err  error
+		want error
+	}{
+		"nil":         {},
+		"canceled":    {err: context.Canceled, want: context.Canceled},
+		"deadline":    {err: context.DeadlineExceeded, want: context.DeadlineExceeded},
+		"invalid":     {err: content.ErrInvalid, want: ErrInvalid},
+		"conflict":    {err: content.ErrConflict, want: ErrCorrupt},
+		"corrupt":     {err: content.ErrCorrupt, want: ErrCorrupt},
+		"durability":  {err: content.ErrDurabilityUnsupported, want: ErrUnsupported},
+		"unavailable": {err: content.ErrUnavailable, want: ErrUnavailable},
+		"unknown":     {err: io.ErrUnexpectedEOF, want: ErrUnavailable},
+	} {
+		t.Run("content "+name, func(t *testing.T) {
+			if err := mapContentPublicationError(test.err); !errors.Is(err, test.want) || test.want == nil && err != nil {
+				t.Fatalf("map content %v = %v", test.err, err)
+			}
+		})
+	}
+	for name, test := range map[string]struct {
+		err  error
+		want error
+	}{
+		"canceled":   {err: context.Canceled, want: context.Canceled},
+		"deadline":   {err: context.DeadlineExceeded, want: context.DeadlineExceeded},
+		"missing":    {err: casserver.ErrNotFound, want: ErrContentNotUploaded},
+		"conflict":   {err: casserver.ErrConflict, want: ErrCorrupt},
+		"corrupt":    {err: casserver.ErrCorrupt, want: ErrCorrupt},
+		"invalid":    {err: casserver.ErrInvalid, want: ErrInvalid},
+		"large":      {err: casserver.ErrTooLarge, want: ErrUnsupported},
+		"durability": {err: casserver.ErrDurabilityUnsupported, want: ErrUnsupported},
+		"unknown":    {err: io.ErrUnexpectedEOF, want: ErrUnavailable},
+	} {
+		t.Run("CAS "+name, func(t *testing.T) {
+			if err := mapCASPublicationError("file", test.err); !errors.Is(err, test.want) {
+				t.Fatalf("map CAS %v = %v", test.err, err)
+			}
+		})
 	}
 }
 
@@ -456,7 +724,7 @@ func TestLocalServiceSurvivesRestartWithRevisionHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inserted, putErr := ordinary.Put(ctx, content.Blob{SHA256: firstSum, Size: int64(len(firstBody))}, bytes.NewReader(firstBody)); putErr != nil || !inserted {
+	if inserted, putErr := service.PutBlob(ctx, content.Blob{SHA256: firstSum, Size: int64(len(firstBody))}, bytes.NewReader(firstBody)); putErr != nil || !inserted {
 		t.Fatalf("first content put = %v, %v", inserted, putErr)
 	}
 	xetBody, xetHash, xetSum := publishXetFixture(t, ctx, service.cas.(*casserver.Service))
@@ -465,7 +733,7 @@ func TestLocalServiceSurvivesRestartWithRevisionHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstOID := testOID(t, '7')
-	if err = metadata.PublishSnapshot(ctx, model.Snapshot{
+	if err = service.PublishSnapshot(ctx, model.Snapshot{
 		Repo: repo, OID: firstOID, CreatedAt: time.Unix(301, 0), Author: model.Identity{Name: "Test"}, Message: "first",
 		Files: []model.FileEntry{{Path: "config.txt", Ref: firstRef}, {Path: "weights.bin", Ref: xetRef}},
 	}, catalog.ExpectRef("main", nil)); err != nil {
@@ -486,11 +754,11 @@ func TestLocalServiceSurvivesRestartWithRevisionHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inserted, putErr := ordinary.Put(ctx, content.Blob{SHA256: secondSum, Size: int64(len(secondBody))}, bytes.NewReader(secondBody)); putErr != nil || !inserted {
+	if inserted, putErr := service.PutBlob(ctx, content.Blob{SHA256: secondSum, Size: int64(len(secondBody))}, bytes.NewReader(secondBody)); putErr != nil || !inserted {
 		t.Fatalf("second content put = %v, %v", inserted, putErr)
 	}
 	secondOID := testOID(t, '8')
-	if err = metadata.PublishSnapshot(ctx, model.Snapshot{
+	if err = service.PublishSnapshot(ctx, model.Snapshot{
 		Repo: repo, OID: secondOID, Parent: &firstOID, CreatedAt: time.Unix(302, 0), Author: model.Identity{Name: "Test"}, Message: "second",
 		Files: []model.FileEntry{{Path: "config.txt", Ref: secondRef}},
 	}, catalog.ExpectRef("main", &firstOID)); err != nil {
@@ -625,6 +893,15 @@ func TestServiceRejectsInconsistentCASMetadataAndMapsStreams(t *testing.T) {
 }
 
 func publishXetFixture(t *testing.T, ctx context.Context, service *casserver.Service) ([]byte, xethash.Hash, [32]byte) {
+	return publishXetFixtureWithSHA(t, ctx, service, true)
+}
+
+func publishXetFixtureWithSHA(
+	t *testing.T,
+	ctx context.Context,
+	service *casserver.Service,
+	includeSHA bool,
+) ([]byte, xethash.Hash, [32]byte) {
 	t.Helper()
 	chunks := [][]byte{
 		bytes.Repeat([]byte("xet-backed-a"), 500),
@@ -652,10 +929,14 @@ func publishXetFixture(t *testing.T, ctx context.Context, service *casserver.Ser
 	}
 	fileHash := xethash.File(nodes)
 	sum := sha256.Sum256(body)
+	var shardSum *[32]byte
+	if includeSHA {
+		shardSum = &sum
+	}
 	shardBody, err := shard.EncodeUpload(shard.Shard{
 		Xorbs: []shard.Xorb{xorbInfo},
 		Files: []shard.File{{
-			Hash: fileHash, SHA256: &sum,
+			Hash: fileHash, SHA256: shardSum,
 			Terms: []shard.Term{{
 				XorbHash: object.Hash, UnpackedBytes: uint32(len(body)), Start: 0, End: uint32(len(chunks)),
 				Verification: xethash.Verification(hashes),
@@ -738,6 +1019,15 @@ func testRepo(t *testing.T, namespace, name string) model.RepoKey {
 	return repo
 }
 
+func mustRepositoryNamespace(t *testing.T, repo model.RepoKey) string {
+	t.Helper()
+	namespace, err := RepositoryNamespace(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return namespace
+}
+
 func testOID(t *testing.T, character byte) model.OID {
 	t.Helper()
 	oid, err := model.ParseOID(strings.Repeat(string(character), 40))
@@ -766,6 +1056,32 @@ func (function casOpenerFunc) OpenFileInNamespace(
 	wanted *xetcas.FileRange,
 ) (*casserver.OpenedFile, error) {
 	return function(ctx, namespace, hash, wanted)
+}
+
+func (casOpenerFunc) VerifyFileInNamespace(
+	context.Context,
+	string,
+	xethash.Hash,
+	uint64,
+	*[32]byte,
+) error {
+	return errors.New("unused CAS verifier")
+}
+
+type trackingCASFileService struct {
+	CASFileService
+	verifications int
+}
+
+func (service *trackingCASFileService) VerifyFileInNamespace(
+	ctx context.Context,
+	namespace string,
+	hash xethash.Hash,
+	size uint64,
+	sum *[32]byte,
+) error {
+	service.verifications++
+	return service.CASFileService.VerifyFileInNamespace(ctx, namespace, hash, size, sum)
 }
 
 type errorReadCloser struct{ err error }
