@@ -31,6 +31,12 @@ verification, cancellation, and typed corruption/range/backend errors. The
 filesystem backend uses private versioned keys, same-directory temporary files,
 file sync, atomic hard-link publication, and directory barriers through the
 filesystem root. Separate processes may safely race identical publication.
+The `content/s3` implementation provides the same immutable contract over an
+operator-configured S3-compatible prefix: it verifies SHA-256 and exact length
+in a local spool before one conditional `PutObject`, compares any retained
+collision exactly, validates full/range response metadata, and hash-checks full
+downloads. It deliberately avoids optional checksum trailers for wider S3
+compatibility and does not claim multipart upload, listing, caching, or delete.
 
 `catalog/sqlite` requires a trusted private directory: it rejects symlink path
 components but cannot fence hostile concurrent path, WAL, or SHM replacement by
@@ -543,6 +549,7 @@ read resolves one of those scoped records before reaching physical content.
 | `content` | CAS-independent immutable ordinary-blob storage contract, identities, ranges, and typed errors |
 | `content/memory` | Concurrent ephemeral ordinary-content storage and reference semantics |
 | `content/filesystem` | Linux/macOS crash-consistent immutable ordinary-content publication and streaming |
+| `content/s3` | S3-compatible conditionally immutable ordinary-content publication and verified full/range streaming |
 | `bucket` | Hosting-neutral repository façade and uniform ordinary/Xet file streaming with derived CAS namespace isolation |
 | `chunker` | Streaming official GearHash content-defined chunking |
 | `xethash` | Canonical hashes, BLAKE3 domains, Merkle aggregation, and compact subtrees |

@@ -40,7 +40,7 @@
 | Model domain | Hosting-neutral, case-sensitive repository keys; strict NFC paths/refs; opaque server-assigned 40-lowercase-hex commit OIDs; immutable complete snapshots; and ordinary/Xet file references. No compatible commit-OID derivation or Hub DTO claim |
 | Memory catalog | Repository-scoped immutable snapshots and files; atomic target-state-idempotent ref publication; first-publication `main`; bounded operation-bound repository/snapshot/file cursors; file continuations pinned to an immutable snapshot OID; no durable-backend or Hub-control-plane claim |
 | SQLite model catalog | The same catalog contract on a versioned pure-Go SQLite schema; WAL plus `synchronous=FULL`; context-aware immediate write serialization across independent handles; atomic snapshot/file/ref publication; restart persistence; retained-row validation; and bounded snapshot-bound keyset cursors. No PostgreSQL model-catalog or Hub-control-plane claim |
-| Ordinary content | CAS-independent SHA-256-plus-length identities; exact verified immutable uploads; idempotent memory and Linux/macOS filesystem publication; full/hash-verified and half-open range streams; cancellation and typed errors. The filesystem layout is versioned and uses same-directory temp, file-sync, hard-link, and full ancestor-directory barriers; no S3/cache, deletion, or repository authorization claim |
+| Ordinary content | CAS-independent SHA-256-plus-length identities; exact verified immutable uploads; idempotent memory, Linux/macOS filesystem, and S3-compatible publication; full/hash-verified and half-open range streams; cancellation and typed errors. Filesystem publication uses same-directory temp, file-sync, hard-link, and full ancestor-directory barriers. S3 publication uses verified local spooling, `If-None-Match: *`, exact collision comparison, required-only SDK checksums, and strict response-range metadata; no multipart, cache, listing, deletion, or repository authorization claim |
 | Model-bucket façade | Hosting-neutral catalog delegation and one typed full/range file-open API over ordinary blobs and Xet reconstruction; repository keys derive opaque logical CAS namespaces, callers cannot choose a raw scope, optional SHA metadata remains optional, and local filesystem + SQLite restart tests retain old revisions while denying cross-repository hash reachability. No Hub authentication, compatible HTTP DTO, or commit-hash claim |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
@@ -257,8 +257,7 @@ constraint, foreign-key, or database-integrity audit.
 
 Remaining production storage boundaries are:
 
-1. S3-compatible ordinary-content storage and the optional filesystem read
-   cache;
+1. an optional filesystem read-through cache for authoritative S3 content;
 2. a PostgreSQL model catalog implementing the same contract as memory and
    SQLite;
 3. operator policy and grace-based cleanup for missing, corrupt, or persistently
