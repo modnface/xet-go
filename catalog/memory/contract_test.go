@@ -5,14 +5,18 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jmwoliver/xet-go/catalog"
 	"github.com/jmwoliver/xet-go/catalog/memory"
+	postgrescatalog "github.com/jmwoliver/xet-go/catalog/postgres"
 	sqlitecatalog "github.com/jmwoliver/xet-go/catalog/sqlite"
 	"github.com/jmwoliver/xet-go/model"
 )
@@ -30,6 +34,35 @@ func TestSQLiteCatalogContract(t *testing.T) {
 			tb.Fatal(err)
 		}
 		tb.Cleanup(func() { _ = store.Close() })
+		return store
+	})
+}
+
+var postgresSchemaSequence atomic.Uint64
+
+func TestPostgreSQLCatalogContract(t *testing.T) {
+	if os.Getenv("XET_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set XET_POSTGRES_INTEGRATION=1 with XET_POSTGRES_DSN to run")
+	}
+	dsn := os.Getenv("XET_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("XET_POSTGRES_DSN is required")
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatal("configure PostgreSQL test pool")
+	}
+	t.Cleanup(pool.Close)
+	runCatalogContract(t, func(tb testing.TB) catalog.Catalog {
+		schema := fmt.Sprintf("xet_catalog_contract_%d_%d", os.Getpid(), postgresSchemaSequence.Add(1))
+		store, openErr := postgrescatalog.New(context.Background(), pool, postgrescatalog.Options{Schema: schema})
+		if openErr != nil {
+			tb.Fatal(openErr)
+		}
+		tb.Cleanup(func() {
+			_ = store.Close()
+			_, _ = pool.Exec(context.Background(), `DROP SCHEMA `+schema+` CASCADE`)
+		})
 		return store
 	})
 }

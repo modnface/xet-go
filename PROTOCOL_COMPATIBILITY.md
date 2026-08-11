@@ -39,7 +39,8 @@
 | Global Xorb-index repair | Bounded exact reconciliation of missing global layout metadata from canonical complete-Xorb payloads; no shard/scoped-index inference, payload mutation, reachability, retention, or deletion authority |
 | Model domain | Hosting-neutral, case-sensitive repository keys; strict NFC paths/refs; opaque server-assigned 40-lowercase-hex commit OIDs; immutable complete snapshots; and ordinary/Xet file references. No compatible commit-OID derivation or Hub DTO claim |
 | Memory catalog | Repository-scoped immutable snapshots and files; atomic target-state-idempotent ref publication; first-publication `main`; bounded operation-bound repository/snapshot/file cursors; file continuations pinned to an immutable snapshot OID; no durable-backend or Hub-control-plane claim |
-| SQLite model catalog | The same catalog contract on a versioned pure-Go SQLite schema; WAL plus `synchronous=FULL`; context-aware immediate write serialization across independent handles; atomic snapshot/file/ref publication; restart persistence; retained-row validation; and bounded snapshot-bound keyset cursors. No PostgreSQL model-catalog or Hub-control-plane claim |
+| SQLite model catalog | The catalog contract on a versioned pure-Go SQLite schema; WAL plus `synchronous=FULL`; context-aware immediate write serialization across independent handles; atomic snapshot/file/ref publication; restart persistence; retained-row validation; and bounded snapshot-bound keyset cursors. No Hub-control-plane claim |
+| PostgreSQL model catalog | The same contract on versioned private-schema migrations; UTF-8 server/client enforcement; explicit `C`-collated key ordering; per-repository serialization across independent pools; atomic, target-state-idempotent snapshot/file/ref publication; exact nanosecond timestamps; strict retained-schema/row validation; and operation-bound keyset cursors. No Hub-control-plane or compatible commit-OID claim |
 | Ordinary content | CAS-independent SHA-256-plus-length identities; exact verified immutable uploads; idempotent memory, Linux/macOS filesystem, and S3-compatible publication; full/hash-verified and half-open range streams; cancellation and typed errors. Filesystem publication uses same-directory temp, file-sync, hard-link, and full ancestor-directory barriers. S3 publication uses verified local spooling, `If-None-Match: *`, exact collision comparison, required-only SDK checksums, and strict response-range metadata; no multipart, cache, listing, deletion, or repository authorization claim |
 | Model-bucket façade | Hosting-neutral catalog delegation and one typed full/range file-open API over ordinary blobs and Xet reconstruction; repository keys derive opaque logical CAS namespaces, callers cannot choose a raw scope, optional SHA metadata remains optional, and local filesystem + SQLite restart tests retain old revisions while denying cross-repository hash reachability. No Hub authentication, compatible HTTP DTO, or commit-hash claim |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
@@ -255,15 +256,34 @@ weakly consistent across calls, and startup schema probing verifies required
 queryable columns and the required index name rather than serving as a complete
 constraint, foreign-key, or database-integrity audit.
 
+The `catalog/postgres` backend applies the same catalog contract to a private
+PostgreSQL schema. `Open` creates a pool configured for UTF-8; `New` requires
+every connection in its caller-owned pool to retain UTF-8 client encoding.
+Initialization rejects non-UTF-8 servers, unsupported newer schema versions,
+and retained schemas whose columns, collations, primary/foreign keys, checks,
+or snapshot-order index do not match the versioned manifest. Every identifier
+is qualified, migration runs under a schema-specific advisory transaction
+lock, and transaction-local `search_path` is restricted to `pg_catalog`.
+Repository/path comparisons explicitly use PostgreSQL's `C` collation so
+keyset cursors follow the same UTF-8 byte order as memory and SQLite.
+Per-repository row locks serialize ref and snapshot publication across
+independent pools. One transaction publishes the immutable snapshot, complete
+file tree, target ref, and initial `main`; exact target-state replay succeeds
+after an ambiguous result, while incompatible replay remains a typed conflict.
+The opt-in PostgreSQL 15 suite runs the common contract and proves restart
+visibility, migration and writer concurrency, rollback at every injected
+publication boundary, Unicode ordering, nanosecond timestamps, malformed
+cursor isolation, retained-state/schema corruption detection, and pool
+ownership. PostgreSQL catalog pagination is weakly consistent across calls;
+file continuations remain pinned to an immutable snapshot OID.
+
 Remaining production storage boundaries are:
 
 1. an optional filesystem read-through cache for authoritative S3 content;
-2. a PostgreSQL model catalog implementing the same contract as memory and
-   SQLite;
-3. operator policy and grace-based cleanup for missing, corrupt, or persistently
+2. operator policy and grace-based cleanup for missing, corrupt, or persistently
    blocked recovery stages (expiration or protection deletion alone never
    authorizes object deletion);
-4. catalog reachability roots and read/maintenance epochs for destructive work;
-5. namespace-safe shard/index repair, resumable mark-and-sweep, and guarded
+3. catalog reachability roots and read/maintenance epochs for destructive work;
+4. namespace-safe shard/index repair, resumable mark-and-sweep, and guarded
    garbage collection built on the current bounded audits, global Xorb-layout
    reconciliation, and explicit root primitives.

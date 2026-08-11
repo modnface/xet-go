@@ -14,14 +14,16 @@ signing, and authorization. The independent `model` package defines validated
 repository keys, opaque commit OIDs, refs, immutable complete snapshots, and
 ordinary or Xet-backed file references for higher-level catalogs. It does not
 invent Hugging Face/Git commit hashing or import persistence and HTTP policy.
-The `catalog` contract, `catalog/memory` reference implementation, and
-`catalog/sqlite` durable implementation add repository-scoped revision/file
-lookup, atomic immutable-snapshot publication, compare-and-swap refs, and
-snapshot-bound bounded pagination. SQLite uses a versioned schema, WAL with
-`synchronous=FULL`, context-aware immediate write transactions, and one atomic
-transaction for snapshot, file, and ref publication. A trusted control-plane
-adapter allocates an opaque OID before publication; the catalog does not derive
-one from its versioned internal equality fingerprint.
+The `catalog` contract and its memory, SQLite, and PostgreSQL implementations
+add repository-scoped revision/file lookup, atomic immutable-snapshot
+publication, compare-and-swap refs, and snapshot-bound bounded pagination.
+SQLite uses a versioned schema, WAL with `synchronous=FULL`, context-aware
+immediate write transactions, and one atomic transaction for snapshot, file,
+and ref publication. PostgreSQL uses versioned private-schema migrations,
+per-repository transaction locks for independent writers, explicit UTF-8 byte
+ordering, and the same atomic publication contract across independent pools. A
+trusted control-plane adapter allocates an opaque OID before publication; the
+catalog does not derive one from its versioned internal equality fingerprint.
 
 The independent `content` contract stores ordinary files by SHA-256 and exact
 length without importing repository or CAS policy. Its memory and Linux/macOS
@@ -375,6 +377,48 @@ and S3 still cannot share a transaction: CAS publication relies on immutable
 object writes followed by protected atomic index publication, and ambiguous or
 failed index publication retains its durable stage for reconciliation.
 
+The separate `catalog/postgres` adapter implements the model catalog over
+PostgreSQL. It follows the same ownership convention: `Open` owns its pool and
+`New` leaves a caller-owned pool open. The default private schema is
+`xet_catalog`; a deployment may select another lowercase unquoted PostgreSQL
+identifier:
+
+```go
+modelCatalog, err := catalogpostgres.New(ctx, pool, catalogpostgres.Options{
+	Schema: "xet_catalog",
+})
+if err != nil {
+	return err
+}
+defer modelCatalog.Close()
+```
+
+Initialization requires UTF-8 server and client encodings, serializes migration
+with a schema-specific advisory transaction lock, and rejects newer or
+structurally incompatible retained schemas. Text keys and pagination use
+PostgreSQL's `C` collation to preserve the catalog contract's UTF-8 byte order.
+Snapshot rows, their complete file tree, the target ref, and first-publication
+`main` are committed in one transaction after locking the repository row.
+Publication and ref updates accept exact target-state replay, making retry safe
+after an ambiguous commit result without permitting a stale writer to overwrite
+a different ref value.
+
+Run the real-backend contract against a principal allowed to create and drop
+private test schemas:
+
+```sh
+XET_POSTGRES_INTEGRATION=1 \
+XET_POSTGRES_DSN='postgres://xet@127.0.0.1:5432/postgres?sslmode=disable' \
+go test -race ./catalog/postgres ./catalog/memory
+```
+
+The suite runs the shared catalog contract and separately checks independent
+pool restart visibility, concurrent writers, migration serialization, exact
+nanosecond timestamps, UTF-8 byte-order pagination, fault-injected transaction
+rollback, retained-state/schema corruption, cursor isolation, and pool
+ownership. It does not claim Hugging Face-compatible commit OID derivation or a
+Hub control plane.
+
 With both backends available, run the composed remote-profile contract:
 
 ```sh
@@ -546,6 +590,7 @@ read resolves one of those scoped records before reaching physical content.
 | `catalog` | Hosting-neutral repository catalog contract and typed errors |
 | `catalog/memory` | Transactional in-memory catalog reference semantics |
 | `catalog/sqlite` | Pure-Go durable SQLite catalog with atomic snapshot/ref publication, restart persistence, and bounded keyset pagination |
+| `catalog/postgres` | PostgreSQL catalog with versioned private-schema migrations, serialized repository publication, strict schema validation, and bounded byte-ordered pagination |
 | `content` | CAS-independent immutable ordinary-blob storage contract, identities, ranges, and typed errors |
 | `content/memory` | Concurrent ephemeral ordinary-content storage and reference semantics |
 | `content/filesystem` | Linux/macOS crash-consistent immutable ordinary-content publication and streaming |
