@@ -174,8 +174,8 @@ func runIndexStoreContract(t *testing.T, factory indexStoreFactory) {
 	t.Run("immutable and scoped indexes", func(t *testing.T) {
 		store := factory(t)
 		ctx := context.Background()
-		xorbHash := xethash.Chunk([]byte("index xorb"))
 		chunkHash := xethash.Chunk([]byte("index chunk"))
+		xorbHash := xethash.Xorb([]xethash.Node{{Hash: chunkHash, Size: 7}})
 		fileHash := xethash.Chunk([]byte("index file"))
 		shardKey := BlobKey{Kind: BlobShard, Hash: xethash.Chunk([]byte("index shard"))}
 		xorbRecord := XorbRecord{
@@ -206,7 +206,12 @@ func runIndexStoreContract(t *testing.T, factory indexStoreFactory) {
 			t.Fatalf("idempotent xorb = %v", err)
 		}
 		conflictingXorb := xorbRecord
+		conflictingXorb.Layout.Chunks = append([]xorb.IngestedChunk(nil), conflictingXorb.Layout.Chunks...)
+		conflictingXorb.Layout.Chunks[0].SerializedLength++
 		conflictingXorb.Layout.NetworkBytes++
+		if _, err := ValidateXorbRecord(xorbHash, conflictingXorb); err != nil {
+			t.Fatalf("valid conflicting Xorb = %v", err)
+		}
 		if err := store.PutXorb(ctx, conflictingXorb); !errors.Is(err, ErrConflict) {
 			t.Fatalf("xorb conflict = %v", err)
 		}
@@ -214,6 +219,48 @@ func runIndexStoreContract(t *testing.T, factory indexStoreFactory) {
 		if err != nil || !found || !reflect.DeepEqual(gotXorb, xorbRecord) {
 			t.Fatalf("xorb = %#v, %v, %v", gotXorb, found, err)
 		}
+
+		t.Run("concurrent Xorb insertion never replaces", func(t *testing.T) {
+			concurrent := factory(t)
+			left, right := xorbRecord, conflictingXorb
+			start := make(chan struct{})
+			results := make(chan error, 2)
+			for _, record := range []XorbRecord{left, right} {
+				go func() {
+					<-start
+					results <- concurrent.PutXorb(ctx, record)
+				}()
+			}
+			close(start)
+			first, second := <-results, <-results
+			if (first == nil) == (second == nil) ||
+				first != nil && !errors.Is(first, ErrConflict) ||
+				second != nil && !errors.Is(second, ErrConflict) {
+				t.Fatalf("concurrent Xorb results = %v, %v", first, second)
+			}
+			retained, found, err := concurrent.GetXorb(ctx, xorbHash)
+			if err != nil || !found || !reflect.DeepEqual(retained, left) && !reflect.DeepEqual(retained, right) {
+				t.Fatalf("concurrent retained Xorb = %#v, %v, %v", retained, found, err)
+			}
+		})
+
+		t.Run("corrupt retained Xorb is not a conflict", func(t *testing.T) {
+			corruptStore := factory(t)
+			corrupt := xorbRecord
+			corrupt.Layout.NetworkBytes++
+			if _, err := ValidateXorbRecord(xorbHash, corrupt); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("corrupt retained fixture = %v", err)
+			}
+			if err := corruptStore.PutXorb(ctx, corrupt); err != nil {
+				if !errors.Is(err, ErrInvalid) {
+					t.Fatalf("reject corrupt supplied Xorb = %v", err)
+				}
+				return
+			}
+			if err := corruptStore.PutXorb(ctx, xorbRecord); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("put over corrupt retained Xorb = %v", err)
+			}
+		})
 
 		if err := store.PutFile(ctx, "a", fileRecord); err != nil {
 			t.Fatal(err)

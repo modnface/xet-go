@@ -1071,17 +1071,17 @@ func TestAuditInventoryPointCheckBoundaries(t *testing.T) {
 
 	corruptXorb := xorbRecord
 	corruptXorb.Blob.Hash = xethash.Chunk([]byte("wrong audit Xorb identity"))
-	if _, err := validateAuditXorbRecord(graph.xorb.Hash, corruptXorb); !errors.Is(err, ErrCorrupt) {
+	if _, err := ValidateXorbRecord(graph.xorb.Hash, corruptXorb); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("Xorb identity validation = %v", err)
 	}
 	corruptXorb = xorbRecord
 	corruptXorb.Layout.Chunks = nil
-	if _, err := validateAuditXorbRecord(graph.xorb.Hash, corruptXorb); !errors.Is(err, ErrCorrupt) {
+	if _, err := ValidateXorbRecord(graph.xorb.Hash, corruptXorb); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("Xorb layout validation = %v", err)
 	}
 	corruptXorb = xorbRecord
 	corruptXorb.Layout.Complete = []byte{1}
-	if _, err := validateAuditXorbRecord(graph.xorb.Hash, corruptXorb); !errors.Is(err, ErrCorrupt) {
+	if _, err := ValidateXorbRecord(graph.xorb.Hash, corruptXorb); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("persisted Xorb payload retention = %v", err)
 	}
 	if err := validateAuditBlobSize(BlobKey{Kind: "unknown", Hash: graph.xorb.Hash}, BlobInfo{Size: 1}); !errors.Is(err, ErrCorrupt) {

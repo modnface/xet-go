@@ -116,23 +116,56 @@ func (s *Service) readStoredBlob(
 		return nil, true, BlobStageRecoveryValidate,
 			fmt.Errorf("%w: stored %s size %d is outside [1,%d]", ErrCorrupt, key.Kind, info.Size, limit)
 	}
-	reader, err := s.blobs.Get(ctx, key, nil)
-	if errors.Is(err, ErrNotFound) {
+	body, readFound, err := s.readExactStoredBlob(ctx, key, info.Size)
+	if !readFound && err == nil {
 		return nil, false, BlobStageRecoveryRead, nil
 	}
 	if err != nil {
+		if errors.Is(err, ErrCorrupt) {
+			return nil, true, BlobStageRecoveryValidate, err
+		}
 		return nil, true, BlobStageRecoveryRead, err
-	}
-	body, readErr := io.ReadAll(io.LimitReader(reader, info.Size+1))
-	closeErr := reader.Close()
-	if err := errors.Join(readErr, closeErr); err != nil {
-		return nil, true, BlobStageRecoveryRead, err
-	}
-	if int64(len(body)) != info.Size {
-		return nil, true, BlobStageRecoveryValidate,
-			fmt.Errorf("%w: stored %s size %d differs from declared %d", ErrCorrupt, key.Kind, len(body), info.Size)
 	}
 	return body, true, "", nil
+}
+
+func (s *Service) readExactStoredBlob(
+	ctx context.Context,
+	key BlobKey,
+	expectedSize int64,
+) ([]byte, bool, error) {
+	reader, getErr := s.blobs.Get(ctx, key, nil)
+	if getErr != nil {
+		var closeErr error
+		if reader != nil {
+			closeErr = reader.Close()
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, true, err
+		}
+		if errors.Is(getErr, ErrNotFound) && closeErr == nil {
+			return nil, false, nil
+		}
+		return nil, true, errors.Join(getErr, closeErr)
+	}
+	if reader == nil {
+		return nil, true, errors.New("xet CAS server: blob store returned a nil payload reader")
+	}
+	reader, readerDone := closeReaderOnCancellation(ctx, reader)
+	body, readErr := io.ReadAll(io.LimitReader(&contextAuditReader{ctx: ctx, reader: reader}, expectedSize+1))
+	close(readerDone)
+	closeErr := reader.Close()
+	if err := ctx.Err(); err != nil {
+		return nil, true, err
+	}
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, true, err
+	}
+	if int64(len(body)) != expectedSize {
+		return nil, true, fmt.Errorf("%w: stored %s size %d differs from declared %d",
+			ErrCorrupt, key.Kind, len(body), expectedSize)
+	}
+	return body, true, nil
 }
 
 func (s *Service) recoverXorbStage(

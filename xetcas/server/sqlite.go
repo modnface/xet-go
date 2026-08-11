@@ -567,7 +567,13 @@ func (s *SQLiteIndexStore) PutXorb(ctx context.Context, value XorbRecord) error 
 	if err != nil {
 		return err
 	}
-	if !found || !reflect.DeepEqual(existing, value) {
+	if !found {
+		return ErrConflict
+	}
+	if _, err := ValidateXorbRecord(value.Layout.Hash, existing); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(existing, value) {
 		return ErrConflict
 	}
 	return nil

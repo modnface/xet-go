@@ -29,6 +29,7 @@ var (
 	ErrDurabilityUnsupported       = errors.New("xet CAS server: strict filesystem durability is unsupported")
 	ErrProtectionExpiryUnsupported = errors.New("xet CAS server: protection expiry operations are unsupported")
 	ErrAuditUnsupported            = errors.New("xet CAS server: selected audit inventory is unsupported")
+	ErrRepairUnsupported           = errors.New("xet CAS server: selected repair operation is unsupported")
 )
 
 type BlobKind string
@@ -75,7 +76,9 @@ type BlobPage struct {
 }
 
 // BlobStore stores immutable protocol objects. PutIfAbsent must return
-// ErrConflict if a key already contains different bytes.
+// ErrConflict if a key already contains different bytes. A successful Get
+// returns a non-nil reader whose Close may run concurrently with Read and must
+// promptly unblock that Read; this is required for cancellation propagation.
 type BlobStore interface {
 	PutIfAbsent(context.Context, BlobKey, io.Reader, int64) (inserted bool, err error)
 	Head(context.Context, BlobKey) (BlobInfo, bool, error)
@@ -98,6 +101,23 @@ type XorbRecord struct {
 	// Layout contains metadata only. Service publication stores Complete in
 	// Blob and clears Layout.Complete before publishing the index record.
 	Layout xorb.Ingested
+}
+
+// ValidateXorbRecord validates durable global Xorb metadata and returns the
+// exact canonical complete-payload size described by it. Invalid retained
+// metadata is reported as ErrCorrupt.
+func ValidateXorbRecord(hash xethash.Hash, record XorbRecord) (int64, error) {
+	if record.Blob.Kind != BlobXorb || record.Blob.Hash != hash || record.Layout.Hash != hash {
+		return 0, fmt.Errorf("%w: Xorb record identity mismatch", ErrCorrupt)
+	}
+	if record.Layout.Complete != nil {
+		return 0, fmt.Errorf("%w: persisted Xorb record retains complete payload bytes", ErrCorrupt)
+	}
+	expectedSize, err := xorb.ValidateIngested(&record.Layout)
+	if err != nil {
+		return 0, fmt.Errorf("%w: invalid Xorb layout: %v", ErrCorrupt, err)
+	}
+	return expectedSize, nil
 }
 
 type FileRecord struct {
@@ -452,6 +472,51 @@ type PayloadAuditPage struct {
 	NextCursor string
 }
 
+// XorbIndexRepairStatus is the observed disposition from reconciling one
+// listed physical Xorb with its global layout index. Repair never changes or
+// deletes payload bytes and cannot reconstruct namespace-scoped shard indexes
+// without a retained publication stage.
+type XorbIndexRepairStatus string
+
+const (
+	XorbIndexRepairAlreadyValid     XorbIndexRepairStatus = "already-valid"
+	XorbIndexRepairReconciled       XorbIndexRepairStatus = "reconciled"
+	XorbIndexRepairMissing          XorbIndexRepairStatus = "missing"
+	XorbIndexRepairInvalidInventory XorbIndexRepairStatus = "invalid-inventory"
+	XorbIndexRepairInvalidPayload   XorbIndexRepairStatus = "invalid-payload"
+	XorbIndexRepairConflict         XorbIndexRepairStatus = "index-conflict"
+	XorbIndexRepairIndexCorrupt     XorbIndexRepairStatus = "index-corrupt"
+	XorbIndexRepairFailed           XorbIndexRepairStatus = "failed"
+)
+
+type XorbIndexRepairPhase string
+
+const (
+	XorbIndexRepairRead     XorbIndexRepairPhase = "read"
+	XorbIndexRepairValidate XorbIndexRepairPhase = "validate"
+	XorbIndexRepairLookup   XorbIndexRepairPhase = "lookup-index"
+	XorbIndexRepairPublish  XorbIndexRepairPhase = "publish-index"
+)
+
+type XorbIndexRepairResult struct {
+	Entry  BlobEntry
+	Status XorbIndexRepairStatus
+	Phase  XorbIndexRepairPhase
+	// Err is nil for already-valid, reconciled, and missing outcomes. Invalid
+	// inventory/payload and index-corrupt outcomes retain ErrCorrupt, conflicts
+	// retain ErrConflict, and backend failures retain their original error.
+	Err error
+}
+
+// XorbIndexRepairPage contains outcomes for one bounded physical-Xorb page.
+// Per-item failures advance the continuation and must be retained by callers.
+// A top-level error always withholds NextCursor and requires retrying the
+// original request.
+type XorbIndexRepairPage struct {
+	Items      []XorbIndexRepairResult
+	NextCursor string
+}
+
 // ShardPublication is the complete set of logical index records exposed by
 // one validated shard. PublishShard must commit all records atomically within
 // Namespace or expose none of them.
@@ -468,9 +533,12 @@ type ShardPublication struct {
 // and dedup keys are non-unique secondary indexes: the same logical content
 // can have more than one valid shard recipe. PutFile and PutDedup must retain
 // either an existing valid record or the supplied valid record without
-// returning a conflict. Every Put operation is idempotent. The Service
-// validates supplied records and orders calls so scoped file records, the
-// public reconstruction point, are written last.
+// returning a conflict. PutXorb must atomically insert only when absent, accept
+// an exactly identical retained record, return ErrConflict for a different
+// retained record, return ErrCorrupt if that retained record cannot be
+// validated, and never replace an existing record. Every Put operation is
+// idempotent. The Service validates supplied records and orders calls so scoped
+// file records, the public reconstruction point, are written last.
 type IndexStore interface {
 	GetXorb(context.Context, xethash.Hash) (XorbRecord, bool, error)
 	PutXorb(context.Context, XorbRecord) error
@@ -561,6 +629,7 @@ const (
 	cursorFileLeaseExpired
 	cursorAuditEnvelope
 	cursorPayloadAuditEnvelope
+	cursorXorbIndexRepairEnvelope
 )
 
 // validateShardPublication is shared by durable backends so contradictory

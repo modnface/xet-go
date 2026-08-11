@@ -88,7 +88,13 @@ func (s *Store) PutXorb(c context.Context, r server.XorbRecord) error {
 	if e != nil {
 		return e
 	}
-	if !ok || !reflect.DeepEqual(old, r) {
+	if !ok {
+		return server.ErrConflict
+	}
+	if _, e = server.ValidateXorbRecord(r.Layout.Hash, old); e != nil {
+		return e
+	}
+	if !reflect.DeepEqual(old, r) {
 		return server.ErrConflict
 	}
 	return nil

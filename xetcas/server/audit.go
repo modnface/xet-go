@@ -269,7 +269,7 @@ func (s *Service) auditBlobInventory(ctx context.Context, kind AuditKind, entry 
 			Target: auditXorbTarget(entry.Key.Hash),
 		}
 	}
-	expectedSize, err := validateAuditXorbRecord(entry.Key.Hash, record)
+	expectedSize, err := ValidateXorbRecord(entry.Key.Hash, record)
 	if err != nil {
 		return auditInvalid(subject, auditXorbTarget(entry.Key.Hash), err)
 	}
@@ -282,7 +282,7 @@ func (s *Service) auditBlobInventory(ctx context.Context, kind AuditKind, entry 
 
 func (s *Service) auditXorbRecord(ctx context.Context, record XorbRecord) AuditResult {
 	subject := XorbRecordAuditSubject{Blob: record.Blob}
-	expectedSize, err := validateAuditXorbRecord(record.Layout.Hash, record)
+	expectedSize, err := ValidateXorbRecord(record.Layout.Hash, record)
 	if err != nil {
 		return auditInvalid(subject, nil, err)
 	}
@@ -392,7 +392,7 @@ func (s *Service) auditRegisteredFile(
 			dependency = &result
 			return shard.Xorb{}, false, errAuditDependency
 		}
-		expectedSize, err := validateAuditXorbRecord(hash, record)
+		expectedSize, err := ValidateXorbRecord(hash, record)
 		if err != nil {
 			result := auditInvalid(subject, auditXorbTarget(hash), err)
 			dependency = &result
@@ -563,20 +563,6 @@ func validateAuditBlobSize(key BlobKey, info BlobInfo) error {
 		return fmt.Errorf("%w: stored %s size %d is outside [1,%d]", ErrCorrupt, key.Kind, info.Size, limit)
 	}
 	return nil
-}
-
-func validateAuditXorbRecord(hash xethash.Hash, record XorbRecord) (int64, error) {
-	if record.Blob.Kind != BlobXorb || record.Blob.Hash != hash || record.Layout.Hash != hash {
-		return 0, fmt.Errorf("%w: Xorb record identity mismatch", ErrCorrupt)
-	}
-	if record.Layout.Complete != nil {
-		return 0, fmt.Errorf("%w: persisted Xorb record retains complete payload bytes", ErrCorrupt)
-	}
-	expectedSize, err := xorb.ValidateIngested(&record.Layout)
-	if err != nil {
-		return 0, fmt.Errorf("%w: invalid Xorb layout: %v", ErrCorrupt, err)
-	}
-	return expectedSize, nil
 }
 
 func auditNoIssueFound(subject AuditSubject) AuditResult {

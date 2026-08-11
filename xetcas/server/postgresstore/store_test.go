@@ -392,8 +392,8 @@ type fixture struct {
 }
 
 func indexFixture(label string) fixture {
-	xorbHash := xethash.Chunk([]byte("xorb " + label))
 	chunkHash := xethash.Chunk([]byte("chunk " + label))
+	xorbHash := xethash.Xorb([]xethash.Node{{Hash: chunkHash, Size: 7}})
 	fileHash := xethash.Chunk([]byte("file " + label))
 	shardKey := server.BlobKey{Kind: server.BlobShard, Hash: xethash.Chunk([]byte("shard " + label))}
 	var sum [32]byte
@@ -526,7 +526,12 @@ func testCoreIndex(t *testing.T, ctx context.Context, store *Store) {
 	t.Run("concurrent immutable writes", func(t *testing.T) {
 		concurrent := indexFixture("concurrent Xorb")
 		conflict := concurrent.xorb
+		conflict.Layout.Chunks = append([]xorb.IngestedChunk(nil), conflict.Layout.Chunks...)
+		conflict.Layout.Chunks[0].SerializedLength++
 		conflict.Layout.NetworkBytes++
+		if _, err := server.ValidateXorbRecord(conflict.Layout.Hash, conflict); err != nil {
+			t.Fatalf("valid concurrent Xorb conflict = %v", err)
+		}
 		start := make(chan struct{})
 		results := make(chan error, 2)
 		for _, record := range []server.XorbRecord{concurrent.xorb, conflict} {
@@ -1122,8 +1127,21 @@ func testMalformedRecords(
 	}
 
 	xorbValue := indexFixture("malformed Xorb")
+	invalidLayout := xorbValue.xorb
+	invalidLayout.Layout.NetworkBytes++
+	invalidLayoutData, err := enc(invalidLayout)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `INSERT INTO `+schema+`.xorbs(hash,record) VALUES($1,$2)`,
-		xorbValue.xorb.Blob.Hash[:], []byte(`{}`)); err != nil {
+		xorbValue.xorb.Blob.Hash[:], invalidLayoutData); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutXorb(ctx, xorbValue.xorb); !errors.Is(err, server.ErrCorrupt) {
+		t.Fatalf("invalid-layout retained Xorb = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE `+schema+`.xorbs SET record=$1 WHERE hash=$2`,
+		[]byte(`{}`), xorbValue.xorb.Blob.Hash[:]); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := store.GetXorb(ctx, xorbValue.xorb.Blob.Hash); !errors.Is(err, server.ErrCorrupt) {

@@ -141,7 +141,8 @@ func TestNewServiceValidationAndDefaults(t *testing.T) {
 func TestMemoryStoreBlobContractsAndClonesIndexes(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryStore()
-	key := BlobKey{Kind: BlobXorb, Hash: xethash.Chunk([]byte("blob"))}
+	chunkHash := xethash.Chunk([]byte("chunk"))
+	key := BlobKey{Kind: BlobXorb, Hash: xethash.Xorb([]xethash.Node{{Hash: chunkHash, Size: 5}})}
 	wantRead := errors.New("read failed")
 	for name, body := range map[string]struct {
 		body   io.Reader
@@ -188,7 +189,10 @@ func TestMemoryStoreBlobContractsAndClonesIndexes(t *testing.T) {
 		t.Fatalf("range = %q", data)
 	}
 
-	layout := xorb.Ingested{Hash: key.Hash, Chunks: []xorb.IngestedChunk{{Hash: xethash.Chunk([]byte("chunk")), UncompressedLength: 5}}}
+	layout := xorb.Ingested{
+		Hash: key.Hash, NetworkBytes: 15, UncompressedSize: 5,
+		Chunks: []xorb.IngestedChunk{{Hash: chunkHash, SerializedLength: 15, UncompressedLength: 5}},
+	}
 	xorbRecord := XorbRecord{Blob: key, Layout: layout}
 	if err := store.PutXorb(ctx, xorbRecord); err != nil {
 		t.Fatal(err)
@@ -199,7 +203,8 @@ func TestMemoryStoreBlobContractsAndClonesIndexes(t *testing.T) {
 		t.Fatalf("cloned xorb = %#v, %v, %v", gotXorb, found, err)
 	}
 	conflictingXorb := gotXorb
-	conflictingXorb.Layout.UncompressedSize = 1
+	conflictingXorb.Layout.Chunks[0].SerializedLength++
+	conflictingXorb.Layout.NetworkBytes++
 	if err := store.PutXorb(ctx, conflictingXorb); !errors.Is(err, ErrConflict) {
 		t.Fatalf("xorb conflict = %v", err)
 	}

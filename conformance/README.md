@@ -116,5 +116,13 @@ README; the PostgreSQL principal must be able to create and drop private test
 schemas. The coverage script fails rather than silently excluding PostgreSQL
 when `CI=true`.
 
+The composed profile also verifies the administrative Xorb-index repair
+boundary after recreating both S3 and PostgreSQL adapters. It starts from a
+canonical complete Xorb with no retained global layout and proves bounded
+reconciliation survives restart. This is not shard-index repair: physical
+shards do not carry the namespace needed to recreate scoped shard, file, dedup,
+or SHA associations, and the operation neither changes payloads nor supplies
+reachability or garbage-collection evidence.
+
 See [../CONFORMANCE.md](../CONFORMANCE.md) for the requirement-to-test matrix
 and exactness boundary.

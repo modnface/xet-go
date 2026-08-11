@@ -211,8 +211,14 @@ func (s *MemoryStore) PutXorb(ctx context.Context, value XorbRecord) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if previous, ok := s.xorbs[value.Layout.Hash]; ok && !reflect.DeepEqual(previous, value) {
-		return ErrConflict
+	if previous, ok := s.xorbs[value.Layout.Hash]; ok {
+		if _, err := ValidateXorbRecord(value.Layout.Hash, previous); err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(previous, value) {
+			return ErrConflict
+		}
+		return nil
 	}
 	s.xorbs[value.Layout.Hash] = cloneXorbRecord(value)
 	return nil

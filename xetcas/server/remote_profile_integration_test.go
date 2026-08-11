@@ -490,6 +490,42 @@ func TestS3PostgreSQLRemoteProfile(t *testing.T) {
 		}
 	})
 
+	t.Run("unstaged canonical Xorb index repair survives restart", func(t *testing.T) {
+		fixture := makeRemoteFixture(t, "inventory-repair")
+		ingested, err := xorb.IngestNetwork(fixture.object.Body, fixture.object.Hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := casserver.BlobKey{Kind: casserver.BlobXorb, Hash: fixture.object.Hash}
+		if inserted, err := blobs.PutIfAbsent(
+			ctx, key, bytes.NewReader(ingested.Complete), int64(len(ingested.Complete)),
+		); err != nil || !inserted {
+			t.Fatalf("unstaged repair object = %v, %v", inserted, err)
+		}
+		if _, found, err := index.GetXorb(ctx, key.Hash); err != nil || found {
+			t.Fatalf("unstaged index before repair = %v, %v", found, err)
+		}
+		restart()
+		service := newRemoteService(t, blobs, blobs, index, "unused-repair-scope", time.Time{})
+		page, err := service.RepairXorbIndexes(ctx, casserver.PageRequest{})
+		if err != nil || page.NextCursor != "" {
+			t.Fatalf("remote Xorb repair = %#v, %v", page, err)
+		}
+		var repaired bool
+		for _, item := range page.Items {
+			if item.Entry.Key == key {
+				repaired = item.Status == casserver.XorbIndexRepairReconciled && item.Err == nil
+			}
+		}
+		if !repaired {
+			t.Fatalf("remote Xorb repair target = %#v", page)
+		}
+		restart()
+		if _, found, err := index.GetXorb(ctx, key.Hash); err != nil || !found {
+			t.Fatalf("unstaged index after repair restart = %v, %v", found, err)
+		}
+	})
+
 	pool.Close()
 	runRemoteProfileProcesses(t, ctx, schema, prefix, t.TempDir())
 	_, blobs = newRemoteS3(t, configuration, prefix)

@@ -347,7 +347,8 @@ This suite injects cross-backend failure before the object write, after an S3
 write whose success response is lost, at the PostgreSQL shard-publication
 boundary, and both before and after an applied stage deletion. It closes and
 recreates both adapters between recovery passes, reconstructs exact full and
-ranged files, denies an identical file hash in another namespace, and races
+ranged files, reconciles an unstaged canonical Xorb's missing global layout
+after restart, denies an identical file hash in another namespace, and races
 two separate Go processes publishing the same content. Required Linux CI runs
 it against PostgreSQL 15 and MinIO `RELEASE.2025-09-07T16-13-09Z`.
 
@@ -421,7 +422,7 @@ results or inserts behind a cursor. Backend point failures remain per-item
 diagnostics and iteration advances past them, so operators must retain and
 retry failed subjects explicitly. Cancellation may return completed diagnostic
 items, but never a continuation; retry from the original request cursor. There
-is no repair or payload-sweep API.
+is no payload-sweep API.
 
 `Service.AuditBlobPayloads` is the separate, stronger physical-byte check. It
 lists one bounded Xorb or shard page, reads each object exactly and one at a
@@ -437,6 +438,19 @@ the metadata audit, it is administrative, weakly consistent across pages, and
 withholds the continuation cursor after cancellation. Backend point failures
 remain per-item diagnostics and iteration advances past them, so operators must
 retain and retry failed entries explicitly.
+
+`Service.RepairXorbIndexes` is the deliberately narrower repair boundary. It
+boundedly lists physical Xorbs, exactly reads and canonicalizes one complete V1
+payload at a time, and inserts only a missing global `XorbRecord`. Existing
+metadata must be fully valid and byte-layout-identical; a valid different
+layout is reported as a conflict and malformed retained metadata as corruption.
+`reconciled` is observational: under a concurrent identical writer it means
+the derived immutable record was accepted, not that this invocation owned the
+insert. The operation never writes or deletes payloads, performs no tenant
+authorization, and makes no reachability or retention decision. A physical
+shard does not encode its publication namespace, so namespace-scoped shard,
+file, dedup, and SHA indexes are not inferred without a retained stage.
+Cancellation withholds the continuation cursor.
 
 Embedders can stream reconstructed content without interpreting protocol JSON
 or making an internal HTTP request:

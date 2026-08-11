@@ -36,6 +36,7 @@
 | PostgreSQL CAS metadata | Isolated pgx adapter with versioned private-schema migrations, global Xorb metadata, namespace-scoped logical indexes/protections, transactional shard publication, stable lock ordering, nanosecond expiry, and bounded keyset inventory |
 | Administrative audit | Bounded, weakly consistent, read-only forward metadata checks across blob/index/protection inventories; no tenant authorization, payload hashing, catalog reachability, repair, or deletion authority |
 | Physical payload audit | Bounded, sequential exact reads of physical Xorbs and shards with canonical durable-form and key-identity verification; no namespace reachability, repair, retention, or deletion authority |
+| Global Xorb-index repair | Bounded exact reconciliation of missing global layout metadata from canonical complete-Xorb payloads; no shard/scoped-index inference, payload mutation, reachability, retention, or deletion authority |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
 | Credential refresh | Refresh 30 seconds before expiry, coalesce concurrent refresh, and retry exactly once after a 401 invalidation |
@@ -175,7 +176,14 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
   distinguishes missing, size-invalid, malformed/noncanonical,
   identity-mismatched, and backend-failed objects. Success proves only the
   bytes observed for that object, not namespace reachability, file SHA-256,
-  retention, or deletion safety; and
+  retention, or deletion safety;
+- bounded Xorb-index repair derives only missing global immutable layout
+  metadata from canonical complete V1 Xorbs. Retained layouts are fully
+  validated and never replaced; valid differences are conflicts, malformed
+  records are corruption, and `reconciled` does not claim which concurrent
+  writer inserted an identical record. Repair performs no tenant authorization,
+  payload write/delete, shard or namespace-scoped index inference, reachability
+  decision, or retention decision; and
 - the same backend contract suite runs against memory/filesystem and
   memory/SQLite, including cancellation, namespace isolation, concurrent
   publication and pagination mutation, corrupt-row detection, injected
@@ -217,9 +225,11 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
   lost, failure at the atomic shard-index publication boundary, and failures
   both before and after an applied stage deletion. Expired-stage recovery and
   idempotent request retry repair each ambiguous durable state without
-  rewriting payloads. The suite then verifies namespace isolation and exact
-  full/ranged reconstruction and races two separate Go processes publishing
-  the same Xorb and shard to prove cross-process immutable/idempotent behavior.
+  rewriting payloads. After recreating both adapters, it also reconciles a
+  canonical unstaged Xorb whose global layout record is absent. The suite then
+  verifies namespace isolation and exact full/ranged reconstruction and races
+  two separate Go processes publishing the same Xorb and shard to prove
+  cross-process immutable/idempotent behavior.
   The required Linux race and coverage CI job runs both real backends rather
   than silently skipping them.
 
@@ -235,6 +245,6 @@ Remaining production storage boundaries are:
    blocked recovery stages (expiration or protection deletion alone never
    authorizes object deletion);
 2. catalog reachability roots and read/maintenance epochs for destructive work;
-3. repair, resumable mark-and-sweep, and guarded garbage collection built on
-   the current bounded metadata and physical-payload audits plus explicit root
-   primitives.
+3. namespace-safe shard/index repair, resumable mark-and-sweep, and guarded
+   garbage collection built on the current bounded audits, global Xorb-layout
+   reconciliation, and explicit root primitives.
