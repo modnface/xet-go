@@ -65,6 +65,23 @@ func ParseFilePath(value string) (FilePath, error) {
 	return FilePath(value), nil
 }
 
+// ParseFilePrefix validates a lexical path prefix used for bounded tree
+// queries. The empty prefix selects the complete tree; one trailing slash is
+// allowed to select descendants of a directory.
+func ParseFilePrefix(value string) (FilePrefix, error) {
+	if value == "" {
+		return "", nil
+	}
+	path := strings.TrimSuffix(value, "/")
+	if path == "" || strings.HasSuffix(path, "/") {
+		return "", fmt.Errorf("model: file prefix is noncanonical")
+	}
+	if _, err := ParseFilePath(path); err != nil {
+		return "", fmt.Errorf("model: file prefix: %w", err)
+	}
+	return FilePrefix(value), nil
+}
+
 func ParseRefName(value string) (RefName, error) {
 	if !utf8.ValidString(value) || !norm.NFC.IsNormalString(value) {
 		return "", fmt.Errorf("model: ref must be valid NFC UTF-8")

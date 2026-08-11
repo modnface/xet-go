@@ -21,6 +21,7 @@ const RepoTypeModel RepoType = "model"
 type Namespace string
 type RepoName string
 type FilePath string
+type FilePrefix string
 type RefName string
 
 type RepoKey struct {
@@ -30,11 +31,33 @@ type RepoKey struct {
 }
 
 func NewRepoKey(namespace, name string, repoType RepoType) (RepoKey, error) {
-	key := RepoKey{Namespace: Namespace(namespace), Name: RepoName(name), Type: repoType}
+	parsedNamespace, err := ParseNamespace(namespace)
+	if err != nil {
+		return RepoKey{}, err
+	}
+	parsedName, err := ParseRepoName(name)
+	if err != nil {
+		return RepoKey{}, err
+	}
+	key := RepoKey{Namespace: parsedNamespace, Name: parsedName, Type: repoType}
 	if err := ValidateRepoKey(key); err != nil {
 		return RepoKey{}, err
 	}
 	return key, nil
+}
+
+func ParseNamespace(value string) (Namespace, error) {
+	if err := validateRepoComponent("namespace", value, MaxNamespaceRunes); err != nil {
+		return "", err
+	}
+	return Namespace(value), nil
+}
+
+func ParseRepoName(value string) (RepoName, error) {
+	if err := validateRepoComponent("repository name", value, MaxRepoNameRunes); err != nil {
+		return "", err
+	}
+	return RepoName(value), nil
 }
 
 func ValidateRepoKey(key RepoKey) error {

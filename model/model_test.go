@@ -77,6 +77,21 @@ func TestRepoKeyValidation(t *testing.T) {
 	if err := ValidateRepoKey(upper); err != nil || upper == lower {
 		t.Fatalf("case-sensitive keys = %#v/%#v, %v", upper, lower, err)
 	}
+	if _, err := NewRepoKey("../bad", "model", RepoTypeModel); err == nil {
+		t.Fatal("NewRepoKey accepted invalid namespace")
+	}
+	if _, err := NewRepoKey("team", "../bad", RepoTypeModel); err == nil {
+		t.Fatal("NewRepoKey accepted invalid name")
+	}
+	if _, err := NewRepoKey("team", "model", "dataset"); err == nil {
+		t.Fatal("NewRepoKey accepted unsupported type")
+	}
+	if _, err := ParseNamespace("../bad"); err == nil {
+		t.Fatal("ParseNamespace accepted invalid value")
+	}
+	if _, err := ParseRepoName("../bad"); err == nil {
+		t.Fatal("ParseRepoName accepted invalid value")
+	}
 }
 
 func TestOIDAndRevisionParsing(t *testing.T) {
@@ -104,6 +119,32 @@ func TestOIDAndRevisionParsing(t *testing.T) {
 	if ref, err := ParseRefName(upperOIDLike); err != nil || string(ref) != upperOIDLike {
 		t.Fatalf("distinguishable uppercase ref = %q, %v", ref, err)
 	}
+	fromOID, err := RevisionFromOID(oid)
+	if err != nil || fromOID.String() != oid.String() {
+		t.Fatalf("RevisionFromOID = %q, %v", fromOID, err)
+	}
+	if _, ok := fromOID.Ref(); ok {
+		t.Fatal("OID revision exposed ref")
+	}
+	if _, err := RevisionFromOID(OID{}); err == nil {
+		t.Fatal("RevisionFromOID accepted zero")
+	}
+	fromRef, err := RevisionFromRef("main")
+	if err != nil || fromRef.String() != "main" {
+		t.Fatalf("RevisionFromRef = %q, %v", fromRef, err)
+	}
+	if _, ok := fromRef.OID(); ok {
+		t.Fatal("ref revision exposed OID")
+	}
+	if _, err := RevisionFromRef("../bad"); err == nil {
+		t.Fatal("RevisionFromRef accepted invalid ref")
+	}
+	if (Revision{}).String() != "" {
+		t.Fatal("zero revision has nonempty text")
+	}
+	if _, err := ParseRevision("../bad"); err == nil {
+		t.Fatal("ParseRevision accepted invalid revision")
+	}
 }
 
 func TestPathAndRefValidation(t *testing.T) {
@@ -125,6 +166,16 @@ func TestPathAndRefValidation(t *testing.T) {
 	for _, invalid := range []string{"", "/main", "main/", "a//b", "a..b", "@", "a.lock", "a/@{b", "a b", "a~b", ".hidden/main", "a\ufeffb"} {
 		if _, err := ParseRefName(invalid); err == nil {
 			t.Fatalf("invalid ref %q accepted", invalid)
+		}
+	}
+	for _, valid := range []string{"", "token", "tokenizer/"} {
+		if prefix, err := ParseFilePrefix(valid); err != nil || string(prefix) != valid {
+			t.Fatalf("valid prefix %q = %q, %v", valid, prefix, err)
+		}
+	}
+	for _, invalid := range []string{"/", "tokenizer//", "../models", "a\\b"} {
+		if _, err := ParseFilePrefix(invalid); err == nil {
+			t.Fatalf("invalid prefix %q accepted", invalid)
 		}
 	}
 }
@@ -203,6 +254,26 @@ func TestCanonicalSnapshotAndFingerprint(t *testing.T) {
 	if err != nil || otherOID != digest {
 		t.Fatalf("OID affected immutable digest = %x, %v", otherOID, err)
 	}
+	parent := testOID(t, 9)
+	withParent := snapshot
+	withParent.Parent = &parent
+	withParent.OID = testOID(t, 10)
+	info := withParent.Info()
+	if info.Parent == nil || *info.Parent != parent || info.FileCount != 2 {
+		t.Fatalf("snapshot info = %#v", info)
+	}
+	parent = testOID(t, 11)
+	if *info.Parent == parent {
+		t.Fatal("snapshot info aliases parent")
+	}
+	emptyRef, err := NewXetFileRef(xethash.Zero, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withParent.Files = []FileEntry{{Path: "empty", Ref: emptyRef}}
+	if _, err := FingerprintSnapshot(withParent); err != nil {
+		t.Fatalf("fingerprint parent and absent SHA: %v", err)
+	}
 }
 
 func TestCanonicalSnapshotRejectsInvalidAndClones(t *testing.T) {
@@ -213,17 +284,27 @@ func TestCanonicalSnapshotRejectsInvalidAndClones(t *testing.T) {
 		t.Fatal("duplicate path accepted")
 	}
 	for name, mutate := range map[string]func(*Snapshot){
+		"invalid repo":    func(value *Snapshot) { value.Repo.Name = "../bad" },
 		"zero OID":        func(value *Snapshot) { value.OID = OID{} },
 		"self parent":     func(value *Snapshot) { value.Parent = &value.OID },
+		"zero parent":     func(value *Snapshot) { value.Parent = &OID{} },
 		"zero time":       func(value *Snapshot) { value.CreatedAt = time.Time{} },
+		"overflow time":   func(value *Snapshot) { value.CreatedAt = time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC) },
 		"missing author":  func(value *Snapshot) { value.Author.Name = "" },
+		"bad email":       func(value *Snapshot) { value.Author.Email = "a\nb" },
 		"missing message": func(value *Snapshot) { value.Message = "" },
+		"invalid message": func(value *Snapshot) { value.Message = string([]byte{0xff}) },
+		"long message":    func(value *Snapshot) { value.Message = strings.Repeat("a", MaxMessageBytes+1) },
+		"invalid path":    func(value *Snapshot) { value.Files[0].Path = "../bad" },
 		"zero ref":        func(value *Snapshot) { value.Files[0].Ref = FileRef{} },
 		"negative blob": func(value *Snapshot) {
 			value.Files[1].Ref.size = -1
 		},
 		"zero Xet": func(value *Snapshot) {
 			value.Files[0].Ref.xetHash = xethash.Zero
+		},
+		"blob with Xet hash": func(value *Snapshot) {
+			value.Files[1].Ref.xetHash = xethash.Chunk([]byte("invalid"))
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -285,6 +366,9 @@ func TestRepositoryAndRefValidation(t *testing.T) {
 	if _, err := CanonicalRepository(Repository{Key: repository.Key}); err == nil {
 		t.Fatal("repository with zero creation time accepted")
 	}
+	if _, err := CanonicalRepository(Repository{Key: RepoKey{}, CreatedAt: time.Unix(1, 0)}); err == nil {
+		t.Fatal("repository with invalid key accepted")
+	}
 	ref := Ref{Repo: repository.Key, Name: "main", OID: testOID(t, 4)}
 	if err := ValidateRef(ref); err != nil {
 		t.Fatalf("valid ref: %v", err)
@@ -292,5 +376,15 @@ func TestRepositoryAndRefValidation(t *testing.T) {
 	ref.OID = OID{}
 	if err := ValidateRef(ref); err == nil {
 		t.Fatal("ref with zero OID accepted")
+	}
+	ref.OID = testOID(t, 5)
+	ref.Name = "../bad"
+	if err := ValidateRef(ref); err == nil {
+		t.Fatal("ref with invalid name accepted")
+	}
+	ref.Name = "main"
+	ref.Repo = RepoKey{}
+	if err := ValidateRef(ref); err == nil {
+		t.Fatal("ref with invalid repository accepted")
 	}
 }

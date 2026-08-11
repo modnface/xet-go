@@ -11,6 +11,11 @@ import (
 
 const snapshotFingerprintDomain = "xet-go-snapshot-v1\x00"
 
+// SnapshotFingerprintVersion identifies the canonical equality encoding used
+// by FingerprintSnapshot. Durable catalogs must persist this version with a
+// retained fingerprint.
+const SnapshotFingerprintVersion = 1
+
 // CanonicalSnapshot validates and deep-clones a complete snapshot, ordering
 // files by canonical UTF-8 path bytes. It does not derive or reinterpret OID.
 func CanonicalSnapshot(snapshot Snapshot) (Snapshot, error) {

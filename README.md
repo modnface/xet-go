@@ -14,6 +14,11 @@ signing, and authorization. The independent `model` package defines validated
 repository keys, opaque commit OIDs, refs, immutable complete snapshots, and
 ordinary or Xet-backed file references for higher-level catalogs. It does not
 invent Hugging Face/Git commit hashing or import persistence and HTTP policy.
+The `catalog` contract and `catalog/memory` reference implementation add
+repository-scoped revision/file lookup, atomic immutable-snapshot publication,
+compare-and-swap refs, and snapshot-bound bounded pagination. A trusted
+control-plane adapter allocates an opaque OID before publication; the catalog
+does not derive one from its versioned internal equality fingerprint.
 
 The implementation is verified against official `huggingface/xet-core` 1.6.0
 commit `de71453d952bd8b806edaa997c72313051a49050` and the checksummed official

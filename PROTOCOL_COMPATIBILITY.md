@@ -38,6 +38,7 @@
 | Physical payload audit | Bounded, sequential exact reads of physical Xorbs and shards with canonical durable-form and key-identity verification; no namespace reachability, repair, retention, or deletion authority |
 | Global Xorb-index repair | Bounded exact reconciliation of missing global layout metadata from canonical complete-Xorb payloads; no shard/scoped-index inference, payload mutation, reachability, retention, or deletion authority |
 | Model domain | Hosting-neutral, case-sensitive repository keys; strict NFC paths/refs; opaque server-assigned 40-lowercase-hex commit OIDs; immutable complete snapshots; and ordinary/Xet file references. No compatible commit-OID derivation or Hub DTO claim |
+| Memory catalog | Repository-scoped immutable snapshots and files; atomic target-state-idempotent ref publication; first-publication `main`; bounded operation-bound repository/snapshot/file cursors; file continuations pinned to an immutable snapshot OID; no durable-backend or Hub-control-plane claim |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
 | Credential refresh | Refresh 30 seconds before expiry, coalesce concurrent refresh, and retry exactly once after a 401 invalidation |
