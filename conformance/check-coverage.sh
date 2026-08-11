@@ -6,7 +6,16 @@ readonly MINIMUM="${XET_COVERAGE_MIN:-95.0}"
 readonly PROFILE="${1:-${ROOT_DIR}/coverage.out}"
 
 cd "${ROOT_DIR}"
-go test -covermode=atomic -coverprofile="${PROFILE}" ./...
+packages=(./...)
+if [[ "${XET_POSTGRES_INTEGRATION:-}" != "1" ]]; then
+  if [[ "${CI:-}" == "true" ]]; then
+    printf 'coverage gate: PostgreSQL integration is required in CI\n' >&2
+    exit 1
+  fi
+  mapfile -t packages < <(go list ./... | grep -v '/xetcas/server/postgresstore$')
+  printf 'core-only coverage gate: PostgreSQL adapter excluded; set XET_POSTGRES_INTEGRATION=1 and XET_POSTGRES_DSN for the complete aggregate\n'
+fi
+go test -covermode=atomic -coverprofile="${PROFILE}" "${packages[@]}"
 
 coverage="$(go tool cover -func="${PROFILE}" | awk '/^total:/ {gsub(/%/, "", $3); print $3}')"
 if [[ -z "${coverage}" ]]; then

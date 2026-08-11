@@ -33,8 +33,10 @@ go get github.com/jmwoliver/xet-go
 ```
 
 The release library has no C or Rust dependency. Its direct dependencies are
-pure-Go BLAKE3, LZ4, compressed-response codecs, pure-Go SQLite, and the Go
-platform syscall package used for strict local-filesystem locking.
+pure-Go BLAKE3, LZ4, compressed-response codecs, SQLite, PostgreSQL, and S3
+clients, plus the Go platform syscall package used for strict local-filesystem
+locking. Cloud and SQL dependencies remain isolated in their backend packages;
+the primitives and standalone client do not import them.
 
 ## Connect to Xet CAS
 
@@ -274,6 +276,59 @@ go test -run TestS3CompatibleIntegration ./xetcas/server/s3store
 The bucket must already exist. `XET_S3_REGION` defaults to `us-east-1`; set
 `XET_S3_PATH_STYLE=false` for providers requiring virtual-hosted bucket URLs.
 
+For durable remote CAS metadata, pair the S3 blob adapter with
+`xetcas/server/postgresstore`. `Open` owns its connection pool; `New` accepts a
+caller-owned pool and leaves it open on `Close`:
+
+```go
+pool, err := pgxpool.New(ctx, os.Getenv("XET_POSTGRES_DSN"))
+if err != nil {
+	return err
+}
+defer pool.Close()
+
+index, err := postgresstore.New(ctx, pool, postgresstore.Options{
+	Schema: "xet_cas",
+})
+if err != nil {
+	return err
+}
+cas, err := server.New(server.Options{
+	Blobs: blobs, Index: index,
+	Authorizer: authorizer, Signer: blobs,
+	DedupProtectionKey: protectionKey,
+})
+```
+
+The adapter implements `IndexStore`, `IndexLister`, `ProtectionStore`, and
+`ProtectionExpiryStore`; it stores no payload bytes. It uses a private,
+explicitly qualified schema without changing `search_path`. Construction takes
+a schema-specific transaction advisory lock, applies versioned migrations, and
+rejects a database schema newer than the library. Xorb metadata is global
+inside that schema. Shard registrations, files, dedup records, SHA
+associations, stages, and leases are namespace-scoped. `PublishShard` sorts
+logical keys into a stable lock order and commits all records in one
+transaction, preventing partial visibility and opposite-order deadlocks.
+Protection timestamps remain nanosecond-exact signed integers; renewals only
+extend them and expired cleanup uses an atomic compare-and-delete.
+
+The opt-in PostgreSQL integration suite requires a pre-existing database and a
+principal allowed to create and drop private test schemas:
+
+```sh
+XET_POSTGRES_INTEGRATION=1 \
+XET_POSTGRES_DSN='postgres://xet@127.0.0.1:5432/postgres?sslmode=disable' \
+go test -race -run TestPostgreSQLIntegration ./xetcas/server/postgresstore
+```
+
+It covers namespace isolation, immutable conflict handling, transactional
+rollback, independent-pool restart visibility, concurrent publication and
+migration, bounded scoped/global pagination, nanosecond expiry, stale cleanup
+versus renewal, retained corruption detection, and pool ownership. PostgreSQL
+and S3 still cannot share a transaction: CAS publication relies on immutable
+object writes followed by protected atomic index publication, and ambiguous or
+failed index publication retains its durable stage for reconciliation.
+
 When the index implements `ProtectionStore`, the service durably stages each
 Xorb or shard before writing its immutable blob, renews that stage throughout a
 slow publication, and removes it only after logical index publication. A failed
@@ -424,10 +479,15 @@ go test ./...
 go test -race ./...
 go vet ./...
 golangci-lint run ./...
-./conformance/check-coverage.sh
+./conformance/check-coverage.sh # core-only unless PostgreSQL integration is configured
 ./conformance/fuzz-smoke.sh
 ./conformance/cross-compile.sh
 ```
+
+The required Linux CI job provisions PostgreSQL 15 and sets
+`XET_POSTGRES_INTEGRATION=1` plus `XET_POSTGRES_DSN`, so its race and coverage
+gates execute the real adapter suite and enforce the complete 95% aggregate.
+The coverage script refuses a PostgreSQL-free run when `CI=true`.
 
 Run every pinned official reference, Rust differential, and Rust local-CAS gate
 with Rust 1.95.0 installed:

@@ -103,10 +103,16 @@ the recorded matrix, profile analysis, and realistic remaining gap.
 The local release gates are:
 
 ```sh
-./conformance/check-coverage.sh   # 95% aggregate statement floor
+./conformance/check-coverage.sh   # 95% core-only floor without PostgreSQL
 ./conformance/fuzz-smoke.sh       # all 11 fuzz targets; XET_FUZZ_TIME overrides 2s
 ./conformance/cross-compile.sh    # seven supported GOOS/GOARCH targets
 ```
+
+The required Linux CI gate provisions PostgreSQL 15 and runs race detection
+and the 95% complete aggregate with `XET_POSTGRES_INTEGRATION=1`. To reproduce
+that complete coverage gate locally, also set `XET_POSTGRES_DSN` to a database
+whose principal may create and drop private test schemas. The coverage script
+fails rather than silently excluding PostgreSQL when `CI=true`.
 
 See [../CONFORMANCE.md](../CONFORMANCE.md) for the requirement-to-test matrix
 and exactness boundary.

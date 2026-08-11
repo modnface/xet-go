@@ -33,6 +33,7 @@
 | Typed reconstruction | `Service.OpenFile` streams full files or ranges directly from global physical Xorbs reached through a namespace-scoped file recipe, with chunk/length validation, optional whole-file SHA-256, backpressure, cancellation, and deterministic closure |
 | Local durable storage | Linux/macOS immutable filesystem blobs plus a pure-Go SQLite WAL index; strict file/directory barriers, process-root locking, restart persistence, transactional shard-index publication, and schema-v4 lifecycle and shard-registration metadata |
 | S3-compatible CAS bytes | Isolated AWS SDK v2 adapter with versioned canonical keys, exact-length spooling, conditional immutable publication plus byte-identical collision verification, strict range metadata, bounded lexical inventory, and SigV4 URLs bound to one exact range |
+| PostgreSQL CAS metadata | Isolated pgx adapter with versioned private-schema migrations, global Xorb metadata, namespace-scoped logical indexes/protections, transactional shard publication, stable lock ordering, nanosecond expiry, and bounded keyset inventory |
 | Administrative audit | Bounded, weakly consistent, read-only forward metadata checks across blob/index/protection inventories; no tenant authorization, payload hashing, catalog reachability, repair, or deletion authority |
 | Physical payload audit | Bounded, sequential exact reads of physical Xorbs and shards with canonical durable-form and key-identity verification; no namespace reachability, repair, retention, or deletion authority |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
@@ -194,6 +195,21 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
   `HEAD`, `GET` range metadata, inventory, and fetching the presigned range.
   The adapter uses single-object `PutObject`; multipart publication has not
   been implemented or claimed.
+- `xetcas/server/postgresstore` implements the remote index, iteration, stage,
+  lease, and expiry contracts over PostgreSQL. Every table is explicitly
+  schema-qualified; construction serializes versioned migrations with a
+  schema-specific transaction advisory lock and rejects newer schemas. Xorb
+  layout metadata is global within the private schema, while shard
+  registrations, file recipes, dedup records, SHA associations, stages, and
+  leases are namespace-scoped. Shard publication clones and sorts caller input
+  into a stable lock order, validates retained records, and atomically commits
+  all logical metadata. Protection times are signed Unix nanoseconds rather
+  than lossy PostgreSQL timestamps. Bounded cursors are canonical and bound to
+  operation, scope, mode, and expiry cutoff. An opt-in real PostgreSQL 15 suite
+  proves independent-pool restart visibility, migration serialization,
+  opposite-order and conflicting concurrent publication, transactional
+  rollback, scoped/global continuation, retained-corruption detection,
+  nanosecond expiry, renewal/deletion races, and caller/adapter pool ownership.
 
 Strict directory durability is currently implemented only on Linux and macOS.
 Other platforms return `ErrDurabilityUnsupported` before changing the requested
@@ -210,7 +226,5 @@ Remaining production storage boundaries are:
 3. repair, resumable mark-and-sweep, and guarded garbage collection built on
    the current bounded metadata and physical-payload audits plus explicit root
    primitives;
-4. PostgreSQL migrations and an index/protection implementation with the same
-   atomic and namespace-scoped contract as SQLite; and
-5. MinIO/PostgreSQL multi-process, restart, and fault-injection evidence for the
-   remote profile.
+4. MinIO/PostgreSQL combined multi-process and cross-backend publication
+   fault-injection evidence for the remote profile.

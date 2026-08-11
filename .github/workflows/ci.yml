@@ -25,6 +25,23 @@ jobs:
 
   quality:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: xet
+          POSTGRES_PASSWORD: xet
+          POSTGRES_DB: xet
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U xet -d xet"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      XET_POSTGRES_INTEGRATION: '1'
+      XET_POSTGRES_DSN: postgres://xet:xet@127.0.0.1:5432/xet?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
