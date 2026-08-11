@@ -43,6 +43,7 @@
 | PostgreSQL model catalog | The same contract on versioned private-schema migrations; UTF-8 server/client enforcement; explicit `C`-collated key ordering; per-repository serialization across independent pools; atomic, target-state-idempotent snapshot/file/ref publication; exact nanosecond timestamps; strict retained-schema/row validation; and operation-bound keyset cursors. No Hub-control-plane or compatible commit-OID claim |
 | Ordinary content | CAS-independent SHA-256-plus-length identities; exact verified immutable uploads; idempotent memory, Linux/macOS filesystem, and S3-compatible publication; full/hash-verified and half-open range streams; cancellation and typed errors. Filesystem publication uses same-directory temp, file-sync, hard-link, and full ancestor-directory barriers. S3 publication uses verified local spooling, `If-None-Match: *`, exact collision comparison, required-only SDK checksums, and strict response-range metadata; no multipart, cache, listing, deletion, or repository authorization claim |
 | Model-bucket façade | Hosting-neutral catalog delegation and one typed full/range file-open API over ordinary blobs and Xet reconstruction; repository keys derive opaque logical CAS namespaces, callers cannot choose a raw scope, optional SHA metadata remains optional, and local filesystem + SQLite restart tests retain old revisions while denying cross-repository hash reachability. No Hub authentication, compatible HTTP DTO, or commit-hash claim |
+| Scoped CAS credentials | Hosting-neutral separation of Hub authentication, repository authorization, and CAS bearer verification; HMAC-SHA256 credentials bind subject, exact audience, derived repository namespace, read/write permissions, whole-second validity, key ID, and random token ID. Strict bounded parsing rejects unknown, duplicate, case-folded, malformed, or noncanonical fields. Write scope includes the namespace-scoped dedup query required by official uploads but excludes file/Xorb reads. This private opaque-bearer format is not a hosted-token wire-parity claim and is replayable until expiry. |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
 | Credential refresh | Refresh 30 seconds before expiry, coalesce concurrent refresh, and retry exactly once after a 401 invalidation |
@@ -88,6 +89,14 @@ Compatibility is continuously checked by the requirement matrix in
   not authorization. `Authorizer.Authorize` runs before every externally
   reachable file, xorb, dedup, and shard operation and must enforce the
   credential's repository/storage reachability.
+- The scoped token broker accepts a validated repository key rather than a raw
+  namespace, runs Hub authentication and repository policy separately, and
+  derives exactly the same injective scope as trusted `bucket.OpenFile` reads.
+  A read token cannot upload; a write token can perform only Xorb/shard writes
+  plus the namespace-scoped dedup query required by the pinned Rust uploader.
+  Unknown operations fail closed. Tokens use an exact configured audience and
+  bounded expiry; as ordinary bearer credentials they remain replayable until
+  expiry and are not represented as one-time or sender-constrained credentials.
 - `Grant.Namespace` scopes file recipes, dedup records, and `(SHA-256, size) ->
   Xet file` associations. All file, reconstruction, chunk-hash, and dedup reads
   resolve those scoped records before they can reach global physical objects.

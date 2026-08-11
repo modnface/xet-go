@@ -4,12 +4,12 @@ package bucket
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 
+	"github.com/jmwoliver/xet-go/auth"
 	"github.com/jmwoliver/xet-go/catalog"
 	"github.com/jmwoliver/xet-go/content"
 	"github.com/jmwoliver/xet-go/model"
@@ -62,11 +62,11 @@ func New(options Options) (*Service, error) {
 // one repository. CAS token issuance and trusted bucket reads must use this
 // same mapping. The encoding is traversal-free and injective for valid keys.
 func RepositoryNamespace(repo model.RepoKey) (string, error) {
-	if err := model.ValidateRepoKey(repo); err != nil {
-		return "", fmt.Errorf("%w: %v", ErrInvalid, err)
+	namespace, err := auth.RepositoryNamespace(repo)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", ErrInvalid, err)
 	}
-	payload := string(repo.Type) + "\x00" + string(repo.Namespace) + "\x00" + string(repo.Name)
-	return "repo-v1-" + base64.RawURLEncoding.EncodeToString([]byte(payload)), nil
+	return namespace, nil
 }
 
 func (service *Service) CreateRepository(ctx context.Context, repository model.Repository) error {

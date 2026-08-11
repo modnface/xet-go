@@ -104,7 +104,7 @@ The local release gates are:
 
 ```sh
 ./conformance/check-coverage.sh   # 95% core-only floor without PostgreSQL
-./conformance/fuzz-smoke.sh       # all 11 fuzz targets; XET_FUZZ_TIME overrides 2s
+./conformance/fuzz-smoke.sh       # all 12 fuzz targets; XET_FUZZ_TIME overrides 2s
 ./conformance/cross-compile.sh    # seven supported GOOS/GOARCH targets
 ```
 

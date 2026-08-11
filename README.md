@@ -58,6 +58,11 @@ half-open ranges, stable entity tags, cancellation, and typed backend errors.
 The local filesystem + SQLite profile is restart-tested with old-revision Xet
 reads and durable cross-repository namespace isolation. Authentication and
 Hugging Face-compatible HTTP translation remain separate higher boundaries.
+The independent `auth` package supplies hosting-neutral contracts for
+pluggable Hub credential authentication, separate repository authorization,
+canonical repository-to-CAS scope exchange, and short-lived HMAC-SHA256 CAS
+bearer credentials. It does not define Hub HTTP routes or a hosted-provider
+token format.
 
 The implementation is verified against official `huggingface/xet-core` 1.6.0
 commit `de71453d952bd8b806edaa997c72313051a49050` and the checksummed official
@@ -124,6 +129,55 @@ fresh read or write credential with `ExpiresAt`; concurrent refreshes are
 coalesced, refresh starts 30 seconds early by default, and a CAS 401 calls
 `Invalidate` and retries once. The provider owns all host-specific token
 exchange policy.
+
+## Issue repository-scoped CAS credentials
+
+Hub authentication, repository policy, and CAS authorization are deliberately
+separate. A control plane can compose them without passing the Hub credential
+to the CAS server:
+
+```go
+tokens, err := auth.NewCASTokenManager(auth.CASTokenManagerOptions{
+	Issuer:     "miniface",
+	Audience:   "https://cas.example",
+	SigningKey: auth.HMACKey{ID: "2026-08", Secret: casSigningKey},
+	DefaultTTL: 5 * time.Minute,
+	MaximumTTL: 15 * time.Minute,
+})
+if err != nil {
+	return err
+}
+broker, err := auth.NewBroker(auth.BrokerOptions{
+	Authenticator: hubAuthenticator,
+	Authorizer:    repositoryPolicy,
+	Tokens:        tokens,
+})
+if err != nil {
+	return err
+}
+casAuthorizer := auth.CASAuthorizer{Verifier: tokens}
+```
+
+`Broker.IssueCASToken` accepts a validated `model.RepoKey`, never an arbitrary
+storage namespace. It authenticates the Hub credential, separately authorizes
+each requested read/write permission, and issues a credential containing the
+subject, exact opaque audience, derived namespace, permissions, issue/not-before
+times, expiration, key ID, and random token ID. Read credentials cannot upload;
+write credentials can upload Xorbs and shards and perform the namespace-scoped
+dedup lookup used by the pinned official Rust upload flow, but cannot read files
+or Xorbs. Unknown CAS operations fail closed.
+
+The compact credential is a private hosting-neutral format, not a claim of
+wire parity with any hosted token issuer; official Rust treats the bearer as
+opaque. Keys must contain at least 32 random bytes. Verification keys support
+rotation and are defensively copied. Because HMAC verifiers can also mint
+credentials, deploy them only inside the signing trust boundary; use an
+asymmetric issuer before placing verifiers outside that boundary. The bearer is
+reusable and therefore replayable until expiration. Use TLS, short TTLs, exact
+audiences, least privilege, key retirement, and audit the token ID rather than
+the credential. One-time consumption is intentionally not offered because one
+official upload reuses a token across concurrent dedup, Xorb, shard, and retry
+requests.
 
 The high-level engine uses bounded upload/download worker pools. The transport
 also has separate adaptive stream controllers, starting at 2 uploads and 4
@@ -595,6 +649,7 @@ read resolves one of those scoped records before reaching physical content.
 | `content/memory` | Concurrent ephemeral ordinary-content storage and reference semantics |
 | `content/filesystem` | Linux/macOS crash-consistent immutable ordinary-content publication and streaming |
 | `content/s3` | S3-compatible conditionally immutable ordinary-content publication and verified full/range streaming |
+| `auth` | Pluggable Hub identity/policy contracts and scoped short-lived CAS bearer credentials |
 | `bucket` | Hosting-neutral repository façade and uniform ordinary/Xet file streaming with derived CAS namespace isolation |
 | `chunker` | Streaming official GearHash content-defined chunking |
 | `xethash` | Canonical hashes, BLAKE3 domains, Merkle aggregation, and compact subtrees |

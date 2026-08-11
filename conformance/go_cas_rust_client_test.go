@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jmwoliver/xet-go/auth"
 	"github.com/jmwoliver/xet-go/chunker"
 	"github.com/jmwoliver/xet-go/xetcas"
 	cas_server "github.com/jmwoliver/xet-go/xetcas/server"
@@ -89,6 +90,21 @@ func TestOfficialRustClientGoCASRoundTrip(t *testing.T) {
 		_, _ = w.Write(body)
 	}))
 	defer storage.Close()
+	tokenManager, err := auth.NewCASTokenManager(auth.CASTokenManagerOptions{
+		Issuer: "xet-go-conformance", Audience: "official-rust-client",
+		SigningKey: auth.HMACKey{ID: "test-key", Secret: bytes.Repeat([]byte{0xa5}, 32)},
+		Now:        func() time.Time { return time.Unix(2_000_000_000, 0) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuedToken, err := tokenManager.IssueCASToken(context.Background(), auth.CASTokenRequest{
+		Principal: auth.Principal{Subject: "official-rust-client"}, Namespace: "rust-client",
+		Permissions: auth.CASRead | auth.CASWrite,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	service, err := cas_server.New(cas_server.Options{
 		Blobs: store,
@@ -99,7 +115,7 @@ func TestOfficialRustClientGoCASRoundTrip(t *testing.T) {
 				ExpiresAt: time.Unix(2_000_003_600, 0),
 			}, nil
 		}),
-		Authorizer:         cas_server.StaticTokenAuthorizer{Token: "official-rust-token", Namespace: "rust-client"},
+		Authorizer:         auth.CASAuthorizer{Verifier: tokenManager},
 		DedupProtectionKey: xethash.Chunk([]byte("official Rust client test key")),
 		Now:                func() time.Time { return time.Unix(2_000_000_000, 0) },
 	})
@@ -143,14 +159,14 @@ func TestOfficialRustClientGoCASRoundTrip(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, oracle, "remote-roundtrip", input, cas.URL, "official-rust-token", output)
+	command := exec.CommandContext(ctx, oracle, "remote-roundtrip", input, cas.URL, issuedToken.Value, output)
 	command.Env = append(os.Environ(), "HF_XET_CACHE="+filepath.Join(temporary, "cache"))
 	raw, err := command.CombinedOutput()
 	if err != nil {
 		captured.Lock()
 		shardBody := append([]byte(nil), captured.shard...)
 		captured.Unlock()
-		_, validationErr := service.UploadShard(context.Background(), "official-rust-token", bytes.NewReader(shardBody), int64(len(shardBody)))
+		_, validationErr := service.UploadShard(context.Background(), issuedToken.Value, bytes.NewReader(shardBody), int64(len(shardBody)))
 		t.Fatalf("official Rust client: %v; Go shard validation: %v\n%s", err, validationErr, raw)
 	}
 	var result rustRemoteRoundtrip
@@ -189,7 +205,7 @@ func TestOfficialRustClientGoCASRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	secondOutput := filepath.Join(temporary, "output-dedup.bin")
-	second := exec.CommandContext(ctx, oracle, "remote-roundtrip", secondInput, cas.URL, "official-rust-token", secondOutput)
+	second := exec.CommandContext(ctx, oracle, "remote-roundtrip", secondInput, cas.URL, issuedToken.Value, secondOutput)
 	second.Env = append(os.Environ(), "HF_XET_CACHE="+filepath.Join(temporary, "cache-dedup"))
 	secondRaw, err := second.CombinedOutput()
 	if err != nil {

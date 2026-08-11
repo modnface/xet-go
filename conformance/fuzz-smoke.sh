@@ -6,6 +6,7 @@ readonly FUZZ_TIME="${XET_FUZZ_TIME:-2s}"
 
 readonly TARGETS=(
   './:FuzzUploadDownload'
+  './auth:FuzzCASTokenVerify'
   './chunker:FuzzReaderSegmentation'
   './xethash:FuzzHashTextRoundTrip'
   './xethash:FuzzSubtreeMerge'
