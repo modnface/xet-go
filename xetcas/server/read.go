@@ -62,7 +62,7 @@ func (s *Service) validateRecipeWork(ctx context.Context, file shard.RegisteredF
 			}
 		}
 		if term.End < term.Start {
-			return errors.New("xet CAS server: stored reconstruction has a reversed chunk range")
+			return fmt.Errorf("%w: stored reconstruction has a reversed chunk range", ErrCorrupt)
 		}
 		count := uint64(term.End - term.Start)
 		if math.MaxUint64-references < count || references+count > s.registration.MaxChunkReferences {

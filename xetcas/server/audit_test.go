@@ -381,8 +381,8 @@ func TestValidateRecipeWorkRejectsAmplifiedAndMalformedRecipes(t *testing.T) {
 	if err := service.validateRecipeWork(context.Background(), shard.RegisteredFile{File: shard.File{Terms: []shard.Term{{}, {}}}}); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("term limit error = %v", err)
 	}
-	if err := service.validateRecipeWork(context.Background(), shard.RegisteredFile{File: shard.File{Terms: []shard.Term{{Start: 2, End: 1}}}}); err == nil {
-		t.Fatal("reversed stored range succeeded")
+	if err := service.validateRecipeWork(context.Background(), shard.RegisteredFile{File: shard.File{Terms: []shard.Term{{Start: 2, End: 1}}}}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("reversed stored range = %v", err)
 	}
 	if err := service.validateRecipeWork(context.Background(), shard.RegisteredFile{File: shard.File{Terms: []shard.Term{{Start: 0, End: 3}}}}); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("chunk reference limit error = %v", err)
