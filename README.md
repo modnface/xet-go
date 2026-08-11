@@ -85,6 +85,15 @@ Git LFS metadata or claim compatible Git object IDs. Repository creation,
 preupload, commit/write routes, and hosted write-error behavior remain absent
 until pinned authenticated traffic is available.
 
+The `bucket/hosted` package is the embeddable application composition boundary.
+Its constructor accepts one catalog, ordinary-content store, CAS blob/index
+bundle, repository policy, and coherent CAS token authority; it installs the
+namespace-scoped CAS authorizer rather than accepting a second policy. The
+result promotes the typed `bucket.Service` API and exposes separate
+`HubHandler` and `CASHandler` mounts. It also exposes bounded read-only CAS
+inventory and payload-audit pages. Those diagnostics do not establish catalog
+reachability or make object deletion safe.
+
 The implementation is verified against official `huggingface/xet-core` 1.6.0
 commit `de71453d952bd8b806edaa997c72313051a49050` and the checksummed official
 reference corpus. See [CONFORMANCE.md](CONFORMANCE.md),
