@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export PATH="$HOME/.local/share/go/1.25.12/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.local/share/go/1.26.5/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
 command -v go >/dev/null
 command -v cargo >/dev/null

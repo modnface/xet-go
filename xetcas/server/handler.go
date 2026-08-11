@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -266,7 +267,12 @@ func (s *Service) handleBatchReconstruction(w http.ResponseWriter, r *http.Reque
 			hashes = append(hashes, key.Hash)
 		}
 	} else {
-		values := r.URL.Query()["file_id"]
+		query, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil {
+			writeServerError(w, r, fmt.Errorf("%w: invalid batch query", ErrInvalid))
+			return
+		}
+		values := query["file_id"]
 		if len(values) > 10_000 {
 			writeServerError(w, r, fmt.Errorf("%w: batch exceeds 10000 files", ErrInvalid))
 			return

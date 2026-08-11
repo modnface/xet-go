@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly GO_VERSION="1.25.12"
+readonly GO_VERSION="1.26.5"
 readonly RUST_TOOLCHAIN="1.95.0"
 readonly GOLANGCI_LINT_VERSION="v2.12.2"
 readonly GO_ROOT="$HOME/.local/share/go/$GO_VERSION"
@@ -58,8 +58,12 @@ persist_path() {
 		cat >> "$HOME/.bash_profile" <<'EOF'
 
 # xet-go orb toolchains
-export PATH="$HOME/.local/share/go/1.25.12/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.local/share/go/1.26.5/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 EOF
+	else
+		sed -i -E \
+			's#^export PATH="\$HOME/\.local/share/go/[0-9.]+/bin:\$HOME/\.local/bin:\$HOME/\.cargo/bin:\$PATH"$#export PATH="$HOME/.local/share/go/1.26.5/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"#' \
+			"$HOME/.bash_profile"
 	fi
 	export PATH="$GO_ROOT/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 }
@@ -77,7 +81,8 @@ install_rust() {
 
 install_golangci_lint() {
 	if command -v golangci-lint >/dev/null 2>&1 && \
-		golangci-lint version 2>/dev/null | grep -Fq "${GOLANGCI_LINT_VERSION#v}"; then
+		golangci-lint version 2>/dev/null | grep -Fq "${GOLANGCI_LINT_VERSION#v}" && \
+		golangci-lint version 2>/dev/null | grep -Fq "built with go${GO_VERSION}"; then
 		return
 	fi
 	GOBIN="$HOME/.local/bin" "$GO_ROOT/bin/go" install \

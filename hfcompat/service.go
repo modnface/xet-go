@@ -315,7 +315,11 @@ var errTreeLimit = errors.New("hfcompat: tree limit exceeded")
 var errInput = errors.New("hfcompat: invalid input")
 
 func (s *Service) tree(w http.ResponseWriter, r *http.Request, rt route) {
-	query := r.URL.Query()
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		s.fail(w, r, errInput)
+		return
+	}
 	if len(query) != 2 || len(query["recursive"]) != 1 || query["recursive"][0] != "true" ||
 		len(query["expand"]) != 1 || query["expand"][0] != "false" {
 		s.fail(w, r, bucket.ErrUnsupported)

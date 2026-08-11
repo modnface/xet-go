@@ -609,6 +609,7 @@ func TestHandlerValidationStatusesAndParsers(t *testing.T) {
 		{"batch values", http.MethodPost, "/v1/reconstructions", "[] []", nil, http.StatusBadRequest},
 		{"batch prefix", http.MethodPost, "/v1/reconstructions", `[{"prefix":"bad","hash":"` + hash + `"}]`, nil, http.StatusBadRequest},
 		{"batch GET hash", http.MethodGet, "/v1/reconstructions?file_id=nope", "", nil, http.StatusBadRequest},
+		{"batch GET query escape", http.MethodGet, "/v1/reconstructions?file_id=%gh", "", nil, http.StatusBadRequest},
 		{"batch GET missing", http.MethodGet, "/v1/reconstructions?file_id=" + hash, "", nil, http.StatusOK},
 		{"batch GET empty", http.MethodGet, "/v1/reconstructions", "", nil, http.StatusOK},
 		{"dirty missing", http.MethodGet, "/v2/file-chunk-hashes/" + hash, "", nil, http.StatusBadRequest},

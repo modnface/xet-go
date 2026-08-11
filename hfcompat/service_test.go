@@ -305,6 +305,7 @@ func TestHandlerReadFailuresAndLimits(t *testing.T) {
 		{name: "missing file", method: http.MethodGet, target: "/owner/model/resolve/main/missing.json", status: 404, code: "EntryNotFound"},
 		{name: "unsupported tree default", method: http.MethodGet, target: "/api/models/owner/model/tree/main", status: 501},
 		{name: "unsupported tree duplicate", method: http.MethodGet, target: "/api/models/owner/model/tree/main?recursive=true&recursive=true&expand=false", status: 501},
+		{name: "oversized tree query", method: http.MethodGet, target: "/api/models/owner/model/tree/main?recursive=true&expand=false&" + strings.Repeat("extra=x&", 10_000), status: 400},
 		{name: "malformed range", method: http.MethodGet, target: "/owner/model/resolve/main/config.json", headers: map[string]string{"Range": "bytes=bad"}, status: 416},
 		{name: "past range", method: http.MethodGet, target: "/owner/model/resolve/main/config.json", headers: map[string]string{"Range": "bytes=99-"}, status: 416},
 		{name: "token wrong method", method: http.MethodHead, target: "/api/models/owner/model/xet-read-token/main", status: 405},

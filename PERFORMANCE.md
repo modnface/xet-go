@@ -5,6 +5,10 @@ this module with official `huggingface/xet-core` commit
 `7a267506b77b484688654c46079e3aec35394611` and explains why the previous Go
 implementation was slower and produced far more context switches.
 
+The Go 1.23 compatibility statements below describe that historical
+investigation. The module's current supported minimum is Go 1.26; the later
+security migration intentionally superseded the recorded compatibility gate.
+
 ## Outcome
 
 The recommended implementation is now the published

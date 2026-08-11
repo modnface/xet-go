@@ -53,7 +53,7 @@
 | Transport concurrency | Separate adaptive upload/download limits; official starting points 2/4 and maximum 64; fixed mode supported |
 | Download verification | Complete files verify structure, term hashes, Xet identity, size, and optional SHA-256; ranges verify all available structure but not a whole-file identity |
 | Persistent state | Content-only checksummed range/shard cache and identity-only replay journal; credentials and signed URLs are excluded |
-| Runtime | Pure Go, CGO disabled, Go 1.23 language baseline |
+| Runtime | Pure Go, CGO disabled, Go 1.26 language baseline |
 
 ## Exactness boundary
 
