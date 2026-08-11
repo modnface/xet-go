@@ -143,5 +143,22 @@ signed URL queries, and records the client/runtime versions. It is read-side
 evidence only: hosted write-policy responses, compatible commit-OID generation,
 and write-error bodies still require an authenticated sanitized capture.
 
+The `hfcompat` black-box check runs the same pinned official client against an
+in-process authenticated Go model endpoint. Its stronger `snapshot_download`
+case first uploads LZ4 Xet data through the Go client and Go CAS, then requires
+the official `hf_xet` transport to refresh a scoped read token, request a CAS
+reconstruction, and fetch a storage capability bound to the exact object range.
+The test rejects ordinary resolve-GET fallback for the Xet file and compares
+both ordinary and reconstructed bytes. The checker asserts its installed
+client versions before sending traffic:
+
+```sh
+XET_HF_CLIENT_PYTHON="$(pwd)/.cache/hf-client/bin/python" \
+  go test -race -run '^TestOfficialPythonClient' -count=1 -v ./hfcompat
+```
+
+These tests are opt-in outside CI and skip when `XET_HF_CLIENT_PYTHON` is not
+set; the transcript fixture remains the always-on sanitized wire-evidence gate.
+
 See [../CONFORMANCE.md](../CONFORMANCE.md) for the requirement-to-test matrix
 and exactness boundary.
