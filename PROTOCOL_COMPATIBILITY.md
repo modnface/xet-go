@@ -32,6 +32,7 @@
 | Server work limits | Configurable file/xorb/term/chunk-reference budgets, context-aware planners, bounded compact-gap memory, and pre-buffer ingestion admission |
 | Typed reconstruction | `Service.OpenFile` streams full files or ranges directly from global physical Xorbs reached through a namespace-scoped file recipe, with chunk/length validation, optional whole-file SHA-256, backpressure, cancellation, and deterministic closure |
 | Local durable storage | Linux/macOS immutable filesystem blobs plus a pure-Go SQLite WAL index; strict file/directory barriers, process-root locking, restart persistence, transactional shard-index publication, and schema-v4 lifecycle and shard-registration metadata |
+| S3-compatible CAS bytes | Isolated AWS SDK v2 adapter with versioned canonical keys, exact-length spooling, conditional immutable publication plus byte-identical collision verification, strict range metadata, bounded lexical inventory, and SigV4 URLs bound to one exact range |
 | Administrative audit | Bounded, weakly consistent, read-only forward metadata checks across blob/index/protection inventories; no tenant authorization, payload hashing, catalog reachability, repair, or deletion authority |
 | Physical payload audit | Bounded, sequential exact reads of physical Xorbs and shards with canonical durable-form and key-identity verification; no namespace reachability, repair, retention, or deletion authority |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
@@ -178,6 +179,21 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
   memory/SQLite, including cancellation, namespace isolation, concurrent
   publication and pagination mutation, corrupt-row detection, injected
   publication failures, close/reopen, and full reconstruction after restart.
+- `xetcas/server/s3store` implements only remote immutable physical bytes,
+  bounded physical inventory, and signed range capabilities. It centralizes a
+  versioned key layout, rejects ambiguous prefixes and object metadata, uses
+  `If-None-Match: *`, compares existing bytes before accepting an idempotent
+  collision, retries bounded S3 `409` publication races, and binds `Range` into
+  SigV4 signed headers. Its authoritative capability expiry is parsed from the
+  signed URL. Inventory requires general-purpose S3's lexical `ListObjectsV2`
+  and `StartAfter` semantics; directory buckets are unsupported. Adapter-level
+  conditionals do not replace bucket policy/Object Lock controls against
+  out-of-band mutation. A sequential real-backend opt-in suite was exercised
+  against MinIO
+  `RELEASE.2025-09-07T16-13-09Z`, including conditional retry/conflict,
+  `HEAD`, `GET` range metadata, inventory, and fetching the presigned range.
+  The adapter uses single-object `PutObject`; multipart publication has not
+  been implemented or claimed.
 
 Strict directory durability is currently implemented only on Linux and macOS.
 Other platforms return `ErrDurabilityUnsupported` before changing the requested
@@ -194,8 +210,7 @@ Remaining production storage boundaries are:
 3. repair, resumable mark-and-sweep, and guarded garbage collection built on
    the current bounded metadata and physical-payload audits plus explicit root
    primitives;
-4. S3-compatible immutable/conditional blob publication and signed range reads;
-5. PostgreSQL migrations and an index/protection implementation with the same
+4. PostgreSQL migrations and an index/protection implementation with the same
    atomic and namespace-scoped contract as SQLite; and
-6. MinIO/PostgreSQL multi-process, restart, and fault-injection evidence for the
+5. MinIO/PostgreSQL multi-process, restart, and fault-injection evidence for the
    remote profile.

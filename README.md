@@ -212,6 +212,68 @@ with their file, dedup, and SHA indexes and are available through bounded
 return `ErrDurabilityUnsupported` without modifying their target on platforms
 where strict directory durability is not implemented.
 
+For S3-compatible CAS bytes, configure an AWS SDK v2 client with the provider's
+endpoint, credentials, addressing mode, and retry policy, then wrap it with the
+isolated `xetcas/server/s3store` adapter:
+
+```go
+s3Client := s3.NewFromConfig(awsConfig, func(options *s3.Options) {
+	options.BaseEndpoint = aws.String("https://objects.example")
+	options.UsePathStyle = true // commonly required by MinIO
+})
+blobs, err := s3store.New(s3Client, s3store.Options{
+	Bucket:          "model-content",
+	Prefix:          "production/xet",
+	TempDirectory:   "/var/lib/my-service/xet-spool",
+	PresignExpiry:   15 * time.Minute,
+})
+if err != nil {
+	return err
+}
+cas, err := server.New(server.Options{
+	Blobs: blobs, Index: durableIndex,
+	Authorizer: authorizer, Signer: blobs,
+	DedupProtectionKey: protectionKey,
+})
+```
+
+The adapter implements `BlobStore`, `BlobLister`, and `RangeURLSigner`. It uses
+versioned hash-derived keys below one normalized operator-controlled prefix,
+exact-length local spooling, S3 `If-None-Match: *` publication, and a full byte
+comparison before treating a conditional collision as idempotent. Reads verify
+S3 length and `Content-Range` metadata. Presigned URLs bind the exact requested
+`Range` header; consumers must send that same header, as the Xet client does.
+Listing is bounded and lexically keyset-paginated rather than loading a bucket
+inventory. S3 stores only immutable Xorb/shard bytes: namespace-scoped file,
+dedup, SHA, stage, lease, and shard-registration truth remains in the injected
+index. The current adapter deliberately uses streaming single-object
+`PutObject`, not multipart upload, and makes no multipart claim.
+
+Inventory requires general-purpose S3 semantics: lexically ordered
+`ListObjectsV2` results plus `StartAfter` support. S3 directory buckets are not
+supported. `If-None-Match` prevents overwrites made through the adapter, but
+operators must use bucket policy, Object Lock, lifecycle controls, and scoped
+credentials as appropriate to prevent out-of-band replacement or deletion.
+Signing credentials must remain valid through `PresignExpiry`; the returned
+lease lifetime is derived from the URL's actual `X-Amz-Date` and
+`X-Amz-Expires`, not from a separate local clock.
+
+An opt-in real-backend test exercises sequential conditional writes,
+byte-identical retry, conflict detection, `HEAD`, exact ranges, inventory,
+SigV4 range signing, and cleanup against MinIO or another compatible endpoint:
+
+```bash
+XET_S3_INTEGRATION=1 \
+XET_S3_ENDPOINT=http://127.0.0.1:9000 \
+XET_S3_BUCKET=xet-go-test \
+XET_S3_ACCESS_KEY=... \
+XET_S3_SECRET_KEY=... \
+go test -run TestS3CompatibleIntegration ./xetcas/server/s3store
+```
+
+The bucket must already exist. `XET_S3_REGION` defaults to `us-east-1`; set
+`XET_S3_PATH_STYLE=false` for providers requiring virtual-hosted bucket URLs.
+
 When the index implements `ProtectionStore`, the service durably stages each
 Xorb or shard before writing its immutable blob, renews that stage throughout a
 slow publication, and removes it only after logical index publication. A failed
@@ -342,6 +404,7 @@ read resolves one of those scoped records before reaching physical content.
 | `xet` | Streaming upload, reconstruction, batches, ranges, groups, delta upload, persistent cache, and replay journal |
 | `xetcas` | Access refresh, Xet CAS v1/v2 routes, signed multipart ranges, retry, response bounds, and adaptive concurrency |
 | `xetcas/server` | Storage-neutral CAS ingestion, shard registration, reconstruction/delta planning, authorization, signed range URLs, and HTTP handlers |
+| `xetcas/server/s3store` | S3-compatible immutable Xorb/shard bytes, bounded inventory, and exact SigV4 range signing |
 | `chunker` | Streaming official GearHash content-defined chunking |
 | `xethash` | Canonical hashes, BLAKE3 domains, Merkle aggregation, and compact subtrees |
 | `xorb` | Network and complete/cache xorb codecs for none, LZ4, BG4-LZ4, and production auto selection |
