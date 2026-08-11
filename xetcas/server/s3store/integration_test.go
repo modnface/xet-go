@@ -51,6 +51,9 @@ func TestS3CompatibleIntegration(t *testing.T) {
 		options.BaseEndpoint = aws.String(endpoint)
 		options.UsePathStyle = pathStyle
 	})
+	if os.Getenv("XET_S3_CREATE_BUCKET") == "1" {
+		ensureIntegrationBucket(t, client, bucket)
+	}
 	prefix := fmt.Sprintf("xet-go-integration/%d", time.Now().UnixNano())
 	store, err := New(client, Options{
 		Bucket: bucket, Prefix: prefix, TempDirectory: t.TempDir(), PresignExpiry: time.Minute,
@@ -144,4 +147,19 @@ func requiredEnvironment(t *testing.T, name string) string {
 		t.Fatalf("%s is required when XET_S3_INTEGRATION=1", name)
 	}
 	return value
+}
+
+func ensureIntegrationBucket(t testing.TB, client *awss3.Client, bucket string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := client.HeadBucket(ctx, &awss3.HeadBucketInput{Bucket: aws.String(bucket)}); err == nil {
+		return
+	}
+	if _, err := client.CreateBucket(ctx, &awss3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		// Package tests may race to create one shared ephemeral CI bucket.
+		if _, headErr := client.HeadBucket(ctx, &awss3.HeadBucketInput{Bucket: aws.String(bucket)}); headErr != nil {
+			t.Fatal("create S3 integration bucket")
+		}
+	}
 }

@@ -210,6 +210,18 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
   opposite-order and conflicting concurrent publication, transactional
   rollback, scoped/global continuation, retained-corruption detection,
   nanosecond expiry, renewal/deletion races, and caller/adapter pool ownership.
+- The composed remote-profile suite pairs MinIO
+  `RELEASE.2025-09-07T16-13-09Z` with PostgreSQL 15 and constructs fresh S3
+  clients and PostgreSQL pools across publication restarts. It injects failure
+  before object publication, a successfully applied S3 write whose response is
+  lost, failure at the atomic shard-index publication boundary, and failures
+  both before and after an applied stage deletion. Expired-stage recovery and
+  idempotent request retry repair each ambiguous durable state without
+  rewriting payloads. The suite then verifies namespace isolation and exact
+  full/ranged reconstruction and races two separate Go processes publishing
+  the same Xorb and shard to prove cross-process immutable/idempotent behavior.
+  The required Linux race and coverage CI job runs both real backends rather
+  than silently skipping them.
 
 Strict directory durability is currently implemented only on Linux and macOS.
 Other platforms return `ErrDurabilityUnsupported` before changing the requested
@@ -225,6 +237,4 @@ Remaining production storage boundaries are:
 2. catalog reachability roots and read/maintenance epochs for destructive work;
 3. repair, resumable mark-and-sweep, and guarded garbage collection built on
    the current bounded metadata and physical-payload audits plus explicit root
-   primitives;
-4. MinIO/PostgreSQL combined multi-process and cross-backend publication
-   fault-injection evidence for the remote profile.
+   primitives.

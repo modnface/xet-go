@@ -42,12 +42,36 @@ jobs:
     env:
       XET_POSTGRES_INTEGRATION: '1'
       XET_POSTGRES_DSN: postgres://xet:xet@127.0.0.1:5432/xet?sslmode=disable
+      XET_S3_INTEGRATION: '1'
+      XET_S3_ENDPOINT: http://127.0.0.1:9000
+      XET_S3_BUCKET: xet-go-test
+      XET_S3_ACCESS_KEY: xetminio
+      XET_S3_SECRET_KEY: xetminio-secret
+      XET_S3_REGION: us-east-1
+      XET_S3_PATH_STYLE: 'true'
+      XET_S3_CREATE_BUCKET: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.12'
           cache: true
+      - name: Start pinned MinIO
+        run: |
+          docker run --detach --rm --name xet-go-minio \
+            --publish 127.0.0.1:9000:9000 \
+            --env MINIO_ROOT_USER="$XET_S3_ACCESS_KEY" \
+            --env MINIO_ROOT_PASSWORD="$XET_S3_SECRET_KEY" \
+            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data --address :9000
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/cluster >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs xet-go-minio
+          exit 1
       - run: go test -race ./...
       - run: go vet ./...
       - uses: golangci/golangci-lint-action@v9
@@ -57,6 +81,9 @@ jobs:
       - run: ./conformance/check-coverage.sh
       - run: XET_FUZZ_TIME=2s ./conformance/fuzz-smoke.sh
       - run: ./conformance/cross-compile.sh
+      - name: Stop MinIO
+        if: always()
+        run: docker rm --force xet-go-minio || true
 
   official-conformance:
     runs-on: ubuntu-latest

@@ -33,6 +33,7 @@ to differ while preserving bounded, cancelable, backoff/recovery semantics.
 | Go CAS black-box interoperability | `TestOfficialRustClientGoCASRoundTrip` | Released Rust RemoteClient upload/download through an in-process memory-backed Go server; a second Rust process with a fresh cache consumes protected Go dedup with nonzero metrics |
 | CAS HTTP server | `TestHTTPHandlerGoClientEndToEnd`, handler audit/status tests | All v1/v2 routes, exact namespace paths, signed one-range URLs without CAS credentials, bearer enforcement, limits, error mapping, and NDJSON heartbeat/terminal semantics |
 | In-process server publication recovery | service memory/fault/audit tests | Immutable xorb/SHA records, first-valid file/dedup secondary indexes, file-last visibility, alternative compressed representation repair, and idempotent replay after injected write failures |
+| Remote-profile durability | `TestS3PostgreSQLRemoteProfile`, `TestS3CompatibleIntegration`, `TestPostgreSQLIntegration` | Real MinIO+PostgreSQL stage/object/index/release fault windows, restart recovery, separate-process idempotent publication, namespace isolation, and exact full/range streaming |
 | Administrative integrity audit | `TestAuditInventory*`, `TestAuditBlobPayloads*` | Bounded metadata/forward checks remain distinct from exact canonical payload-byte and key-identity checks; cancellation withholds cursors; filesystem payload verification survives restart |
 | Reconstruction API versions | `TestQueryReconstructionV2RangeAndAuthentication`, `TestQueryReconstructionFallsBackAndPinsV1`, `TestBatchReconstructionPostThenLegacyGetFallback` | v2 preferred, explicit unsupported-route v1 fallback, normalized DTOs |
 | Shard API versions and NDJSON | `TestUploadShardV2RetriesTerminalError`, `TestUploadShardFallbackAndMissingTerminal`, `TestNDJSONStructuralFaults` | v2 progress/terminal handling, retryable errors, v1 fallback |
@@ -49,7 +50,7 @@ to differ while preserving bounded, cancelable, backoff/recovery semantics.
 | Fuzzing | `conformance/fuzz-smoke.sh` | 11 fuzz targets spanning end-to-end transfer, chunking, hashes, subtrees, codecs, multipart, compression, and cache |
 | Matched performance | `conformance/compare-performance.sh` | Alternating optimized Go/Rust samples with identity, count, scheme, and none-size preconditions |
 | Portability and purity | OS CI matrix and `conformance/cross-compile.sh` | CGO disabled; Linux amd64/arm64/386, Windows amd64/arm64, Darwin amd64/arm64 production and test compilation |
-| Release hygiene | race, vet, golangci-lint, `check-coverage.sh`, govulncheck | Race freedom, static analysis, at least 95% aggregate statement coverage, no reachable known vulnerability on patched Go |
+| Release hygiene | race, vet, golangci-lint, `check-coverage.sh`, govulncheck | Required Linux CI provisions PostgreSQL 15 and pinned MinIO, runs both real backend suites under race, enforces at least 95% complete aggregate statement coverage, and checks no reachable known vulnerability on patched Go |
 
 ## Reproduce the official gates
 

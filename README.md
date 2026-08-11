@@ -273,7 +273,8 @@ XET_S3_SECRET_KEY=... \
 go test -run TestS3CompatibleIntegration ./xetcas/server/s3store
 ```
 
-The bucket must already exist. `XET_S3_REGION` defaults to `us-east-1`; set
+The bucket must already exist unless the test is explicitly allowed to create
+it with `XET_S3_CREATE_BUCKET=1`. `XET_S3_REGION` defaults to `us-east-1`; set
 `XET_S3_PATH_STYLE=false` for providers requiring virtual-hosted bucket URLs.
 
 For durable remote CAS metadata, pair the S3 blob adapter with
@@ -328,6 +329,27 @@ versus renewal, retained corruption detection, and pool ownership. PostgreSQL
 and S3 still cannot share a transaction: CAS publication relies on immutable
 object writes followed by protected atomic index publication, and ambiguous or
 failed index publication retains its durable stage for reconciliation.
+
+With both backends available, run the composed remote-profile contract:
+
+```sh
+XET_POSTGRES_INTEGRATION=1 \
+XET_POSTGRES_DSN='postgres://xet@127.0.0.1:5432/postgres?sslmode=disable' \
+XET_S3_INTEGRATION=1 \
+XET_S3_ENDPOINT=http://127.0.0.1:9000 \
+XET_S3_BUCKET=xet-go-test \
+XET_S3_ACCESS_KEY=... \
+XET_S3_SECRET_KEY=... \
+go test -race -run TestS3PostgreSQLRemoteProfile ./xetcas/server
+```
+
+This suite injects cross-backend failure before the object write, after an S3
+write whose success response is lost, at the PostgreSQL shard-publication
+boundary, and both before and after an applied stage deletion. It closes and
+recreates both adapters between recovery passes, reconstructs exact full and
+ranged files, denies an identical file hash in another namespace, and races
+two separate Go processes publishing the same content. Required Linux CI runs
+it against PostgreSQL 15 and MinIO `RELEASE.2025-09-07T16-13-09Z`.
 
 When the index implements `ProtectionStore`, the service durably stages each
 Xorb or shard before writing its immutable blob, renews that stage throughout a
@@ -460,6 +482,7 @@ read resolves one of those scoped records before reaching physical content.
 | `xetcas` | Access refresh, Xet CAS v1/v2 routes, signed multipart ranges, retry, response bounds, and adaptive concurrency |
 | `xetcas/server` | Storage-neutral CAS ingestion, shard registration, reconstruction/delta planning, authorization, signed range URLs, and HTTP handlers |
 | `xetcas/server/s3store` | S3-compatible immutable Xorb/shard bytes, bounded inventory, and exact SigV4 range signing |
+| `xetcas/server/postgresstore` | PostgreSQL CAS indexes, transactional shard publication, protections, expiry, and bounded inventory |
 | `chunker` | Streaming official GearHash content-defined chunking |
 | `xethash` | Canonical hashes, BLAKE3 domains, Merkle aggregation, and compact subtrees |
 | `xorb` | Network and complete/cache xorb codecs for none, LZ4, BG4-LZ4, and production auto selection |
@@ -484,10 +507,10 @@ golangci-lint run ./...
 ./conformance/cross-compile.sh
 ```
 
-The required Linux CI job provisions PostgreSQL 15 and sets
-`XET_POSTGRES_INTEGRATION=1` plus `XET_POSTGRES_DSN`, so its race and coverage
-gates execute the real adapter suite and enforce the complete 95% aggregate.
-The coverage script refuses a PostgreSQL-free run when `CI=true`.
+The required Linux CI job provisions PostgreSQL 15 and pinned MinIO, sets both
+integration capability bundles, and executes the individual and composed real
+backend suites under race and coverage. It enforces the complete 95% aggregate;
+the coverage script refuses a PostgreSQL-free run when `CI=true`.
 
 Run every pinned official reference, Rust differential, and Rust local-CAS gate
 with Rust 1.95.0 installed:

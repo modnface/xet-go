@@ -108,11 +108,13 @@ The local release gates are:
 ./conformance/cross-compile.sh    # seven supported GOOS/GOARCH targets
 ```
 
-The required Linux CI gate provisions PostgreSQL 15 and runs race detection
-and the 95% complete aggregate with `XET_POSTGRES_INTEGRATION=1`. To reproduce
-that complete coverage gate locally, also set `XET_POSTGRES_DSN` to a database
-whose principal may create and drop private test schemas. The coverage script
-fails rather than silently excluding PostgreSQL when `CI=true`.
+The required Linux CI gate provisions PostgreSQL 15 and pinned MinIO, then runs
+the individual and composed real-backend tests under race detection and the 95%
+complete aggregate. To reproduce that complete coverage gate locally, set the
+`XET_POSTGRES_*` and `XET_S3_*` integration variables documented in the root
+README; the PostgreSQL principal must be able to create and drop private test
+schemas. The coverage script fails rather than silently excluding PostgreSQL
+when `CI=true`.
 
 See [../CONFORMANCE.md](../CONFORMANCE.md) for the requirement-to-test matrix
 and exactness boundary.
