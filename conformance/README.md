@@ -124,5 +124,24 @@ shards do not carry the namespace needed to recreate scoped shard, file, dedup,
 or SHA associations, and the operation neither changes payloads nor supplies
 reachability or garbage-collection evidence.
 
+The first Hub-control-plane evidence is a sanitized public-read transcript from
+`huggingface_hub==1.27.0` with `hf_xet==1.6.0`. It pins model metadata, immutable
+revision metadata, recursive tree listing, ordinary and Xet `HEAD`, Xet read
+token refresh, redirects, and an ordinary ranged `GET` against one immutable
+public model revision. Reproduce it in an isolated environment with:
+
+```sh
+python3 -m venv .cache/hf-client
+.cache/hf-client/bin/pip install -r conformance/hf-client/requirements.txt
+.cache/hf-client/bin/python conformance/hf-client/capture-public-read.py \
+  --output conformance/hf-client/public-read-transcript.json
+go test ./conformance -run TestPinnedOfficialHubPublicReadTranscript
+```
+
+The capture retains only protocol-relevant headers, redacts bearer values and
+signed URL queries, and records the client/runtime versions. It is read-side
+evidence only: hosted write-policy responses, compatible commit-OID generation,
+and write-error bodies still require an authenticated sanitized capture.
+
 See [../CONFORMANCE.md](../CONFORMANCE.md) for the requirement-to-test matrix
 and exactness boundary.
