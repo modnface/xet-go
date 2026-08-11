@@ -64,6 +64,9 @@ out-of-band deletion after a successful check.
 The local filesystem + SQLite profile is restart-tested with old-revision Xet
 reads and durable cross-repository namespace isolation. Authentication and
 Hugging Face-compatible HTTP translation remain separate higher boundaries.
+An opt-in remote composition test exercises the same typed publication and
+full/range reads across S3 ordinary/CAS bytes, PostgreSQL catalog/CAS metadata,
+scoped CAS tokens, process restart, and repository-isolation failures.
 The independent `auth` package supplies hosting-neutral contracts for
 pluggable Hub credential authentication, separate repository authorization,
 canonical repository-to-CAS scope exchange, and short-lived HMAC-SHA256 CAS
