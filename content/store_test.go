@@ -8,6 +8,8 @@ import (
 	"io"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/jmwoliver/xet-go/content"
@@ -16,6 +18,13 @@ import (
 )
 
 type storeFactory func(testing.TB) content.Store
+
+type inventoryStore interface {
+	content.Store
+	content.BlobLister
+}
+
+type inventoryFactory func(testing.TB) inventoryStore
 
 func TestStoreContract(t *testing.T) {
 	factories := map[string]storeFactory{
@@ -34,6 +43,78 @@ func TestStoreContract(t *testing.T) {
 	}
 	for name, factory := range factories {
 		t.Run(name, func(t *testing.T) { runStoreContract(t, factory) })
+	}
+}
+
+func TestBlobInventoryContract(t *testing.T) {
+	factories := map[string]inventoryFactory{
+		"memory": func(testing.TB) inventoryStore { return memory.New() },
+	}
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		factories["filesystem"] = func(t testing.TB) inventoryStore {
+			t.Helper()
+			store, err := filesystem.Open(filepath.Join(t.TempDir(), "content"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			return store
+		}
+	}
+	for name, factory := range factories {
+		t.Run(name, func(t *testing.T) { runBlobInventoryContract(t, factory(t)) })
+	}
+}
+
+func runBlobInventoryContract(t *testing.T, store inventoryStore) {
+	t.Helper()
+	ctx := context.Background()
+	blobs := make([]content.Blob, 0, 4)
+	for _, body := range [][]byte{nil, []byte("alpha"), []byte("beta"), []byte("gamma")} {
+		blob := content.Blob{SHA256: sha256.Sum256(body), Size: int64(len(body))}
+		if inserted, err := store.Put(ctx, blob, bytes.NewReader(body)); err != nil || !inserted {
+			t.Fatalf("put inventory blob = %v, %v", inserted, err)
+		}
+		blobs = append(blobs, blob)
+	}
+	slices.SortFunc(blobs, func(left, right content.Blob) int {
+		return bytes.Compare(left.SHA256[:], right.SHA256[:])
+	})
+
+	var got []content.Blob
+	cursor := ""
+	for len(got) < len(blobs) {
+		page, err := store.ListBlobs(ctx, content.PageRequest{Limit: 1, Cursor: cursor})
+		if err != nil || len(page.Items) != 1 {
+			t.Fatalf("inventory page %d = %#v, %v", len(got), page, err)
+		}
+		got = append(got, page.Items[0])
+		cursor = page.NextCursor
+		if (len(got) < len(blobs)) != (cursor != "") {
+			t.Fatalf("inventory continuation %d = %q", len(got), cursor)
+		}
+	}
+	if !slices.Equal(got, blobs) {
+		t.Fatalf("inventory = %#v, want %#v", got, blobs)
+	}
+	all, err := store.ListBlobs(ctx, content.PageRequest{})
+	if err != nil || !slices.Equal(all.Items, blobs) || all.NextCursor != "" {
+		t.Fatalf("default inventory = %#v, %v", all, err)
+	}
+	for _, request := range []content.PageRequest{
+		{Cursor: "bad"}, {Cursor: strings.Repeat("A", 64)}, {Limit: -1}, {Limit: content.MaxPageSize + 1},
+	} {
+		if _, err := store.ListBlobs(ctx, request); !errors.Is(err, content.ErrInvalid) {
+			t.Fatalf("invalid inventory request %#v = %v", request, err)
+		}
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := store.ListBlobs(canceled, content.PageRequest{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled inventory = %v", err)
+	}
+	if _, err := store.ListBlobs(nil, content.PageRequest{}); !errors.Is(err, content.ErrInvalid) { //nolint:staticcheck // Verify nil rejection.
+		t.Fatalf("nil-context inventory = %v", err)
 	}
 }
 

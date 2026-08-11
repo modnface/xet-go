@@ -12,6 +12,7 @@ import (
 	"github.com/jmwoliver/xet-go/auth"
 	"github.com/jmwoliver/xet-go/catalog"
 	"github.com/jmwoliver/xet-go/catalog/memory"
+	"github.com/jmwoliver/xet-go/content"
 	contentmemory "github.com/jmwoliver/xet-go/content/memory"
 	"github.com/jmwoliver/xet-go/model"
 	"github.com/jmwoliver/xet-go/xetcas"
@@ -20,6 +21,7 @@ import (
 )
 
 type catalogWithoutRefListing struct{ catalog.Catalog }
+type contentWithoutBlobListing struct{ content.Store }
 
 func TestServiceComposesTypedAndSeparateHTTPBoundaries(t *testing.T) {
 	options, manager := validOptions(t)
@@ -86,6 +88,10 @@ func TestServiceComposesTypedAndSeparateHTTPBoundaries(t *testing.T) {
 	if err != nil || len(payloads.Items) != 0 {
 		t.Fatalf("CAS payload audit = %#v, %v", payloads, err)
 	}
+	ordinary, err := service.AuditContentInventory(context.Background(), content.PageRequest{Limit: 1})
+	if err != nil || len(ordinary.Items) != 0 {
+		t.Fatalf("ordinary content inventory = %#v, %v", ordinary, err)
+	}
 }
 
 func TestNewRejectsIncoherentCapabilities(t *testing.T) {
@@ -101,6 +107,7 @@ func TestNewRejectsIncoherentCapabilities(t *testing.T) {
 		{"catalog", func(options *Options) { options.Catalog = nil }},
 		{"catalog ref listing", func(options *Options) { options.Catalog = catalogWithoutRefListing{options.Catalog} }},
 		{"content", func(options *Options) { options.Content = nil }},
+		{"content inventory", func(options *Options) { options.Content = contentWithoutBlobListing{options.Content} }},
 		{"blobs", func(options *Options) { options.CAS.Blobs = nil }},
 		{"index", func(options *Options) { options.CAS.Index = nil }},
 		{"signer", func(options *Options) { options.CAS.Signer = nil }},

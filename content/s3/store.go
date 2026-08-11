@@ -31,6 +31,7 @@ type client interface {
 	PutObject(context.Context, *awss3.PutObjectInput, ...func(*awss3.Options)) (*awss3.PutObjectOutput, error)
 	HeadObject(context.Context, *awss3.HeadObjectInput, ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error)
 	GetObject(context.Context, *awss3.GetObjectInput, ...func(*awss3.Options)) (*awss3.GetObjectOutput, error)
+	ListObjectsV2(context.Context, *awss3.ListObjectsV2Input, ...func(*awss3.Options)) (*awss3.ListObjectsV2Output, error)
 }
 
 // Options identifies the private bucket namespace and local upload spool.
@@ -48,7 +49,10 @@ type Store struct {
 	temp   string
 }
 
-var _ content.Store = (*Store)(nil)
+var (
+	_ content.Store      = (*Store)(nil)
+	_ content.BlobLister = (*Store)(nil)
+)
 
 // New constructs a store using an already configured AWS SDK client.
 func New(s3Client *awss3.Client, options Options) (*Store, error) {
@@ -98,6 +102,94 @@ func (s *Store) objectKey(sum [32]byte) string {
 		return s.prefix + "/" + key
 	}
 	return key
+}
+
+func (s *Store) blobPrefix() string {
+	prefix := layoutVersion + "/blobs/"
+	if s.prefix != "" {
+		return s.prefix + "/" + prefix
+	}
+	return prefix
+}
+
+// ListBlobs returns a bounded physical inventory in digest order. The cursor
+// identifies the last returned digest; it is not an authorization capability.
+func (s *Store) ListBlobs(ctx context.Context, request content.PageRequest) (content.BlobPage, error) {
+	if err := validate(ctx, nil); err != nil {
+		return content.BlobPage{}, err
+	}
+	limit := request.Limit
+	if limit == 0 {
+		limit = content.DefaultPageSize
+	}
+	if limit < 1 || limit > content.MaxPageSize {
+		return content.BlobPage{}, fmt.Errorf("%w: invalid page limit", content.ErrInvalid)
+	}
+	var cursor [32]byte
+	if request.Cursor != "" {
+		decoded, err := hex.DecodeString(request.Cursor)
+		if err != nil || len(decoded) != len(cursor) || request.Cursor != strings.ToLower(request.Cursor) {
+			return content.BlobPage{}, fmt.Errorf("%w: invalid blob cursor", content.ErrInvalid)
+		}
+		copy(cursor[:], decoded)
+	}
+	input := &awss3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket), Prefix: aws.String(s.blobPrefix()), MaxKeys: aws.Int32(int32(limit)),
+	}
+	if request.Cursor != "" {
+		input.StartAfter = aws.String(s.objectKey(cursor))
+	}
+	output, err := s.client.ListObjectsV2(ctx, input)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return content.BlobPage{}, ctxErr
+		}
+		return content.BlobPage{}, unavailable(err)
+	}
+	if output == nil || output.IsTruncated == nil || len(output.CommonPrefixes) != 0 || len(output.Contents) > limit ||
+		(output.KeyCount != nil && int(*output.KeyCount) != len(output.Contents)) {
+		return content.BlobPage{}, fmt.Errorf("%w: invalid S3 inventory response", content.ErrCorrupt)
+	}
+	items := make([]content.Blob, 0, len(output.Contents))
+	previous := aws.ToString(input.StartAfter)
+	for _, object := range output.Contents {
+		if err := ctx.Err(); err != nil {
+			return content.BlobPage{}, err
+		}
+		if object.Key == nil || object.Size == nil || *object.Size < 0 || *object.Key <= previous {
+			return content.BlobPage{}, fmt.Errorf("%w: invalid S3 blob inventory metadata", content.ErrCorrupt)
+		}
+		digest, parseErr := s.parseObjectKey(*object.Key)
+		if parseErr != nil {
+			return content.BlobPage{}, parseErr
+		}
+		items = append(items, content.Blob{SHA256: digest, Size: *object.Size})
+		previous = *object.Key
+	}
+	page := content.BlobPage{Items: items}
+	if aws.ToBool(output.IsTruncated) {
+		if len(items) == 0 {
+			return content.BlobPage{}, fmt.Errorf("%w: truncated S3 inventory made no progress", content.ErrCorrupt)
+		}
+		page.NextCursor = hex.EncodeToString(items[len(items)-1].SHA256[:])
+	}
+	return page, nil
+}
+
+func (s *Store) parseObjectKey(key string) ([32]byte, error) {
+	var sum [32]byte
+	relative, found := strings.CutPrefix(key, s.blobPrefix())
+	parts := strings.Split(relative, "/")
+	if !found || len(parts) != 3 || len(parts[0]) != 2 || len(parts[1]) != 2 || len(parts[2]) != 64 ||
+		parts[0] != parts[2][:2] || parts[1] != parts[2][2:4] || parts[2] != strings.ToLower(parts[2]) {
+		return sum, fmt.Errorf("%w: non-canonical ordinary blob key", content.ErrCorrupt)
+	}
+	decoded, err := hex.DecodeString(parts[2])
+	if err != nil || len(decoded) != len(sum) {
+		return sum, fmt.Errorf("%w: malformed ordinary blob key", content.ErrCorrupt)
+	}
+	copy(sum[:], decoded)
+	return sum, nil
 }
 
 func validate(ctx context.Context, blob *content.Blob) error {

@@ -4,12 +4,14 @@ package filesystem
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -248,6 +250,232 @@ func TestSymlinkedObjectDirectoryIsRejected(t *testing.T) {
 	entries, err := os.ReadDir(target)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("symlink target entries = %d, %v", len(entries), err)
+	}
+}
+
+func TestBlobInventoryOrdersLargeLeafWithoutLoadingItAsAPage(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "content"))
+	expected := make([]content.Blob, 0, 300)
+	for index := range 300 {
+		var sum [32]byte
+		sum[0], sum[1] = 0xaa, 0xbb
+		sum[29], sum[30], sum[31] = byte(index>>16), byte(index>>8), byte(index)
+		blob := content.Blob{SHA256: sum, Size: int64(index % 17)}
+		objectPath := store.objectPath(sum)
+		if err := os.MkdirAll(filepath.Dir(objectPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(objectPath, make([]byte, blob.Size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		expected = append(expected, blob)
+	}
+	var got []content.Blob
+	cursor := ""
+	for len(got) < len(expected) {
+		page, err := store.ListBlobs(context.Background(), content.PageRequest{Limit: 37, Cursor: cursor})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, page.Items...)
+		cursor = page.NextCursor
+	}
+	if len(got) != len(expected) {
+		t.Fatalf("inventory count = %d, want %d", len(got), len(expected))
+	}
+	for index := range expected {
+		if got[index] != expected[index] {
+			t.Fatalf("inventory item %d = %#v, want %#v", index, got[index], expected[index])
+		}
+	}
+}
+
+func TestBlobInventoryRejectsMalformedFilesystemState(t *testing.T) {
+	type mutation func(*testing.T, *Store, string)
+	for name, mutate := range map[string]mutation{
+		"blob root file": func(t *testing.T, _ *Store, root string) {
+			if err := os.MkdirAll(filepath.Dir(root), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(root, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"blob root symlink": func(t *testing.T, _ *Store, root string) {
+			if err := os.MkdirAll(filepath.Dir(root), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(t.TempDir(), root); err != nil {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+		},
+		"content version file": func(t *testing.T, _ *Store, root string) {
+			if err := os.WriteFile(filepath.Dir(root), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"content version symlink": func(t *testing.T, _ *Store, root string) {
+			if err := os.Symlink(t.TempDir(), filepath.Dir(root)); err != nil {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+		},
+		"malformed first prefix": func(t *testing.T, _ *Store, root string) {
+			if err := os.MkdirAll(filepath.Join(root, "GG"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"symlink first prefix": func(t *testing.T, _ *Store, root string) {
+			if err := os.MkdirAll(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(t.TempDir(), filepath.Join(root, "00")); err != nil {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+		},
+		"malformed second prefix": func(t *testing.T, _ *Store, root string) {
+			if err := os.MkdirAll(filepath.Join(root, "00", "x"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"malformed object": func(t *testing.T, _ *Store, root string) {
+			directory := filepath.Join(root, "00", "00")
+			if err := os.MkdirAll(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(directory, "short"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"object in wrong prefix": func(t *testing.T, _ *Store, root string) {
+			directory := filepath.Join(root, "00", "00")
+			if err := os.MkdirAll(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			name := "0001" + strings.Repeat("0", 60)
+			if err := os.WriteFile(filepath.Join(directory, name), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"object directory": func(t *testing.T, _ *Store, root string) {
+			if err := os.MkdirAll(filepath.Join(root, "00", "00", strings.Repeat("0", 64)), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"object symlink": func(t *testing.T, _ *Store, root string) {
+			directory := filepath.Join(root, "00", "00")
+			if err := os.MkdirAll(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join(t.TempDir(), "target"), filepath.Join(directory, strings.Repeat("0", 64))); err != nil {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+		},
+		"temporary directory": func(t *testing.T, _ *Store, root string) {
+			if err := os.MkdirAll(filepath.Join(root, "00", "00", tempPrefix+"staged"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := openTestStore(t, filepath.Join(t.TempDir(), "content"))
+			root := filepath.Join(store.root, layoutVersion, "blobs")
+			mutate(t, store, root)
+			if _, err := store.ListBlobs(context.Background(), content.PageRequest{}); !errors.Is(err, content.ErrCorrupt) {
+				t.Fatalf("malformed inventory = %v", err)
+			}
+		})
+	}
+	t.Run("temporary objects are not published", func(t *testing.T) {
+		store := openTestStore(t, filepath.Join(t.TempDir(), "content"))
+		directory := filepath.Join(store.root, layoutVersion, "blobs", "00", "00")
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, tempPrefix+"abandoned"), []byte("staged"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		page, err := store.ListBlobs(context.Background(), content.PageRequest{})
+		if err != nil || len(page.Items) != 0 {
+			t.Fatalf("temporary inventory = %#v, %v", page, err)
+		}
+	})
+	t.Run("closed store", func(t *testing.T) {
+		store := openTestStore(t, filepath.Join(t.TempDir(), "content"))
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ListBlobs(context.Background(), content.PageRequest{}); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("closed inventory = %v", err)
+		}
+	})
+}
+
+func TestBlobInventoryInternalBoundaries(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, filepath.Join(t.TempDir(), "content"))
+	if page, err := store.ListBlobs(ctx, content.PageRequest{}); err != nil || len(page.Items) != 0 {
+		t.Fatalf("empty inventory = %#v, %v", page, err)
+	}
+	if _, err := store.ListBlobs(ctx, content.PageRequest{Limit: -1}); !errors.Is(err, content.ErrInvalid) {
+		t.Fatalf("invalid limit = %v", err)
+	}
+	if _, err := store.ListBlobs(ctx, content.PageRequest{Cursor: "bad"}); !errors.Is(err, content.ErrInvalid) {
+		t.Fatalf("invalid cursor = %v", err)
+	}
+	if _, err := readInventoryPrefixes(ctx, filepath.Join(t.TempDir(), "missing")); !errors.Is(err, content.ErrUnavailable) {
+		t.Fatalf("missing prefix directory = %v", err)
+	}
+	if blobs, err := store.readBlobCandidates(ctx, "unused", "0000", "", false, 0); err != nil || blobs != nil {
+		t.Fatalf("zero-capacity candidates = %#v, %v", blobs, err)
+	}
+	if _, err := store.readBlobCandidates(ctx, filepath.Join(t.TempDir(), "missing"), "0000", "", false, 1); !errors.Is(err, content.ErrUnavailable) {
+		t.Fatalf("missing candidate directory = %v", err)
+	}
+
+	root := filepath.Join(store.root, layoutVersion, "blobs")
+	for _, digest := range []string{
+		"0000" + strings.Repeat("0", 60),
+		"0001" + strings.Repeat("0", 60),
+		"0100" + strings.Repeat("0", 60),
+	} {
+		sum, err := parseDigest(digest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		objectPath := store.objectPath(sum)
+		if err = os.MkdirAll(filepath.Dir(objectPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(objectPath, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if page, err := store.ListBlobs(ctx, content.PageRequest{Cursor: "0001" + strings.Repeat("0", 60)}); err != nil || len(page.Items) != 1 {
+		t.Fatalf("second-prefix cursor = %#v, %v", page, err)
+	}
+	if page, err := store.ListBlobs(ctx, content.PageRequest{Cursor: "0100" + strings.Repeat("0", 60)}); err != nil || len(page.Items) != 0 {
+		t.Fatalf("first-prefix cursor = %#v, %v", page, err)
+	}
+	if _, err := readInventoryPrefixes(&errAfterContext{remaining: 0}, root); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled prefix scan = %v", err)
+	}
+	objectRoot := filepath.Join(root, "00", "00")
+	if _, err := store.readBlobCandidates(&errAfterContext{remaining: 0}, objectRoot, "0000", "", false, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled candidate scan = %v", err)
+	}
+	page := content.BlobPage{}
+	if err := store.walkBlobPage(&errAfterContext{remaining: 3}, root, "", false, 10, &page); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled inventory walk = %v", err)
+	}
+
+	candidates := candidateMaxHeap{
+		{name: "00", size: 0},
+		{name: "01", size: 1},
+	}
+	heap.Init(&candidates)
+	heap.Push(&candidates, blobCandidate{name: "02", size: 2})
+	if popped := heap.Pop(&candidates).(blobCandidate); popped.name != "02" { //nolint:forcetypeassert // Internal heap contract.
+		t.Fatalf("candidate heap popped %#v", popped)
 	}
 }
 
@@ -757,3 +985,16 @@ func (source *blockedSource) Read(buffer []byte) (int, error) {
 type failingSource struct{ err error }
 
 func (source failingSource) Read([]byte) (int, error) { return 0, source.err }
+
+type errAfterContext struct{ remaining int }
+
+func (*errAfterContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (*errAfterContext) Done() <-chan struct{}       { return nil }
+func (*errAfterContext) Value(any) any               { return nil }
+func (ctx *errAfterContext) Err() error {
+	if ctx.remaining > 0 {
+		ctx.remaining--
+		return nil
+	}
+	return context.Canceled
+}

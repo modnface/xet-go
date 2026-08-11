@@ -50,8 +50,9 @@ type Options struct {
 // methods are read-only and do not establish reachability or deletion safety.
 type Service struct {
 	*bucket.Service
-	hub *hfcompat.Service
-	cas *casserver.Service
+	hub      *hfcompat.Service
+	cas      *casserver.Service
+	ordinary content.BlobLister
 }
 
 func New(options Options) (*Service, error) {
@@ -63,6 +64,10 @@ func New(options Options) (*Service, error) {
 	}
 	if _, ok := options.Catalog.(catalog.RefLister); !ok {
 		return nil, fmt.Errorf("%w: catalog ref inventory is required", ErrInvalid)
+	}
+	ordinary, ok := options.Content.(content.BlobLister)
+	if !ok {
+		return nil, fmt.Errorf("%w: ordinary content inventory is required", ErrInvalid)
 	}
 
 	broker, err := auth.NewBroker(auth.BrokerOptions{
@@ -91,7 +96,7 @@ func New(options Options) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: Hub compatibility: %w", ErrInvalid, err)
 	}
-	return &Service{Service: core, hub: hub, cas: cas}, nil
+	return &Service{Service: core, hub: hub, cas: cas, ordinary: ordinary}, nil
 }
 
 func (service *Service) HubHandler() http.Handler { return service.hub.Handler() }
@@ -110,4 +115,14 @@ func (service *Service) AuditCASBlobPayloads(
 	request casserver.PayloadAuditRequest,
 ) (casserver.PayloadAuditPage, error) {
 	return service.cas.AuditBlobPayloads(ctx, request)
+}
+
+// AuditContentInventory returns one bounded page of physical ordinary blobs.
+// It is read-only and does not establish catalog reachability or deletion
+// safety.
+func (service *Service) AuditContentInventory(
+	ctx context.Context,
+	request content.PageRequest,
+) (content.BlobPage, error) {
+	return service.ordinary.ListBlobs(ctx, request)
 }

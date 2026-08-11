@@ -51,6 +51,32 @@ func (r Range) Validate(size int64) error {
 
 type Info struct{ Size int64 }
 
+const (
+	DefaultPageSize = 100
+	MaxPageSize     = 1_000
+)
+
+// PageRequest controls bounded, weakly consistent physical inventory. A zero
+// limit selects DefaultPageSize. Concurrent inserts at or before a returned
+// cursor may be missed; destructive maintenance requires an epoch, quiescence,
+// or an equivalent lease/grace barrier.
+type PageRequest struct {
+	Cursor string
+	Limit  int
+}
+
+type BlobPage struct {
+	Items      []Blob
+	NextCursor string
+}
+
+// BlobLister is the optional administrative inventory capability. Results are
+// ordered by SHA-256 bytes. It does not establish catalog reachability or make
+// deletion safe.
+type BlobLister interface {
+	ListBlobs(context.Context, PageRequest) (BlobPage, error)
+}
+
 // Store publishes and opens immutable ordinary blobs. Put verifies the exact
 // declared length and SHA-256 before publication. Repeating identical bytes is
 // success with inserted=false; different retained bytes under the same digest

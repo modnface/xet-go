@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"testing"
 	"time"
 
@@ -39,10 +40,11 @@ func TestS3CompatibleIntegration(t *testing.T) {
 	if os.Getenv("XET_S3_CREATE_BUCKET") == "1" {
 		ensureIntegrationBucket(t, client, bucket)
 	}
-	store, err := New(client, Options{
+	options := Options{
 		Bucket: bucket, Prefix: fmt.Sprintf("xet-go-content-integration/%d", time.Now().UnixNano()),
 		TempDirectory: t.TempDir(),
-	})
+	}
+	store, err := New(client, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,6 +80,22 @@ func TestS3CompatibleIntegration(t *testing.T) {
 		t.Fatalf("empty publication = %v, %v", inserted, err)
 	}
 	assertIntegrationRead(t, ctx, store, empty, nil, nil)
+	expected := []content.Blob{blob, empty}
+	sort.Slice(expected, func(i, j int) bool {
+		return bytes.Compare(expected[i].SHA256[:], expected[j].SHA256[:]) < 0
+	})
+	first, err := store.ListBlobs(ctx, content.PageRequest{Limit: 1})
+	if err != nil || len(first.Items) != 1 || first.Items[0] != expected[0] || first.NextCursor == "" {
+		t.Fatalf("first inventory page = %#v, %v", first, err)
+	}
+	reopened, err := New(client, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := reopened.ListBlobs(ctx, content.PageRequest{Limit: 1, Cursor: first.NextCursor})
+	if err != nil || len(second.Items) != 1 || second.Items[0] != expected[1] || second.NextCursor != "" {
+		t.Fatalf("restarted inventory page = %#v, %v", second, err)
+	}
 }
 
 func assertIntegrationRead(

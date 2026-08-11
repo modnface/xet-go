@@ -3,6 +3,7 @@ package filesystem
 
 import (
 	"bufio"
+	"container/heap"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -61,6 +63,7 @@ func defaultOperations() operations {
 }
 
 var _ content.Store = (*Store)(nil)
+var _ content.BlobLister = (*Store)(nil)
 
 // Open creates or opens root. Strict directory durability is currently
 // supported on Linux and macOS. Existing parent modes are never changed.
@@ -265,6 +268,261 @@ func (s *Store) Open(ctx context.Context, blob content.Blob, wanted *content.Ran
 		body = &sectionReadCloser{Reader: io.NewSectionReader(file, start, end-start), close: file}
 	}
 	return verified.New(ctx, body, blob, end-start, full), nil
+}
+
+func (s *Store) ListBlobs(ctx context.Context, request content.PageRequest) (content.BlobPage, error) {
+	if err := s.begin(ctx, nil); err != nil {
+		return content.BlobPage{}, err
+	}
+	defer s.end()
+	limit, err := inventoryPageLimit(request.Limit)
+	if err != nil {
+		return content.BlobPage{}, err
+	}
+	after, hasAfter, err := parseBlobCursor(request.Cursor)
+	if err != nil {
+		return content.BlobPage{}, err
+	}
+	root := filepath.Join(s.root, layoutVersion, "blobs")
+	err = validateObjectPath(s.root, root)
+	if errors.Is(err, os.ErrNotExist) {
+		return content.BlobPage{Items: []content.Blob{}}, nil
+	}
+	if err != nil {
+		return content.BlobPage{}, normalizeFilesystemError(err)
+	}
+	page := content.BlobPage{Items: make([]content.Blob, 0, limit+1)}
+	if err = s.walkBlobPage(ctx, root, after, hasAfter, limit, &page); err != nil {
+		return content.BlobPage{}, err
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.NextCursor = hex.EncodeToString(page.Items[limit-1].SHA256[:])
+	}
+	return page, nil
+}
+
+func (s *Store) walkBlobPage(
+	ctx context.Context,
+	root, after string,
+	hasAfter bool,
+	limit int,
+	page *content.BlobPage,
+) error {
+	firstLevel, err := readInventoryPrefixes(ctx, root)
+	if err != nil {
+		return err
+	}
+	for _, first := range firstLevel {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if hasAfter && first.Name() < after[:2] {
+			continue
+		}
+		firstPath := filepath.Join(root, first.Name())
+		secondLevel, err := readInventoryPrefixes(ctx, firstPath)
+		if err != nil {
+			return err
+		}
+		for _, second := range secondLevel {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			prefix := first.Name() + second.Name()
+			if hasAfter && prefix < after[:4] {
+				continue
+			}
+			objectRoot := filepath.Join(firstPath, second.Name())
+			remaining := limit + 1 - len(page.Items)
+			objects, err := s.readBlobCandidates(ctx, objectRoot, prefix, after, hasAfter, remaining)
+			if err != nil {
+				return err
+			}
+			page.Items = append(page.Items, objects...)
+			if len(page.Items) > limit {
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func readInventoryPrefixes(ctx context.Context, path string) ([]os.DirEntry, error) {
+	directory, err := os.Open(path)
+	if err != nil {
+		return nil, normalizeFilesystemError(err)
+	}
+	entries := make([]os.DirEntry, 0, 256)
+	for {
+		batch, readErr := directory.ReadDir(128)
+		for _, entry := range batch {
+			if err = ctx.Err(); err != nil {
+				_ = directory.Close()
+				return nil, err
+			}
+			if err = validateInventoryPrefix(entry); err != nil {
+				_ = directory.Close()
+				return nil, err
+			}
+			entries = append(entries, entry)
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			_ = directory.Close()
+			return nil, normalizeFilesystemError(readErr)
+		}
+	}
+	if err = directory.Close(); err != nil {
+		return nil, normalizeFilesystemError(err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	return entries, nil
+}
+
+func (s *Store) readBlobCandidates(
+	ctx context.Context,
+	objectRoot, prefix, after string,
+	hasAfter bool,
+	capacity int,
+) ([]content.Blob, error) {
+	if capacity < 1 {
+		return nil, nil
+	}
+	directory, err := os.Open(objectRoot)
+	if err != nil {
+		return nil, normalizeFilesystemError(err)
+	}
+	selected := make(candidateMaxHeap, 0, capacity)
+	for {
+		entries, readErr := directory.ReadDir(128)
+		for _, entry := range entries {
+			if err = ctx.Err(); err != nil {
+				_ = directory.Close()
+				return nil, err
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				_ = directory.Close()
+				return nil, fmt.Errorf("%w: symlink beneath blob root", content.ErrCorrupt)
+			}
+			info, infoErr := entry.Info()
+			if infoErr != nil {
+				_ = directory.Close()
+				return nil, normalizeFilesystemError(infoErr)
+			}
+			if !info.Mode().IsRegular() || info.Size() < 0 {
+				_ = directory.Close()
+				return nil, fmt.Errorf("%w: ordinary blob leaf is not a regular file", content.ErrCorrupt)
+			}
+			if strings.HasPrefix(entry.Name(), tempPrefix) {
+				continue
+			}
+			name := entry.Name()
+			sum, parseErr := parseDigest(name)
+			if parseErr != nil || entry.Name()[:4] != prefix {
+				_ = directory.Close()
+				return nil, fmt.Errorf("%w: malformed blob object name %q", content.ErrCorrupt, entry.Name())
+			}
+			if hasAfter && name <= after {
+				continue
+			}
+			candidate := blobCandidate{name: name, sum: sum, size: info.Size()}
+			if len(selected) < capacity {
+				heap.Push(&selected, candidate)
+			} else if name < selected[0].name {
+				heap.Pop(&selected)
+				heap.Push(&selected, candidate)
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			_ = directory.Close()
+			return nil, normalizeFilesystemError(readErr)
+		}
+	}
+	if err = directory.Close(); err != nil {
+		return nil, normalizeFilesystemError(err)
+	}
+	sort.Slice(selected, func(i, j int) bool {
+		return selected[i].name < selected[j].name
+	})
+	blobs := make([]content.Blob, 0, len(selected))
+	for _, candidate := range selected {
+		blobs = append(blobs, content.Blob{SHA256: candidate.sum, Size: candidate.size})
+	}
+	return blobs, nil
+}
+
+type blobCandidate struct {
+	name string
+	sum  [32]byte
+	size int64
+}
+
+type candidateMaxHeap []blobCandidate
+
+func (candidates candidateMaxHeap) Len() int { return len(candidates) }
+func (candidates candidateMaxHeap) Less(i, j int) bool {
+	return candidates[i].name > candidates[j].name
+}
+func (candidates candidateMaxHeap) Swap(i, j int) {
+	candidates[i], candidates[j] = candidates[j], candidates[i]
+}
+func (candidates *candidateMaxHeap) Push(value any) {
+	*candidates = append(*candidates, value.(blobCandidate)) //nolint:forcetypeassert // heap values are internal.
+}
+func (candidates *candidateMaxHeap) Pop() any {
+	old := *candidates
+	last := old[len(old)-1]
+	*candidates = old[:len(old)-1]
+	return last
+}
+
+func inventoryPageLimit(value int) (int, error) {
+	if value < 0 || value > content.MaxPageSize {
+		return 0, fmt.Errorf("%w: page limit is outside [0,%d]", content.ErrInvalid, content.MaxPageSize)
+	}
+	if value == 0 {
+		return content.DefaultPageSize, nil
+	}
+	return value, nil
+}
+
+func parseBlobCursor(value string) (string, bool, error) {
+	if value == "" {
+		return "", false, nil
+	}
+	if _, err := parseDigest(value); err != nil {
+		return "", false, fmt.Errorf("%w: malformed blob cursor", content.ErrInvalid)
+	}
+	return value, true, nil
+}
+
+func parseDigest(value string) ([32]byte, error) {
+	var sum [32]byte
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != len(sum) || hex.EncodeToString(decoded) != value {
+		return sum, errors.New("malformed SHA-256")
+	}
+	copy(sum[:], decoded)
+	return sum, nil
+}
+
+func validateInventoryPrefix(entry os.DirEntry) error {
+	name := entry.Name()
+	if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() || len(name) != 2 ||
+		!isLowerHex(name[0]) || !isLowerHex(name[1]) {
+		return fmt.Errorf("%w: malformed blob prefix %q", content.ErrCorrupt, name)
+	}
+	return nil
+}
+
+func isLowerHex(value byte) bool {
+	return value >= '0' && value <= '9' || value >= 'a' && value <= 'f'
 }
 
 func (s *Store) objectPath(sum [32]byte) string {

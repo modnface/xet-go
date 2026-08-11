@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	awstypes "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/jmwoliver/xet-go/content"
 )
@@ -623,6 +625,113 @@ func TestOpenCancellationAndConcurrentCloseUnblockRead(t *testing.T) {
 	}
 }
 
+func TestListBlobsIsBoundedOrderedAndPrefixScoped(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeClient()
+	store, err := newStore(client, Options{Bucket: "bucket", Prefix: "tenant/content"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs := []content.Blob{testBlob([]byte("alpha")), testBlob(nil), testBlob([]byte("gamma"))}
+	sort.Slice(blobs, func(i, j int) bool {
+		return bytes.Compare(blobs[i].SHA256[:], blobs[j].SHA256[:]) < 0
+	})
+	for _, blob := range blobs {
+		client.setObject(store.objectKey(blob.SHA256), make([]byte, blob.Size))
+	}
+	client.setObject("other/content-v1/blobs/00/00/"+strings.Repeat("0", 64), []byte("ignored"))
+
+	page, err := store.ListBlobs(ctx, content.PageRequest{Limit: 2})
+	if err != nil || len(page.Items) != 2 || page.Items[0] != blobs[0] || page.Items[1] != blobs[1] || page.NextCursor == "" {
+		t.Fatalf("first inventory page = %#v, %v", page, err)
+	}
+	firstRequest := client.lastList
+	if firstRequest == nil || aws.ToString(firstRequest.Bucket) != "bucket" ||
+		aws.ToString(firstRequest.Prefix) != store.blobPrefix() || aws.ToInt32(firstRequest.MaxKeys) != 2 || firstRequest.StartAfter != nil {
+		t.Fatalf("first list request = %#v", firstRequest)
+	}
+	page, err = store.ListBlobs(ctx, content.PageRequest{Limit: 2, Cursor: page.NextCursor})
+	if err != nil || len(page.Items) != 1 || page.Items[0] != blobs[2] || page.NextCursor != "" {
+		t.Fatalf("second inventory page = %#v, %v", page, err)
+	}
+	if got := aws.ToString(client.lastList.StartAfter); got != store.objectKey(blobs[1].SHA256) {
+		t.Fatalf("continuation start = %q", got)
+	}
+
+	before := client.callCount()
+	for _, request := range []content.PageRequest{
+		{Cursor: "bad"}, {Cursor: strings.Repeat("A", 64)}, {Limit: -1}, {Limit: content.MaxPageSize + 1},
+	} {
+		if _, err = store.ListBlobs(ctx, request); !errors.Is(err, content.ErrInvalid) {
+			t.Fatalf("invalid request %#v = %v", request, err)
+		}
+	}
+	if got := client.callCount(); got != before {
+		t.Fatalf("invalid requests made %d network calls", got-before)
+	}
+	if _, err = store.ListBlobs(nil, content.PageRequest{}); !errors.Is(err, content.ErrInvalid) { //nolint:staticcheck // Verify nil rejection.
+		t.Fatalf("nil context = %v", err)
+	}
+}
+
+func TestListBlobsRejectsBackendAndInventoryCorruption(t *testing.T) {
+	ctx := context.Background()
+	failure := errors.New("list failed")
+	client := newFakeClient()
+	store, _ := newStore(client, Options{Bucket: "bucket", Prefix: "tenant"})
+	validA, validB := testBlob([]byte("a")), testBlob([]byte("b"))
+	if bytes.Compare(validA.SHA256[:], validB.SHA256[:]) > 0 {
+		validA, validB = validB, validA
+	}
+	object := func(blob content.Blob) awstypes.Object {
+		return awstypes.Object{Key: aws.String(store.objectKey(blob.SHA256)), Size: aws.Int64(blob.Size)}
+	}
+	for name, output := range map[string]*awss3.ListObjectsV2Output{
+		"nil response":        nil,
+		"missing truncation":  {Contents: []awstypes.Object{object(validA)}},
+		"common prefix":       {CommonPrefixes: []awstypes.CommonPrefix{{Prefix: aws.String("unexpected/")}}},
+		"too many results":    {Contents: []awstypes.Object{object(validA), object(validB)}},
+		"wrong key count":     {Contents: []awstypes.Object{object(validA)}, KeyCount: aws.Int32(2)},
+		"nil key":             {Contents: []awstypes.Object{{Size: aws.Int64(1)}}},
+		"nil size":            {Contents: []awstypes.Object{{Key: aws.String(store.objectKey(validA.SHA256))}}},
+		"negative size":       {Contents: []awstypes.Object{{Key: aws.String(store.objectKey(validA.SHA256)), Size: aws.Int64(-1)}}},
+		"out of order":        {Contents: []awstypes.Object{object(validB), object(validA)}},
+		"outside prefix":      {Contents: []awstypes.Object{{Key: aws.String("other/key"), Size: aws.Int64(1)}}},
+		"malformed hierarchy": {Contents: []awstypes.Object{{Key: aws.String(store.blobPrefix() + "00/11/" + strings.Repeat("0", 64)), Size: aws.Int64(1)}}},
+		"uppercase digest": {Contents: []awstypes.Object{{
+			Key: aws.String(store.blobPrefix() + "AA/AA/" + strings.Repeat("A", 64)), Size: aws.Int64(1),
+		}}},
+		"truncated empty": {IsTruncated: aws.Bool(true)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if output != nil && name != "missing truncation" && output.IsTruncated == nil {
+				output.IsTruncated = aws.Bool(false)
+			}
+			client.list = func(context.Context, *awss3.ListObjectsV2Input) (*awss3.ListObjectsV2Output, error) {
+				return output, nil
+			}
+			limit := 1
+			if name == "out of order" {
+				limit = 2
+			}
+			if _, err := store.ListBlobs(ctx, content.PageRequest{Limit: limit}); !errors.Is(err, content.ErrCorrupt) {
+				t.Fatalf("corrupt inventory = %v", err)
+			}
+		})
+	}
+	client.list = func(context.Context, *awss3.ListObjectsV2Input) (*awss3.ListObjectsV2Output, error) {
+		return nil, failure
+	}
+	if _, err := store.ListBlobs(ctx, content.PageRequest{}); !errors.Is(err, content.ErrUnavailable) || !errors.Is(err, failure) {
+		t.Fatalf("backend failure = %v", err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := store.ListBlobs(canceled, content.PageRequest{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled list = %v", err)
+	}
+}
+
 func testBlob(body []byte) content.Blob {
 	return content.Blob{SHA256: sha256.Sum256(body), Size: int64(len(body))}
 }
@@ -655,12 +764,15 @@ type fakeClient struct {
 	afterPut        func()
 	head            func(context.Context, *awss3.HeadObjectInput) (*awss3.HeadObjectOutput, error)
 	get             func(context.Context, *awss3.GetObjectInput) (*awss3.GetObjectOutput, error)
+	list            func(context.Context, *awss3.ListObjectsV2Input) (*awss3.ListObjectsV2Output, error)
 	putCalls        int
 	headCalls       int
 	getCalls        int
+	listCalls       int
 	lastPut         *awss3.PutObjectInput
 	lastHead        *awss3.HeadObjectInput
 	lastGet         *awss3.GetObjectInput
+	lastList        *awss3.ListObjectsV2Input
 	requestChecksum aws.RequestChecksumCalculation
 }
 
@@ -763,6 +875,43 @@ func (client *fakeClient) GetObject(
 	return output, nil
 }
 
+func (client *fakeClient) ListObjectsV2(
+	ctx context.Context,
+	input *awss3.ListObjectsV2Input,
+	_ ...func(*awss3.Options),
+) (*awss3.ListObjectsV2Output, error) {
+	client.mu.Lock()
+	client.listCalls++
+	client.lastList = input
+	hook := client.list
+	keys := make([]string, 0, len(client.objects))
+	for key := range client.objects {
+		keys = append(keys, key)
+	}
+	client.mu.Unlock()
+	if hook != nil {
+		return hook(ctx, input)
+	}
+	sort.Strings(keys)
+	output := &awss3.ListObjectsV2Output{IsTruncated: aws.Bool(false)}
+	limit := int(aws.ToInt32(input.MaxKeys))
+	for _, key := range keys {
+		if !strings.HasPrefix(key, aws.ToString(input.Prefix)) || key <= aws.ToString(input.StartAfter) {
+			continue
+		}
+		if len(output.Contents) == limit {
+			output.IsTruncated = aws.Bool(true)
+			break
+		}
+		client.mu.Lock()
+		size := int64(len(client.objects[key]))
+		client.mu.Unlock()
+		output.Contents = append(output.Contents, awstypes.Object{Key: aws.String(key), Size: aws.Int64(size)})
+	}
+	output.KeyCount = aws.Int32(int32(len(output.Contents)))
+	return output, nil
+}
+
 func (client *fakeClient) setObject(key string, body []byte) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -772,7 +921,7 @@ func (client *fakeClient) setObject(key string, body []byte) {
 func (client *fakeClient) callCount() int {
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	return client.putCalls + client.headCalls + client.getCalls
+	return client.putCalls + client.headCalls + client.getCalls + client.listCalls
 }
 
 func (client *fakeClient) putCount() int {

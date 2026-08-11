@@ -2,10 +2,14 @@ package memory
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -162,6 +166,63 @@ func TestStoreConcurrentPublication(t *testing.T) {
 	wrongSize.Size++
 	if _, err = store.Open(context.Background(), wrongSize, nil); !errors.Is(err, content.ErrCorrupt) {
 		t.Fatalf("wrong size = %v", err)
+	}
+}
+
+func TestBlobInventoryPaginationValidationAndCancellation(t *testing.T) {
+	store := New()
+	expected := make([]content.Blob, 0, 320)
+	store.mu.Lock()
+	for index := range 320 {
+		var sum [32]byte
+		sum[29], sum[30], sum[31] = byte(index>>16), byte(index>>8), byte(index)
+		value := make([]byte, index%19)
+		store.blobs[sum] = value
+		expected = append(expected, content.Blob{SHA256: sum, Size: int64(len(value))})
+	}
+	store.mu.Unlock()
+
+	var got []content.Blob
+	cursor := ""
+	for len(got) < len(expected) {
+		page, err := store.ListBlobs(context.Background(), content.PageRequest{Limit: 17, Cursor: cursor})
+		if err != nil || len(page.Items) == 0 {
+			t.Fatalf("inventory page = %#v, %v", page, err)
+		}
+		got = append(got, page.Items...)
+		cursor = page.NextCursor
+	}
+	if !slices.Equal(got, expected) || cursor != "" {
+		t.Fatalf("inventory count = %d, cursor %q", len(got), cursor)
+	}
+	lastCursor := hex.EncodeToString(expected[len(expected)-1].SHA256[:])
+	if page, err := store.ListBlobs(context.Background(), content.PageRequest{Cursor: lastCursor}); err != nil || len(page.Items) != 0 {
+		t.Fatalf("terminal cursor page = %#v, %v", page, err)
+	}
+	for _, request := range []content.PageRequest{
+		{Limit: -1}, {Limit: content.MaxPageSize + 1}, {Cursor: "bad"}, {Cursor: strings.Repeat("A", 64)},
+	} {
+		if _, err := store.ListBlobs(context.Background(), request); !errors.Is(err, content.ErrInvalid) {
+			t.Fatalf("invalid request %#v = %v", request, err)
+		}
+	}
+	if _, err := store.ListBlobs(nil, content.PageRequest{}); !errors.Is(err, content.ErrInvalid) { //nolint:staticcheck // Verify nil rejection.
+		t.Fatalf("nil context = %v", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.ListBlobs(canceled, content.PageRequest{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled inventory = %v", err)
+	}
+	if _, err := store.ListBlobs(&errAfterContext{remaining: 3}, content.PageRequest{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("inventory cancellation during scan = %v", err)
+	}
+
+	values := blobMaxHeap{expected[0], expected[1]}
+	heap.Init(&values)
+	heap.Push(&values, expected[2])
+	if popped := heap.Pop(&values).(content.Blob); popped != expected[2] { //nolint:forcetypeassert // Internal heap contract.
+		t.Fatalf("max heap popped %#v, want %#v", popped, expected[2])
 	}
 }
 
