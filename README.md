@@ -14,11 +14,20 @@ signing, and authorization. The independent `model` package defines validated
 repository keys, opaque commit OIDs, refs, immutable complete snapshots, and
 ordinary or Xet-backed file references for higher-level catalogs. It does not
 invent Hugging Face/Git commit hashing or import persistence and HTTP policy.
-The `catalog` contract and `catalog/memory` reference implementation add
-repository-scoped revision/file lookup, atomic immutable-snapshot publication,
-compare-and-swap refs, and snapshot-bound bounded pagination. A trusted
-control-plane adapter allocates an opaque OID before publication; the catalog
-does not derive one from its versioned internal equality fingerprint.
+The `catalog` contract, `catalog/memory` reference implementation, and
+`catalog/sqlite` durable implementation add repository-scoped revision/file
+lookup, atomic immutable-snapshot publication, compare-and-swap refs, and
+snapshot-bound bounded pagination. SQLite uses a versioned schema, WAL with
+`synchronous=FULL`, context-aware immediate write transactions, and one atomic
+transaction for snapshot, file, and ref publication. A trusted control-plane
+adapter allocates an opaque OID before publication; the catalog does not derive
+one from its versioned internal equality fingerprint.
+
+`catalog/sqlite` requires a trusted private directory: it rejects symlink path
+components but cannot fence hostile concurrent path, WAL, or SHM replacement by
+another identity that can rename entries in that directory. Durability also
+depends on truthful local-filesystem locking and sync behavior. Callers should
+use contexts with deadlines when write-lock wait time must be bounded.
 
 The implementation is verified against official `huggingface/xet-core` 1.6.0
 commit `de71453d952bd8b806edaa997c72313051a49050` and the checksummed official
@@ -505,6 +514,10 @@ read resolves one of those scoped records before reaching physical content.
 | `xetcas/server` | Storage-neutral CAS ingestion, shard registration, reconstruction/delta planning, authorization, signed range URLs, and HTTP handlers |
 | `xetcas/server/s3store` | S3-compatible immutable Xorb/shard bytes, bounded inventory, and exact SigV4 range signing |
 | `xetcas/server/postgresstore` | PostgreSQL CAS indexes, transactional shard publication, protections, expiry, and bounded inventory |
+| `model` | Validated repository, revision, immutable snapshot, ref, path, and ordinary/Xet file-reference domain types |
+| `catalog` | Hosting-neutral repository catalog contract and typed errors |
+| `catalog/memory` | Transactional in-memory catalog reference semantics |
+| `catalog/sqlite` | Pure-Go durable SQLite catalog with atomic snapshot/ref publication, restart persistence, and bounded keyset pagination |
 | `chunker` | Streaming official GearHash content-defined chunking |
 | `xethash` | Canonical hashes, BLAKE3 domains, Merkle aggregation, and compact subtrees |
 | `xorb` | Network and complete/cache xorb codecs for none, LZ4, BG4-LZ4, and production auto selection |

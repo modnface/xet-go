@@ -19,31 +19,13 @@ const SnapshotFingerprintVersion = 1
 // CanonicalSnapshot validates and deep-clones a complete snapshot, ordering
 // files by canonical UTF-8 path bytes. It does not derive or reinterpret OID.
 func CanonicalSnapshot(snapshot Snapshot) (Snapshot, error) {
-	if err := ValidateRepoKey(snapshot.Repo); err != nil {
-		return Snapshot{}, err
-	}
-	if snapshot.OID.IsZero() {
-		return Snapshot{}, fmt.Errorf("model: snapshot has a zero commit OID")
-	}
-	if snapshot.Parent != nil && (snapshot.Parent.IsZero() || *snapshot.Parent == snapshot.OID) {
-		return Snapshot{}, fmt.Errorf("model: snapshot parent is zero or self-referential")
-	}
-	createdAt, err := canonicalTime(snapshot.CreatedAt)
+	info, err := CanonicalSnapshotInfo(snapshot.Info())
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("model: snapshot creation time: %w", err)
-	}
-	if err := validateText("author name", snapshot.Author.Name, MaxIdentityBytes, true, false); err != nil {
-		return Snapshot{}, err
-	}
-	if err := validateText("author email", snapshot.Author.Email, MaxIdentityBytes, false, false); err != nil {
-		return Snapshot{}, err
-	}
-	if err := validateText("snapshot message", snapshot.Message, MaxMessageBytes, true, true); err != nil {
 		return Snapshot{}, err
 	}
 	result := Snapshot{
-		Repo: snapshot.Repo, OID: snapshot.OID, Parent: cloneOID(snapshot.Parent), CreatedAt: createdAt,
-		Author: snapshot.Author, Message: snapshot.Message, Files: make([]FileEntry, len(snapshot.Files)),
+		Repo: info.Repo, OID: info.OID, Parent: info.Parent, CreatedAt: info.CreatedAt,
+		Author: info.Author, Message: info.Message, Files: make([]FileEntry, len(snapshot.Files)),
 	}
 	for index, entry := range snapshot.Files {
 		path, err := ParseFilePath(string(entry.Path))
@@ -87,6 +69,39 @@ func CanonicalSnapshot(snapshot Snapshot) (Snapshot, error) {
 		}
 	}
 	return result, nil
+}
+
+// CanonicalSnapshotInfo validates and deep-clones immutable snapshot metadata
+// without requiring its complete file tree.
+func CanonicalSnapshotInfo(info SnapshotInfo) (SnapshotInfo, error) {
+	if err := ValidateRepoKey(info.Repo); err != nil {
+		return SnapshotInfo{}, err
+	}
+	if info.OID.IsZero() {
+		return SnapshotInfo{}, fmt.Errorf("model: snapshot has a zero commit OID")
+	}
+	if info.Parent != nil && (info.Parent.IsZero() || *info.Parent == info.OID) {
+		return SnapshotInfo{}, fmt.Errorf("model: snapshot parent is zero or self-referential")
+	}
+	createdAt, err := canonicalTime(info.CreatedAt)
+	if err != nil {
+		return SnapshotInfo{}, fmt.Errorf("model: snapshot creation time: %w", err)
+	}
+	if err := validateText("author name", info.Author.Name, MaxIdentityBytes, true, false); err != nil {
+		return SnapshotInfo{}, err
+	}
+	if err := validateText("author email", info.Author.Email, MaxIdentityBytes, false, false); err != nil {
+		return SnapshotInfo{}, err
+	}
+	if err := validateText("snapshot message", info.Message, MaxMessageBytes, true, true); err != nil {
+		return SnapshotInfo{}, err
+	}
+	if info.FileCount < 0 {
+		return SnapshotInfo{}, fmt.Errorf("model: snapshot file count is negative")
+	}
+	info.Parent = cloneOID(info.Parent)
+	info.CreatedAt = createdAt
+	return info, nil
 }
 
 func canonicalFileRef(ref FileRef) (FileRef, error) {

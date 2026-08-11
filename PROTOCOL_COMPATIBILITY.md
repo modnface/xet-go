@@ -39,6 +39,7 @@
 | Global Xorb-index repair | Bounded exact reconciliation of missing global layout metadata from canonical complete-Xorb payloads; no shard/scoped-index inference, payload mutation, reachability, retention, or deletion authority |
 | Model domain | Hosting-neutral, case-sensitive repository keys; strict NFC paths/refs; opaque server-assigned 40-lowercase-hex commit OIDs; immutable complete snapshots; and ordinary/Xet file references. No compatible commit-OID derivation or Hub DTO claim |
 | Memory catalog | Repository-scoped immutable snapshots and files; atomic target-state-idempotent ref publication; first-publication `main`; bounded operation-bound repository/snapshot/file cursors; file continuations pinned to an immutable snapshot OID; no durable-backend or Hub-control-plane claim |
+| SQLite model catalog | The same catalog contract on a versioned pure-Go SQLite schema; WAL plus `synchronous=FULL`; context-aware immediate write serialization across independent handles; atomic snapshot/file/ref publication; restart persistence; retained-row validation; and bounded snapshot-bound keyset cursors. No PostgreSQL model-catalog or Hub-control-plane claim |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
 | Credential refresh | Refresh 30 seconds before expiry, coalesce concurrent refresh, and retry exactly once after a 401 invalidation |
@@ -240,6 +241,14 @@ Other platforms return `ErrDurabilityUnsupported` before changing the requested
 filesystem or SQLite path. The local backend assumes a filesystem with truthful
 `fsync`, hard-link, and advisory-lock semantics; concurrent mutation by another
 process running as the service identity is outside its threat model.
+
+The separate `catalog/sqlite` backend likewise requires a trusted private
+directory and truthful local WAL, locking, and sync semantics. Its path checks
+do not fence hostile concurrent database/WAL/SHM replacement. Uncancelled
+write contexts may wait indefinitely behind a persistent writer. Pagination is
+weakly consistent across calls, and startup schema probing verifies required
+queryable columns and the required index name rather than serving as a complete
+constraint, foreign-key, or database-integrity audit.
 
 Remaining production storage boundaries are:
 

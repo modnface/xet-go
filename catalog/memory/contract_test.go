@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/jmwoliver/xet-go/catalog"
 	"github.com/jmwoliver/xet-go/catalog/memory"
+	sqlitecatalog "github.com/jmwoliver/xet-go/catalog/sqlite"
 	"github.com/jmwoliver/xet-go/model"
 )
 
@@ -19,6 +21,17 @@ type catalogFactory func(testing.TB) catalog.Catalog
 
 func TestMemoryCatalogContract(t *testing.T) {
 	runCatalogContract(t, func(testing.TB) catalog.Catalog { return memory.New() })
+}
+
+func TestSQLiteCatalogContract(t *testing.T) {
+	runCatalogContract(t, func(tb testing.TB) catalog.Catalog {
+		store, err := sqlitecatalog.Open(filepath.Join(tb.TempDir(), "catalog.db"))
+		if err != nil {
+			tb.Fatal(err)
+		}
+		tb.Cleanup(func() { _ = store.Close() })
+		return store
+	})
 }
 
 func runCatalogContract(t *testing.T, factory catalogFactory) {
