@@ -61,6 +61,9 @@ func New(options Options) (*Service, error) {
 	if options.CASTokens == nil {
 		return nil, fmt.Errorf("%w: CAS token authority is required", ErrInvalid)
 	}
+	if _, ok := options.Catalog.(catalog.RefLister); !ok {
+		return nil, fmt.Errorf("%w: catalog ref inventory is required", ErrInvalid)
+	}
 
 	broker, err := auth.NewBroker(auth.BrokerOptions{
 		Authenticator: options.HubAuthenticator,

@@ -26,6 +26,8 @@ import (
 	"github.com/jmwoliver/xet-go/xorb"
 )
 
+type catalogWithoutRefListing struct{ catalog.Catalog }
+
 func TestServiceStreamsOrdinaryAndXetFiles(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepo(t, "owner", "model")
@@ -130,6 +132,14 @@ func TestServiceStreamsOrdinaryAndXetFiles(t *testing.T) {
 	if ref, err := service.GetRef(ctx, repo, "release"); err != nil || ref.OID != oid {
 		t.Fatalf("get release ref = %#v, %v", ref, err)
 	}
+	firstRefs, err := service.ListRefs(ctx, repo, catalog.RefQuery{Limit: 1})
+	if err != nil || len(firstRefs.Items) != 1 || firstRefs.Items[0].Name != "main" || firstRefs.NextCursor == "" {
+		t.Fatalf("first ref page = %#v, %v", firstRefs, err)
+	}
+	secondRefs, err := service.ListRefs(ctx, repo, catalog.RefQuery{Limit: 1, Cursor: firstRefs.NextCursor})
+	if err != nil || len(secondRefs.Items) != 1 || secondRefs.Items[0].Name != "release" || secondRefs.NextCursor != "" {
+		t.Fatalf("second ref page = %#v, %v", secondRefs, err)
+	}
 	if page, err := service.ListFiles(ctx, repo, revision, catalog.FileQuery{}); err != nil || len(page.Items) != 4 || page.SnapshotOID != oid {
 		t.Fatalf("list files = %#v, %v", page, err)
 	}
@@ -228,6 +238,13 @@ func TestServiceConfigurationAndErrors(t *testing.T) {
 	if _, err := service.GetRepository(nil, model.RepoKey{}); !errors.Is(err, ErrInvalid) { //nolint:staticcheck // Verify nil-context rejection.
 		t.Fatalf("nil context = %v", err)
 	}
+	withoutRefs, err := New(Options{Catalog: catalogWithoutRefListing{metadata}, Content: ordinary, CAS: cas})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := withoutRefs.ListRefs(context.Background(), testRepo(t, "owner", "unsupported-refs"), catalog.RefQuery{}); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("unsupported ref inventory = %v", err)
+	}
 	validRepo := testRepo(t, "owner", "input-validation")
 	validRevision, err := model.ParseRevision("main")
 	if err != nil {
@@ -252,6 +269,10 @@ func TestServiceConfigurationAndErrors(t *testing.T) {
 		},
 		"ref": func() error {
 			_, err := service.GetRef(nil, validRepo, "main") //nolint:staticcheck // Verify that the API rejects a nil context.
+			return err
+		},
+		"refs": func() error {
+			_, err := service.ListRefs(nil, validRepo, catalog.RefQuery{}) //nolint:staticcheck // Verify that the API rejects a nil context.
 			return err
 		},
 		"compare ref": func() error {

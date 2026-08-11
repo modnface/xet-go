@@ -21,14 +21,19 @@ import (
 	"github.com/jmwoliver/xet-go/model"
 )
 
-type catalogFactory func(testing.TB) catalog.Catalog
+type contractCatalog interface {
+	catalog.Catalog
+	catalog.RefLister
+}
+
+type catalogFactory func(testing.TB) contractCatalog
 
 func TestMemoryCatalogContract(t *testing.T) {
-	runCatalogContract(t, func(testing.TB) catalog.Catalog { return memory.New() })
+	runCatalogContract(t, func(testing.TB) contractCatalog { return memory.New() })
 }
 
 func TestSQLiteCatalogContract(t *testing.T) {
-	runCatalogContract(t, func(tb testing.TB) catalog.Catalog {
+	runCatalogContract(t, func(tb testing.TB) contractCatalog {
 		store, err := sqlitecatalog.Open(filepath.Join(tb.TempDir(), "catalog.db"))
 		if err != nil {
 			tb.Fatal(err)
@@ -53,7 +58,7 @@ func TestPostgreSQLCatalogContract(t *testing.T) {
 		t.Fatal("configure PostgreSQL test pool")
 	}
 	t.Cleanup(pool.Close)
-	runCatalogContract(t, func(tb testing.TB) catalog.Catalog {
+	runCatalogContract(t, func(tb testing.TB) contractCatalog {
 		schema := fmt.Sprintf("xet_catalog_contract_%d_%d", os.Getpid(), postgresSchemaSequence.Add(1))
 		store, openErr := postgrescatalog.New(context.Background(), pool, postgrescatalog.Options{Schema: schema})
 		if openErr != nil {
@@ -74,11 +79,12 @@ func runCatalogContract(t *testing.T, factory catalogFactory) {
 	t.Run("first publication", func(t *testing.T) { testFirstPublicationCreatesMain(t, factory(t)) })
 	t.Run("concurrent publication", func(t *testing.T) { testConcurrentPublication(t, factory(t)) })
 	t.Run("snapshot pagination order", func(t *testing.T) { testSnapshotPaginationOrder(t, factory(t)) })
+	t.Run("ref pagination order", func(t *testing.T) { testRefPaginationOrder(t, factory(t)) })
 	t.Run("error semantics", func(t *testing.T) { testErrorSemantics(t, factory(t)) })
 	t.Run("cancellation", func(t *testing.T) { testCancellation(t, factory(t)) })
 }
 
-func testRepositories(t *testing.T, store catalog.Catalog) {
+func testRepositories(t *testing.T, store contractCatalog) {
 	t.Helper()
 	created := time.Date(2026, 8, 11, 12, 0, 0, 0, time.FixedZone("offset", 3600))
 	repositories := []model.Repository{
@@ -138,7 +144,7 @@ func testRepositories(t *testing.T, store catalog.Catalog) {
 	}
 }
 
-func testPublicationAndReads(t *testing.T, store catalog.Catalog) {
+func testPublicationAndReads(t *testing.T, store contractCatalog) {
 	t.Helper()
 	ctx := context.Background()
 	repo := createRepository(t, store, "team", "model")
@@ -270,7 +276,7 @@ func testPublicationAndReads(t *testing.T, store catalog.Catalog) {
 	}
 }
 
-func testFirstPublicationCreatesMain(t *testing.T, store catalog.Catalog) {
+func testFirstPublicationCreatesMain(t *testing.T, store contractCatalog) {
 	t.Helper()
 	repo := createRepository(t, store, "team", "first")
 	root := snapshot(t, repo, oid(t, 20), nil, time.Unix(100, 0), "root", "a")
@@ -285,7 +291,7 @@ func testFirstPublicationCreatesMain(t *testing.T, store catalog.Catalog) {
 	}
 }
 
-func testConcurrentPublication(t *testing.T, store catalog.Catalog) {
+func testConcurrentPublication(t *testing.T, store contractCatalog) {
 	t.Helper()
 	ctx := context.Background()
 	repo := createRepository(t, store, "team", "concurrent")
@@ -335,7 +341,7 @@ func testConcurrentPublication(t *testing.T, store catalog.Catalog) {
 	}
 }
 
-func testSnapshotPaginationOrder(t *testing.T, store catalog.Catalog) {
+func testSnapshotPaginationOrder(t *testing.T, store contractCatalog) {
 	t.Helper()
 	ctx := context.Background()
 	repo := createRepository(t, store, "order", "snapshots")
@@ -366,7 +372,60 @@ func testSnapshotPaginationOrder(t *testing.T, store catalog.Catalog) {
 	}
 }
 
-func testErrorSemantics(t *testing.T, store catalog.Catalog) {
+func testRefPaginationOrder(t *testing.T, store contractCatalog) {
+	t.Helper()
+	ctx := context.Background()
+	repo := createRepository(t, store, "order", "refs")
+	root := snapshot(t, repo, oid(t, 70), nil, time.Unix(1, 0), "root", "a")
+	if err := store.PublishSnapshot(ctx, root, catalog.ExpectRef("main", nil)); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []model.RefName{"release/z", "Alpha", "zeta", "éclair"} {
+		if err := store.CompareAndSwapRef(ctx, repo, name, nil, root.OID); err != nil {
+			t.Fatalf("create ref %q: %v", name, err)
+		}
+	}
+	want := []model.RefName{"Alpha", "main", "release/z", "zeta", "éclair"}
+	cursor := ""
+	for index, name := range want {
+		page, err := store.ListRefs(ctx, repo, catalog.RefQuery{Limit: 1, Cursor: cursor})
+		if err != nil || len(page.Items) != 1 || page.Items[0].Repo != repo ||
+			page.Items[0].Name != name || page.Items[0].OID != root.OID {
+			t.Fatalf("ref page %d = %#v, %v; want %q", index, page, err, name)
+		}
+		cursor = page.NextCursor
+		if (index < len(want)-1) != (cursor != "") {
+			t.Fatalf("ref continuation %d = %q", index, cursor)
+		}
+	}
+	other := createRepository(t, store, "order", "other-refs")
+	if page, err := store.ListRefs(ctx, other, catalog.RefQuery{}); err != nil || len(page.Items) != 0 {
+		t.Fatalf("empty ref page = %#v, %v", page, err)
+	}
+	first, err := store.ListRefs(ctx, repo, catalog.RefQuery{Limit: 1})
+	if err != nil || first.NextCursor == "" {
+		t.Fatalf("first ref cursor = %#v, %v", first, err)
+	}
+	if _, err := store.ListRefs(ctx, other, catalog.RefQuery{Cursor: first.NextCursor}); !errors.Is(err, catalog.ErrInvalid) {
+		t.Fatalf("cross-repository ref cursor = %v", err)
+	}
+	missing := repoKey(t, "order", "missing-refs")
+	if _, err := store.ListRefs(ctx, missing, catalog.RefQuery{Cursor: "bad"}); !errors.Is(err, catalog.ErrInvalid) {
+		t.Fatalf("invalid cursor precedence = %v", err)
+	}
+	if _, err := store.ListRefs(ctx, missing, catalog.RefQuery{Limit: -1}); !errors.Is(err, catalog.ErrInvalid) {
+		t.Fatalf("invalid limit precedence = %v", err)
+	}
+	for _, query := range []catalog.RefQuery{
+		{Cursor: "bad"}, {Limit: -1}, {Limit: catalog.MaxPageSize + 1},
+	} {
+		if _, err := store.ListRefs(ctx, repo, query); !errors.Is(err, catalog.ErrInvalid) {
+			t.Fatalf("invalid ref query %#v = %v", query, err)
+		}
+	}
+}
+
+func testErrorSemantics(t *testing.T, store contractCatalog) {
 	t.Helper()
 	ctx := context.Background()
 	repo := createRepository(t, store, "errors", "model")
@@ -382,6 +441,9 @@ func testErrorSemantics(t *testing.T, store catalog.Catalog) {
 	}
 	if _, err := store.GetRef(ctx, missingRepo, "main"); !errors.Is(err, catalog.ErrNotFound) {
 		t.Fatalf("get ref from missing repository = %v", err)
+	}
+	if _, err := store.ListRefs(ctx, missingRepo, catalog.RefQuery{}); !errors.Is(err, catalog.ErrNotFound) {
+		t.Fatalf("list refs from missing repository = %v", err)
 	}
 	if err := store.CompareAndSwapRef(ctx, missingRepo, "main", nil, root.OID); !errors.Is(err, catalog.ErrNotFound) {
 		t.Fatalf("CAS missing repository = %v", err)
@@ -456,7 +518,7 @@ func testErrorSemantics(t *testing.T, store catalog.Catalog) {
 	}
 }
 
-func testCancellation(t *testing.T, store catalog.Catalog) {
+func testCancellation(t *testing.T, store contractCatalog) {
 	t.Helper()
 	repo := repoKey(t, "team", "canceled")
 	repository := model.Repository{Key: repo, CreatedAt: time.Unix(1, 0)}
@@ -472,6 +534,7 @@ func testCancellation(t *testing.T, store catalog.Catalog) {
 		func() error { _, err := store.GetSnapshot(ctx, repo, snapshot.OID); return err },
 		func() error { _, err := store.ListSnapshots(ctx, repo, catalog.SnapshotQuery{}); return err },
 		func() error { _, err := store.GetRef(ctx, repo, "main"); return err },
+		func() error { _, err := store.ListRefs(ctx, repo, catalog.RefQuery{}); return err },
 		func() error { return store.CompareAndSwapRef(ctx, repo, "main", nil, snapshot.OID) },
 		func() error { return store.PublishSnapshot(ctx, snapshot, catalog.ExpectRef("main", nil)) },
 		func() error { _, err := store.GetFile(ctx, repo, revision, "a"); return err },
@@ -487,7 +550,7 @@ func testCancellation(t *testing.T, store catalog.Catalog) {
 	}
 }
 
-func createRepository(t testing.TB, store catalog.Catalog, namespace, name string) model.RepoKey {
+func createRepository(t testing.TB, store contractCatalog, namespace, name string) model.RepoKey {
 	t.Helper()
 	key := repoKey(t, namespace, name)
 	if err := store.CreateRepository(context.Background(), model.Repository{Key: key, CreatedAt: time.Unix(1, 0)}); err != nil {

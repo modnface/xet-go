@@ -330,6 +330,9 @@ func TestPublicationDetectsCorruptRetainedState(t *testing.T) {
 		if _, err := store.db.Exec("INSERT INTO refs VALUES(?,?,?,?,?)", repo.Type, repo.Namespace, repo.Name, "dangling", dangling[:]); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := store.ListRefs(ctx, repo, catalog.RefQuery{}); !errors.Is(err, catalog.ErrCorrupt) {
+			t.Fatalf("list dangling ref = %v", err)
+		}
 		root := testSnapshot(t, repo, testOID(t, 61), nil, time.Unix(2, 0), "root")
 		if err := store.PublishSnapshot(ctx, root, catalog.ExpectRef("main", nil)); !errors.Is(err, catalog.ErrCorrupt) {
 			t.Fatalf("publication with dangling ref = %v", err)
@@ -602,7 +605,8 @@ func TestRetainedRefCorruptionIsNeverAConflict(t *testing.T) {
 	}
 	store = openTestStore(t, path)
 	for operation, run := range map[string]func() error{
-		"get": func() error { _, err := store.GetRef(ctx, repo, "main"); return err },
+		"get":  func() error { _, err := store.GetRef(ctx, repo, "main"); return err },
+		"list": func() error { _, err := store.ListRefs(ctx, repo, catalog.RefQuery{}); return err },
 		"resolve": func() error {
 			_, err := store.ResolveRevision(ctx, repo, testRevisionRef(t, "main"))
 			return err
@@ -936,6 +940,9 @@ func TestClosedStoreAndCancellation(t *testing.T) {
 	if _, err := store.GetRef(context.Background(), repo, "main"); !errors.Is(err, catalog.ErrUnavailable) {
 		t.Fatalf("closed ref = %v", err)
 	}
+	if _, err := store.ListRefs(context.Background(), repo, catalog.RefQuery{}); !errors.Is(err, catalog.ErrUnavailable) {
+		t.Fatalf("closed refs = %v", err)
+	}
 	root := testSnapshot(t, repo, testOID(t, 66), nil, time.Unix(2, 0), "root")
 	if err := store.PublishSnapshot(context.Background(), root, catalog.ExpectRef("main", nil)); !errors.Is(err, catalog.ErrUnavailable) {
 		t.Fatalf("closed publication = %v", err)
@@ -1018,6 +1025,23 @@ func TestRepositoryRefAndFileOperations(t *testing.T) {
 	}
 	if _, err := store.GetRef(ctx, repo, "missing"); !errors.Is(err, catalog.ErrNotFound) {
 		t.Fatalf("missing ref = %v", err)
+	}
+	refs, err := store.ListRefs(ctx, repo, catalog.RefQuery{Limit: 1})
+	if err != nil || len(refs.Items) != 1 || refs.Items[0].Name != "main" || refs.NextCursor == "" {
+		t.Fatalf("first ref page = %#v, %v", refs, err)
+	}
+	refs, err = store.ListRefs(ctx, repo, catalog.RefQuery{Limit: 1, Cursor: refs.NextCursor})
+	if err != nil || len(refs.Items) != 1 || refs.Items[0].Name != "release" || refs.NextCursor != "" {
+		t.Fatalf("second ref page = %#v, %v", refs, err)
+	}
+	if _, err := store.ListRefs(ctx, repo, catalog.RefQuery{Cursor: "bad"}); !errors.Is(err, catalog.ErrInvalid) {
+		t.Fatalf("invalid ref cursor = %v", err)
+	}
+	if refs, err := store.ListRefs(ctx, repos[0], catalog.RefQuery{}); err != nil || len(refs.Items) != 0 {
+		t.Fatalf("empty ref page = %#v, %v", refs, err)
+	}
+	if _, err := store.ListRefs(ctx, testRepo(t, "missing", "repo"), catalog.RefQuery{}); !errors.Is(err, catalog.ErrNotFound) {
+		t.Fatalf("missing repository refs = %v", err)
 	}
 
 	file, err := store.GetFile(ctx, repo, testRevisionRef(t, "main"), "config.json")
@@ -1135,6 +1159,7 @@ func TestInvalidInputsAcrossOperations(t *testing.T) {
 	parentMismatch := testSnapshot(t, repo, testOID(t, 51), &root.OID, time.Unix(3, 0), "mismatch")
 	wrong := testOID(t, 52)
 	badSnapshotCursor := enc(cursor{Kind: "snapshots", Repository: sortKey(repo), Timestamp: new(int64), OID: "bad"})
+	badRefCursor := enc(cursor{Kind: "snapshots", Repository: sortKey(repo), Last: "main"})
 	badFileCursor := enc(cursor{Kind: "files", Repository: sortKey(repo), Last: "config.json", OID: "bad"})
 
 	checks := map[string]func() error{
@@ -1155,6 +1180,9 @@ func TestInvalidInputsAcrossOperations(t *testing.T) {
 			return err
 		},
 		"get ref":          func() error { _, err := store.GetRef(ctx, repo, "../bad"); return err },
+		"list refs key":    func() error { _, err := store.ListRefs(ctx, badKey, catalog.RefQuery{}); return err },
+		"list refs limit":  func() error { _, err := store.ListRefs(ctx, repo, catalog.RefQuery{Limit: -1}); return err },
+		"list refs cursor": func() error { _, err := store.ListRefs(ctx, repo, catalog.RefQuery{Cursor: badRefCursor}); return err },
 		"cas ref":          func() error { return store.CompareAndSwapRef(ctx, repo, "../bad", nil, root.OID) },
 		"cas expectation":  func() error { return store.CompareAndSwapRef(ctx, repo, "main", &zero, root.OID) },
 		"publish snapshot": func() error { return store.PublishSnapshot(ctx, invalidSnapshot, catalog.ExpectRef("main", nil)) },
@@ -1217,6 +1245,7 @@ func TestUnexpectedDatabaseClosureIsUnavailable(t *testing.T) {
 		"resolve":           func() error { _, err := store.ResolveRevision(ctx, repo, testRevisionRef(t, "main")); return err },
 		"list snapshots":    func() error { _, err := store.ListSnapshots(ctx, repo, catalog.SnapshotQuery{}); return err },
 		"get ref":           func() error { _, err := store.GetRef(ctx, repo, "main"); return err },
+		"list refs":         func() error { _, err := store.ListRefs(ctx, repo, catalog.RefQuery{}); return err },
 		"cas":               func() error { return store.CompareAndSwapRef(ctx, repo, "main", nil, root.OID) },
 		"publish":           func() error { return store.PublishSnapshot(ctx, root, catalog.ExpectRef("main", nil)) },
 		"get file": func() error {

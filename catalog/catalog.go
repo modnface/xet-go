@@ -48,6 +48,26 @@ type SnapshotPage struct {
 	NextCursor string
 }
 
+type RefQuery struct {
+	Cursor string
+	Limit  int
+}
+
+// RefPage is ordered by canonical, case-sensitive ref-name bytes. Pagination
+// is weakly consistent across calls: advancing or creating refs during a scan
+// can change later pages. It is inventory, not destructive-GC authority;
+// deletion requires an epoch, quiescence, or equivalent lease/grace protocol.
+type RefPage struct {
+	Items      []model.Ref
+	NextCursor string
+}
+
+// RefLister is an optional maintenance capability so existing Catalog
+// implementations are not forced to support operational inventory.
+type RefLister interface {
+	ListRefs(context.Context, model.RepoKey, RefQuery) (RefPage, error)
+}
+
 type FileQuery struct {
 	Prefix model.FilePrefix
 	Cursor string

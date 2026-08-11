@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jmwoliver/xet-go/auth"
+	"github.com/jmwoliver/xet-go/catalog"
 	"github.com/jmwoliver/xet-go/catalog/memory"
 	contentmemory "github.com/jmwoliver/xet-go/content/memory"
 	"github.com/jmwoliver/xet-go/model"
@@ -17,6 +18,8 @@ import (
 	casserver "github.com/jmwoliver/xet-go/xetcas/server"
 	"github.com/jmwoliver/xet-go/xethash"
 )
+
+type catalogWithoutRefListing struct{ catalog.Catalog }
 
 func TestServiceComposesTypedAndSeparateHTTPBoundaries(t *testing.T) {
 	options, manager := validOptions(t)
@@ -96,6 +99,7 @@ func TestNewRejectsIncoherentCapabilities(t *testing.T) {
 		{"Hub authenticator", func(options *Options) { options.HubAuthenticator = nil }},
 		{"repository authorizer", func(options *Options) { options.RepositoryAuthorizer = nil }},
 		{"catalog", func(options *Options) { options.Catalog = nil }},
+		{"catalog ref listing", func(options *Options) { options.Catalog = catalogWithoutRefListing{options.Catalog} }},
 		{"content", func(options *Options) { options.Content = nil }},
 		{"blobs", func(options *Options) { options.CAS.Blobs = nil }},
 		{"index", func(options *Options) { options.CAS.Index = nil }},

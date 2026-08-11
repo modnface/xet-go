@@ -610,6 +610,66 @@ func (s *Store) GetRef(ctx context.Context, k model.RepoKey, n model.RefName) (m
 	}
 	return model.Ref{Repo: k, Name: n, OID: o}, nil
 }
+
+func (s *Store) ListRefs(ctx context.Context, k model.RepoKey, q catalog.RefQuery) (catalog.RefPage, error) {
+	if e := validKey(ctx, s, k); e != nil {
+		return catalog.RefPage{}, e
+	}
+	l, e := limit(q.Limit)
+	if e != nil {
+		return catalog.RefPage{}, e
+	}
+	var after model.RefName
+	hasAfter := false
+	if q.Cursor != "" {
+		c, x := dec(q.Cursor)
+		name, nameErr := model.ParseRefName(c.Last)
+		if x != nil || nameErr != nil || c.Kind != "refs" || c.Repository != sortKey(k) ||
+			c.Namespace != "" || c.RepoType != "" || c.Prefix != "" || c.Timestamp != nil || c.OID != "" {
+			return catalog.RefPage{}, invalid(errors.New("bad cursor"))
+		}
+		after = name
+		hasAfter = true
+	}
+	if _, e := s.GetRepository(ctx, k); e != nil {
+		return catalog.RefPage{}, e
+	}
+	rows, e := s.db.QueryContext(ctx, `SELECT r.ref_name,r.oid,s.oid FROM refs r
+LEFT JOIN snapshots s ON s.repo_type=r.repo_type AND s.namespace=r.namespace AND s.name=r.name AND s.oid=r.oid
+WHERE r.repo_type=? AND r.namespace=? AND r.name=? AND (?=0 OR r.ref_name>?)
+ORDER BY r.ref_name COLLATE BINARY LIMIT ?`, append(kargs(k), boolInt(hasAfter), after, l+1)...)
+	if e != nil {
+		return catalog.RefPage{}, dbErr(ctx, e)
+	}
+	defer rows.Close() //nolint:errcheck // rows.Err reports iteration failures.
+	p := catalog.RefPage{}
+	for rows.Next() {
+		var name string
+		var encoded, target []byte
+		if e = rows.Scan(&name, &encoded, &target); e != nil {
+			return p, corrupt(e)
+		}
+		parsed, parseErr := model.ParseRefName(name)
+		var oid, targetOID model.OID
+		if parseErr != nil || !copyOID(&oid, encoded) || !copyOID(&targetOID, target) || oid != targetOID {
+			return p, corrupt(errors.New("invalid ref"))
+		}
+		ref := model.Ref{Repo: k, Name: parsed, OID: oid}
+		if e = model.ValidateRef(ref); e != nil {
+			return p, corrupt(e)
+		}
+		p.Items = append(p.Items, ref)
+	}
+	if e = rows.Err(); e != nil {
+		return p, dbErr(ctx, e)
+	}
+	if len(p.Items) > l {
+		p.Items = p.Items[:l]
+		p.NextCursor = enc(cursor{Kind: "refs", Repository: sortKey(k), Last: string(p.Items[l-1].Name)})
+	}
+	return p, nil
+}
+
 func (s *Store) CompareAndSwapRef(ctx context.Context, k model.RepoKey, n model.RefName, expected *model.OID, newOID model.OID) error {
 	if e := validRef(ctx, s, k, n, newOID); e != nil {
 		return e

@@ -91,8 +91,12 @@ bundle, repository policy, and coherent CAS token authority; it installs the
 namespace-scoped CAS authorizer rather than accepting a second policy. The
 result promotes the typed `bucket.Service` API and exposes separate
 `HubHandler` and `CASHandler` mounts. It also exposes bounded read-only CAS
-inventory and payload-audit pages. Those diagnostics do not establish catalog
-reachability or make object deletion safe.
+inventory and payload-audit pages and requires the catalog's optional,
+repository-scoped `RefLister` inventory capability. Core `bucket.Service`
+remains compatible with catalogs that omit that maintenance capability and
+returns `bucket.ErrUnsupported` from `ListRefs`. Ref and CAS inventory pages
+are weakly consistent diagnostics; they do not establish complete reachability
+or make object deletion safe.
 
 The implementation is verified against official `huggingface/xet-core` 1.6.0
 commit `de71453d952bd8b806edaa997c72313051a49050` and the checksummed official

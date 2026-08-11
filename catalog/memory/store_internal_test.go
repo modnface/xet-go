@@ -1,9 +1,11 @@
 package memory
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jmwoliver/xet-go/catalog"
 	"github.com/jmwoliver/xet-go/model"
@@ -42,6 +44,20 @@ func TestCursorValidationRejectsMalformedState(t *testing.T) {
 		} else if _, _, _, err := prepareFileQuery(testRepoKey(), catalog.FileQuery{Cursor: encodeCursor(value)}); !errors.Is(err, catalog.ErrInvalid) {
 			t.Fatalf("invalid file cursor %#v = %v", value, err)
 		}
+	}
+}
+
+func TestListRefsRejectsDanglingTarget(t *testing.T) {
+	store := New()
+	key := testRepoKey()
+	if err := store.CreateRepository(context.Background(), model.Repository{Key: key, CreatedAt: time.Unix(1, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.repos[key].refs["main"] = model.OID{1}
+	store.mu.Unlock()
+	if _, err := store.ListRefs(context.Background(), key, catalog.RefQuery{}); !errors.Is(err, catalog.ErrCorrupt) {
+		t.Fatalf("dangling ref list = %v", err)
 	}
 }
 

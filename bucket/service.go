@@ -139,6 +139,22 @@ func (service *Service) GetRef(ctx context.Context, repo model.RepoKey, name mod
 	return result, mapCatalogError(err)
 }
 
+func (service *Service) ListRefs(
+	ctx context.Context,
+	repo model.RepoKey,
+	query catalog.RefQuery,
+) (catalog.RefPage, error) {
+	if err := validContext(ctx); err != nil {
+		return catalog.RefPage{}, err
+	}
+	lister, ok := service.catalog.(catalog.RefLister)
+	if !ok {
+		return catalog.RefPage{}, ErrUnsupported
+	}
+	result, err := lister.ListRefs(ctx, repo, query)
+	return result, mapCatalogError(err)
+}
+
 func (service *Service) CompareAndSwapRef(
 	ctx context.Context,
 	repo model.RepoKey,

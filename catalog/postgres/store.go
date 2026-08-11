@@ -897,6 +897,69 @@ func (s *Store) GetRef(ctx context.Context, k model.RepoKey, n model.RefName) (m
 	}
 	return model.Ref{Repo: k, Name: n, OID: o}, nil
 }
+
+func (s *Store) ListRefs(ctx context.Context, k model.RepoKey, q catalog.RefQuery) (catalog.RefPage, error) {
+	if e := s.check(ctx); e != nil {
+		return catalog.RefPage{}, e
+	}
+	if e := validKey(ctx, k); e != nil {
+		return catalog.RefPage{}, e
+	}
+	n, e := limit(q.Limit)
+	if e != nil {
+		return catalog.RefPage{}, e
+	}
+	var after *string
+	if q.Cursor != "" {
+		c, x := dec(q.Cursor)
+		name, nameErr := model.ParseRefName(c.Last)
+		if x != nil || nameErr != nil || c.Op != "refs" || c.Scope != scope(k) || c.Filter != "" ||
+			c.Time != nil || c.OID != "" {
+			return catalog.RefPage{}, invalid(errors.New("mismatched cursor"))
+		}
+		value := string(name)
+		after = &value
+	}
+	if e := s.ensureRepositoryExists(ctx, s.pool, k); e != nil {
+		return catalog.RefPage{}, e
+	}
+	rows, e := s.pool.Query(ctx, `SELECT r.ref_name,r.oid,s.oid FROM `+s.q("refs")+` r
+LEFT JOIN `+s.q("snapshots")+` s ON s.repo_type=r.repo_type AND s.namespace=r.namespace AND s.name=r.name AND s.oid=r.oid
+WHERE r.repo_type=$1 AND r.namespace=$2 AND r.name=$3 AND ($4::text IS NULL OR r.ref_name COLLATE pg_catalog."C">$4)
+ORDER BY r.ref_name COLLATE pg_catalog."C" LIMIT $5`, k.Type, k.Namespace, k.Name, after, n+1)
+	if e != nil {
+		return catalog.RefPage{}, dbErr(ctx, e)
+	}
+	defer rows.Close()
+	p := catalog.RefPage{}
+	for rows.Next() {
+		var name string
+		var encoded, target []byte
+		if e = rows.Scan(&name, &encoded, &target); e != nil {
+			return p, corrupt(e)
+		}
+		parsed, parseErr := model.ParseRefName(name)
+		oid, oidErr := oidBytes(encoded)
+		targetOID, targetErr := oidBytes(target)
+		if parseErr != nil || oidErr != nil || targetErr != nil || oid != targetOID {
+			return p, corrupt(errors.New("invalid ref"))
+		}
+		ref := model.Ref{Repo: k, Name: parsed, OID: oid}
+		if e = model.ValidateRef(ref); e != nil {
+			return p, corrupt(e)
+		}
+		p.Items = append(p.Items, ref)
+	}
+	if e = rows.Err(); e != nil {
+		return p, dbErr(ctx, e)
+	}
+	if len(p.Items) > n {
+		p.Items = p.Items[:n]
+		p.NextCursor = enc(cursor{Op: "refs", Scope: scope(k), Last: string(p.Items[n-1].Name)})
+	}
+	return p, nil
+}
+
 func copyExpected(o *model.OID) (model.OID, bool, error) {
 	if o == nil {
 		return model.OID{}, false, nil

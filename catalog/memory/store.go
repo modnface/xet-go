@@ -268,6 +268,75 @@ func (store *Store) GetRef(
 	return model.Ref{Repo: key, Name: name, OID: oid}, nil
 }
 
+func (store *Store) ListRefs(
+	ctx context.Context,
+	key model.RepoKey,
+	query catalog.RefQuery,
+) (catalog.RefPage, error) {
+	if err := validateContextAndRepo(ctx, key); err != nil {
+		return catalog.RefPage{}, err
+	}
+	limit, after, err := prepareRefQuery(key, query)
+	if err != nil {
+		return catalog.RefPage{}, err
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return catalog.RefPage{}, err
+	}
+	state, exists := store.repos[key]
+	if !exists {
+		return catalog.RefPage{}, notFound("repository")
+	}
+	names := make([]model.RefName, 0, len(state.refs))
+	index := 0
+	for name := range state.refs {
+		if index&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return catalog.RefPage{}, err
+			}
+		}
+		names = append(names, name)
+		index++
+	}
+	slices.SortFunc(names, func(left, right model.RefName) int {
+		return strings.Compare(string(left), string(right))
+	})
+	if err := ctx.Err(); err != nil {
+		return catalog.RefPage{}, err
+	}
+	page := catalog.RefPage{Items: make([]model.Ref, 0, min(len(names), limit+1))}
+	for index, name := range names {
+		if index&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return catalog.RefPage{}, err
+			}
+		}
+		if string(name) <= after {
+			continue
+		}
+		ref := model.Ref{Repo: key, Name: name, OID: state.refs[name]}
+		if err := model.ValidateRef(ref); err != nil {
+			return catalog.RefPage{}, fmt.Errorf("catalog memory: ref: %w: %v", catalog.ErrCorrupt, err)
+		}
+		if _, exists := state.snapshots[ref.OID]; !exists {
+			return catalog.RefPage{}, fmt.Errorf("catalog memory: dangling ref: %w", catalog.ErrCorrupt)
+		}
+		page.Items = append(page.Items, ref)
+		if len(page.Items) == limit+1 {
+			break
+		}
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.NextCursor = encodeCursor(cursor{
+			Kind: "refs", Repository: repositorySortKey(key), Last: string(page.Items[limit-1].Name),
+		})
+	}
+	return page, nil
+}
+
 func (store *Store) CompareAndSwapRef(
 	ctx context.Context,
 	key model.RepoKey,
@@ -527,6 +596,26 @@ func prepareSnapshotQuery(key model.RepoKey, query catalog.SnapshotQuery) (int, 
 		return 0, snapshotPosition{}, invalid(errors.New("malformed or mismatched snapshot cursor"))
 	}
 	return limit, snapshotPosition{timestamp: *decoded.SnapshotUnixNanoseconds, oid: oid, set: true}, nil
+}
+
+func prepareRefQuery(key model.RepoKey, query catalog.RefQuery) (int, string, error) {
+	limit, err := pageLimit(query.Limit)
+	if err != nil {
+		return 0, "", err
+	}
+	if query.Cursor == "" {
+		return limit, "", nil
+	}
+	decoded, err := decodeCursor(query.Cursor)
+	if err != nil || decoded.Kind != "refs" || decoded.Repository != repositorySortKey(key) ||
+		decoded.Namespace != "" || decoded.RepoType != "" || decoded.Prefix != "" ||
+		decoded.SnapshotUnixNanoseconds != nil || decoded.SnapshotOID != "" {
+		return 0, "", invalid(errors.New("malformed or mismatched ref cursor"))
+	}
+	if _, err := model.ParseRefName(decoded.Last); err != nil {
+		return 0, "", invalid(errors.New("malformed or mismatched ref cursor"))
+	}
+	return limit, decoded.Last, nil
 }
 
 func prepareFileQuery(
