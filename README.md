@@ -7,10 +7,13 @@ Rust or requiring a Hugging Face-specific SDK at runtime.
 
 The module is deliberately hosting-decoupled. Callers provide an already-issued
 Xet CAS endpoint and bearer token through `xetcas.CASAccessProvider`; repository
-lookup, host authentication, branches, and commits remain in the calling
-application. The optional `xetcas/server` package implements the other side of
-that boundary through injected blob storage, indexes, range-URL signing, and
-authorization.
+lookup, host authentication, and compatible commit transport remain in the
+calling application. The optional `xetcas/server` package implements the other
+side of the CAS boundary through injected blob storage, indexes, range-URL
+signing, and authorization. The independent `model` package defines validated
+repository keys, opaque commit OIDs, refs, immutable complete snapshots, and
+ordinary or Xet-backed file references for higher-level catalogs. It does not
+invent Hugging Face/Git commit hashing or import persistence and HTTP policy.
 
 The implementation is verified against official `huggingface/xet-core` 1.6.0
 commit `de71453d952bd8b806edaa997c72313051a49050` and the checksummed official
