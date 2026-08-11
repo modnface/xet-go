@@ -131,8 +131,15 @@ func (s *Service) authorize(ctx context.Context, credential string, request Acce
 }
 
 func (s *Service) acquireIngest(ctx context.Context) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	select {
 	case s.ingestSlots <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-s.ingestSlots
+			return nil, err
+		}
 		return func() { <-s.ingestSlots }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
