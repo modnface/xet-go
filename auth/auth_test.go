@@ -113,6 +113,80 @@ func TestBrokerAppliesAuthenticationPolicyAndScope(t *testing.T) {
 	}
 }
 
+func TestBrokerRepositoryGrantNarrowsWithoutReauthentication(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0).UTC()
+	manager := testTokenManager(t, &now, CASTokenManagerOptions{
+		Issuer: "miniface", Audience: "cas", SigningKey: HMACKey{ID: "key", Secret: bytes.Repeat([]byte{0x31}, minimumKeyBytes)},
+	})
+	repository := testRepo(t, "owner", "grant-model")
+	authentications, authorizations := 0, 0
+	broker, err := NewBroker(BrokerOptions{
+		Authenticator: HubAuthenticatorFunc(func(context.Context, string) (Principal, error) {
+			authentications++
+			return Principal{Subject: "user:grant"}, nil
+		}),
+		Authorizer: RepositoryAuthorizerFunc(func(_ context.Context, access RepositoryAccess) error {
+			authorizations++
+			if access.Repository != repository || access.Permission != RepositoryRead {
+				return ErrPermissionDenied
+			}
+			return nil
+		}),
+		Tokens: manager,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := broker.AuthorizeRepository(context.Background(), "hub-token", repository, RepositoryRead)
+	if err != nil || authentications != 1 || authorizations != 1 {
+		t.Fatalf("repository grant = %#v, %v; authentication=%d authorization=%d", grant, err, authentications, authorizations)
+	}
+	issued, err := broker.IssueCASTokenForGrant(context.Background(), grant, CASRead, time.Minute)
+	if err != nil || authentications != 1 || authorizations != 1 {
+		t.Fatalf("grant token = %#v, %v; authentication=%d authorization=%d", issued, err, authentications, authorizations)
+	}
+	claims, err := manager.VerifyCASToken(context.Background(), issued.Value)
+	wantNamespace, namespaceErr := RepositoryNamespace(repository)
+	if err != nil || namespaceErr != nil || claims.Subject != "user:grant" || claims.Namespace != wantNamespace || claims.Permissions != CASRead {
+		t.Fatalf("grant claims = %#v, verify=%v namespace=%v", claims, err, namespaceErr)
+	}
+	if _, err := broker.IssueCASTokenForGrant(context.Background(), grant, CASWrite, 0); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("widen read grant to write = %v", err)
+	}
+	if _, err := broker.IssueCASTokenForGrant(context.Background(), RepositoryGrant{}, CASRead, 0); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("zero grant = %v", err)
+	}
+	other, err := NewBroker(BrokerOptions{
+		Authenticator: StaticTokenAuthenticator{Token: "unused", Principal: Principal{Subject: "other"}},
+		Authorizer:    RepositoryAuthorizerFunc(func(context.Context, RepositoryAccess) error { return nil }),
+		Tokens:        manager,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.IssueCASTokenForGrant(context.Background(), grant, CASRead, 0); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("foreign grant = %v", err)
+	}
+	if _, err := broker.AuthorizeRepository(context.Background(), "hub-token", repository, RepositoryPermission("delete")); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid repository permission = %v", err)
+	}
+	if _, err := broker.IssueCASTokenForGrant(context.Background(), grant, 0, 0); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid narrowed permissions = %v", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := broker.IssueCASTokenForGrant(canceled, grant, CASRead, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled grant token = %v", err)
+	}
+	var nilBroker *Broker
+	if _, err := nilBroker.AuthorizeRepository(context.Background(), "hub-token", repository, RepositoryRead); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("nil broker authorization = %v", err)
+	}
+	if _, err := nilBroker.IssueCASTokenForGrant(context.Background(), grant, CASRead, 0); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("nil broker grant token = %v", err)
+	}
+}
+
 func TestBrokerIssuesTokenForMaximumWidthRepositoryKey(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0).UTC()
 	manager := testTokenManager(t, &now, CASTokenManagerOptions{

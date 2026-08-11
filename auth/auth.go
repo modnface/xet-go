@@ -117,11 +117,33 @@ type Broker struct {
 	tokens        CASTokenIssuer
 }
 
+// RepositoryGrant is an opaque, broker-bound repository authorization result.
+// It can be narrowed into a scoped CAS token without repeating Hub
+// authentication or repository policy. Callers cannot construct or widen it.
+type RepositoryGrant struct {
+	broker       *Broker
+	principal    Principal
+	repository   model.RepoKey
+	readAllowed  bool
+	writeAllowed bool
+}
+
 func NewBroker(options BrokerOptions) (*Broker, error) {
 	if options.Authenticator == nil || options.Authorizer == nil || options.Tokens == nil {
 		return nil, fmt.Errorf("%w: authenticator, repository authorizer, and token issuer are required", ErrInvalid)
 	}
 	return &Broker{authenticator: options.Authenticator, authorizer: options.Authorizer, tokens: options.Tokens}, nil
+}
+
+// AuthorizeRepository authenticates one Hub credential and applies one
+// repository permission without consulting repository storage.
+func (broker *Broker) AuthorizeRepository(
+	ctx context.Context,
+	hubCredential string,
+	repository model.RepoKey,
+	permission RepositoryPermission,
+) (RepositoryGrant, error) {
+	return broker.authorizeRepository(ctx, hubCredential, repository, []RepositoryPermission{permission})
 }
 
 func (broker *Broker) IssueCASToken(
@@ -143,37 +165,99 @@ func (broker *Broker) IssueCASToken(
 	if !permissions.Valid() {
 		return IssuedCASToken{}, fmt.Errorf("%w: invalid CAS permissions", ErrInvalid)
 	}
-	principal, err := broker.authenticator.Authenticate(ctx, hubCredential)
+	wanted := make([]RepositoryPermission, 0, 2)
+	if permissions.Allows(CASRead) {
+		wanted = append(wanted, RepositoryRead)
+	}
+	if permissions.Allows(CASWrite) {
+		wanted = append(wanted, RepositoryWrite)
+	}
+	grant, err := broker.authorizeRepository(ctx, hubCredential, repository, wanted)
 	if err != nil {
-		return IssuedCASToken{}, mapAuthenticationError(ctx, err)
+		return IssuedCASToken{}, err
 	}
-	if err = principal.Validate(); err != nil {
-		return IssuedCASToken{}, fmt.Errorf("%w: authenticator returned an invalid principal", ErrUnavailable)
+	return broker.IssueCASTokenForGrant(ctx, grant, permissions, ttl)
+}
+
+// IssueCASTokenForGrant narrows one authorization result into a CAS token.
+// Grants are valid only with the Broker that produced them, and repository
+// write permission does not implicitly grant repository or CAS read access.
+func (broker *Broker) IssueCASTokenForGrant(
+	ctx context.Context,
+	grant RepositoryGrant,
+	permissions CASPermissions,
+	ttl time.Duration,
+) (IssuedCASToken, error) {
+	if err := validContext(ctx); err != nil {
+		return IssuedCASToken{}, err
 	}
-	for _, requested := range []struct {
-		permission RepositoryPermission
-		required   CASPermissions
-	}{
-		{permission: RepositoryRead, required: CASRead},
-		{permission: RepositoryWrite, required: CASWrite},
-	} {
-		if !permissions.Allows(requested.required) {
-			continue
-		}
-		err = broker.authorizer.AuthorizeRepository(ctx, RepositoryAccess{
-			Principal: principal, Repository: repository, Permission: requested.permission,
-		})
-		if err != nil {
-			return IssuedCASToken{}, mapAuthorizationError(ctx, err)
-		}
+	if broker == nil || broker.tokens == nil {
+		return IssuedCASToken{}, fmt.Errorf("%w: token broker is not configured", ErrUnavailable)
 	}
-	namespace, err := RepositoryNamespace(repository)
+	if !permissions.Valid() {
+		return IssuedCASToken{}, fmt.Errorf("%w: invalid CAS permissions", ErrInvalid)
+	}
+	if grant.broker != broker || grant.principal.Validate() != nil || model.ValidateRepoKey(grant.repository) != nil {
+		return IssuedCASToken{}, fmt.Errorf("%w: invalid or foreign repository grant", ErrInvalid)
+	}
+	if permissions.Allows(CASRead) && !grant.readAllowed || permissions.Allows(CASWrite) && !grant.writeAllowed {
+		return IssuedCASToken{}, ErrPermissionDenied
+	}
+	namespace, err := RepositoryNamespace(grant.repository)
 	if err != nil {
 		return IssuedCASToken{}, err
 	}
 	return broker.tokens.IssueCASToken(ctx, CASTokenRequest{
-		Principal: principal, Namespace: namespace, Permissions: permissions, TTL: ttl,
+		Principal: grant.principal, Namespace: namespace, Permissions: permissions, TTL: ttl,
 	})
+}
+
+func (broker *Broker) authorizeRepository(
+	ctx context.Context,
+	hubCredential string,
+	repository model.RepoKey,
+	permissions []RepositoryPermission,
+) (RepositoryGrant, error) {
+	if err := validContext(ctx); err != nil {
+		return RepositoryGrant{}, err
+	}
+	if broker == nil || broker.authenticator == nil || broker.authorizer == nil || broker.tokens == nil {
+		return RepositoryGrant{}, fmt.Errorf("%w: token broker is not configured", ErrUnavailable)
+	}
+	if err := model.ValidateRepoKey(repository); err != nil {
+		return RepositoryGrant{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	if len(permissions) == 0 {
+		return RepositoryGrant{}, fmt.Errorf("%w: repository permission is required", ErrInvalid)
+	}
+	for _, permission := range permissions {
+		if permission != RepositoryRead && permission != RepositoryWrite {
+			return RepositoryGrant{}, fmt.Errorf("%w: invalid repository permission", ErrInvalid)
+		}
+	}
+	principal, err := broker.authenticator.Authenticate(ctx, hubCredential)
+	if err != nil {
+		return RepositoryGrant{}, mapAuthenticationError(ctx, err)
+	}
+	if err = principal.Validate(); err != nil {
+		return RepositoryGrant{}, fmt.Errorf("%w: authenticator returned an invalid principal", ErrUnavailable)
+	}
+	grant := RepositoryGrant{broker: broker, principal: principal, repository: repository}
+	for _, permission := range permissions {
+		err = broker.authorizer.AuthorizeRepository(ctx, RepositoryAccess{
+			Principal: principal, Repository: repository, Permission: permission,
+		})
+		if err != nil {
+			return RepositoryGrant{}, mapAuthorizationError(ctx, err)
+		}
+		switch permission {
+		case RepositoryRead:
+			grant.readAllowed = true
+		case RepositoryWrite:
+			grant.writeAllowed = true
+		}
+	}
+	return grant, nil
 }
 
 // CASAuthorizer adapts verified CAS claims to the low-level server's generic
