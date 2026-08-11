@@ -41,6 +41,16 @@ use contexts with deadlines when write-lock wait time must be bounded.
 it rejects observed symlinks but does not defend against hostile same-identity
 path replacement or provide object deletion.
 
+The hosting-neutral `bucket` façade composes a catalog, ordinary-content store,
+and trusted CAS reconstruction capability. Repository keys map to deterministic
+opaque CAS namespaces, so callers select repositories rather than raw storage
+scopes. `OpenFile` resolves one immutable snapshot entry and returns the same
+typed metadata and stream shape for ordinary and Xet-backed files, including
+half-open ranges, stable entity tags, cancellation, and typed backend errors.
+The local filesystem + SQLite profile is restart-tested with old-revision Xet
+reads and durable cross-repository namespace isolation. Authentication and
+Hugging Face-compatible HTTP translation remain separate higher boundaries.
+
 The implementation is verified against official `huggingface/xet-core` 1.6.0
 commit `de71453d952bd8b806edaa997c72313051a49050` and the checksummed official
 reference corpus. See [CONFORMANCE.md](CONFORMANCE.md),
@@ -533,6 +543,7 @@ read resolves one of those scoped records before reaching physical content.
 | `content` | CAS-independent immutable ordinary-blob storage contract, identities, ranges, and typed errors |
 | `content/memory` | Concurrent ephemeral ordinary-content storage and reference semantics |
 | `content/filesystem` | Linux/macOS crash-consistent immutable ordinary-content publication and streaming |
+| `bucket` | Hosting-neutral repository façade and uniform ordinary/Xet file streaming with derived CAS namespace isolation |
 | `chunker` | Streaming official GearHash content-defined chunking |
 | `xethash` | Canonical hashes, BLAKE3 domains, Merkle aggregation, and compact subtrees |
 | `xorb` | Network and complete/cache xorb codecs for none, LZ4, BG4-LZ4, and production auto selection |

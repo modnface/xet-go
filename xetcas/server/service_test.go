@@ -475,6 +475,75 @@ func TestServiceNamespaceScopesLogicalReachability(t *testing.T) {
 	if _, err := tenantB.OpenFile(ctx, "", fileHash, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-namespace stream = %v", err)
 	}
+	if _, err := tenantB.OpenFileInNamespace(ctx, "", fileHash, nil); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("empty trusted namespace = %v", err)
+	}
+	if _, err := tenantB.OpenFileInNamespace(ctx, "tenant-a", xethash.Chunk([]byte("missing file")), nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing trusted file = %v", err)
+	}
+	trusted, err := tenantB.OpenFileInNamespace(ctx, "tenant-a", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, readErr := io.ReadAll(trusted.Body); readErr != nil || !bytes.Equal(got, objectContents(none)) {
+		t.Fatalf("trusted scoped stream = %d bytes, %v", len(got), readErr)
+	}
+	if err := trusted.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	trustedRange := xetcas.FileRange{Start: 11, End: 127}
+	trusted, err = tenantB.OpenFileInNamespace(ctx, "tenant-a", fileHash, &trustedRange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, readErr := io.ReadAll(trusted.Body); readErr != nil || !bytes.Equal(got, objectContents(none)[trustedRange.Start:trustedRange.End]) {
+		t.Fatalf("trusted scoped range = %d bytes, %v", len(got), readErr)
+	}
+	if err := trusted.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tenantB.OpenFileInNamespace(nil, "tenant-a", fileHash, nil); err == nil { //nolint:staticcheck // Verify nil-context rejection.
+		t.Fatal("trusted nil-context open succeeded")
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := tenantB.OpenFileInNamespace(canceled, "tenant-a", fileHash, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("trusted canceled open = %v", err)
+	}
+	var authorizationCalls atomic.Int64
+	trustedOnly, err := New(Options{
+		Blobs: store, Index: store,
+		Signer: RangeURLSignerFunc(func(context.Context, BlobKey, xetcas.HTTPRange) (SignedRange, error) {
+			return signedTestRange("https://storage.example/object"), nil
+		}),
+		Authorizer: authorizerFunc(func(context.Context, string, AccessRequest) (Grant, error) {
+			authorizationCalls.Add(1)
+			return Grant{}, ErrForbidden
+		}),
+		DedupProtectionKey: xethash.Chunk([]byte("trusted bypass test key")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trusted, err = trustedOnly.OpenFileInNamespace(ctx, "tenant-a", fileHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, readErr := io.ReadAll(trusted.Body); readErr != nil || !bytes.Equal(got, objectContents(none)) {
+		t.Fatalf("trusted authorization bypass = %d bytes, %v", len(got), readErr)
+	}
+	if err := trusted.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := authorizationCalls.Load(); got != 0 {
+		t.Fatalf("trusted open authorization calls = %d", got)
+	}
+	if _, err := trustedOnly.OpenFile(ctx, "credential", fileHash, nil); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("credential open authorization = %v", err)
+	}
+	if got := authorizationCalls.Load(); got != 1 {
+		t.Fatalf("credential open authorization calls = %d", got)
+	}
 	if _, err := tenantB.GlobalDedup(ctx, "", xetcas.DefaultDedupPrefix, none.Chunks[0].Hash); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-namespace dedup read = %v", err)
 	}
@@ -1091,17 +1160,68 @@ func TestServicePublicationStagesAndReadLeases(t *testing.T) {
 		t.Fatalf("early close after failed lease release = %v", err)
 	}
 
+	leases, err = store.ListFileLeases(ctx, nil, PageRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleLeaseCount := len(leases.Items)
 	faults.failAt = "renew-lease"
 	service.readLeaseTTL = 30 * time.Millisecond
 	opened, err = service.OpenFile(ctx, "", fileHash, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(20 * time.Millisecond)
+	deadline := time.Now().Add(time.Second)
+	for {
+		leases, err = store.ListFileLeases(ctx, nil, PageRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(leases.Items) == staleLeaseCount {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lease renewal failure did not settle unread stream")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if _, err := io.ReadAll(opened.Body); err == nil || !strings.Contains(err.Error(), "renew file read lease") {
 		t.Fatalf("read after lease renewal failure = %v", err)
 	}
-	_ = opened.Body.Close()
+	if err := opened.Body.Close(); err == nil || !strings.Contains(err.Error(), "renew file read lease") {
+		t.Fatalf("close after lease renewal failure = %v", err)
+	}
+}
+
+func TestTypedStreamRetainsCombinedReadAndCloseFailures(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	service := testService(t, store, nil)
+	none, _, value, shardBody := uploadFixture(t)
+	if _, err := service.UploadXorb(ctx, "", xetcas.DefaultXorbPrefix, none.Hash,
+		bytes.NewReader(none.Body), int64(len(none.Body))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UploadShard(ctx, "", bytes.NewReader(shardBody), int64(len(shardBody))); err != nil {
+		t.Fatal(err)
+	}
+	closeFailure := errors.New("injected Xorb close failure")
+	service.blobs = &getOverrideBlobStore{
+		BlobStore: store,
+		get: func(context.Context, BlobKey, *xetcas.HTTPRange) (io.ReadCloser, error) {
+			return &faultReadCloser{Reader: bytes.NewReader([]byte{0xff}), closeErr: closeFailure}, nil
+		},
+	}
+	opened, err := service.OpenFile(ctx, "", value.Files[0].Hash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = io.ReadAll(opened.Body); !errors.Is(err, ErrCorrupt) || !errors.Is(err, closeFailure) {
+		t.Fatalf("combined stream failure = %v", err)
+	}
+	if err = opened.Body.Close(); !errors.Is(err, ErrCorrupt) || !errors.Is(err, closeFailure) {
+		t.Fatalf("combined close failure = %v", err)
+	}
 }
 
 func TestSignedLeaseFinalizationKeepsHeartbeatActive(t *testing.T) {
@@ -1164,6 +1284,22 @@ func TestCancelReadCloserReturnsSettledStreamError(t *testing.T) {
 		t.Fatalf("close after settled stream error = %v", err)
 	}
 }
+
+type getOverrideBlobStore struct {
+	BlobStore
+	get func(context.Context, BlobKey, *xetcas.HTTPRange) (io.ReadCloser, error)
+}
+
+func (store *getOverrideBlobStore) Get(ctx context.Context, key BlobKey, wanted *xetcas.HTTPRange) (io.ReadCloser, error) {
+	return store.get(ctx, key, wanted)
+}
+
+type faultReadCloser struct {
+	io.Reader
+	closeErr error
+}
+
+func (reader *faultReadCloser) Close() error { return reader.closeErr }
 
 func (f *faultIndex) take(name string) error {
 	f.mu.Lock()

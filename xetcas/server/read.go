@@ -425,13 +425,41 @@ func (s *Service) OpenFile(
 	if err != nil {
 		return nil, err
 	}
+	return s.openFileInNamespace(ctx, grant.Namespace, hash, requested)
+}
+
+// OpenFileInNamespace is the trusted embedding form of OpenFile. It skips CAS
+// credential authorization because the calling service has already authorized
+// repository access and resolved that repository to a logical CAS namespace.
+// HTTP handlers and untrusted callers must use OpenFile instead.
+func (s *Service) OpenFileInNamespace(
+	ctx context.Context,
+	namespace string,
+	hash xethash.Hash,
+	requested *xetcas.FileRange,
+) (*OpenedFile, error) {
+	if ctx == nil {
+		return nil, errors.New("xet CAS server: nil open-file context")
+	}
+	if namespace == "" {
+		return nil, fmt.Errorf("%w: trusted open requires a namespace", ErrInvalid)
+	}
+	return s.openFileInNamespace(ctx, namespace, hash, requested)
+}
+
+func (s *Service) openFileInNamespace(
+	ctx context.Context,
+	namespace string,
+	hash xethash.Hash,
+	requested *xetcas.FileRange,
+) (*OpenedFile, error) {
 	streamContext, cancel := context.WithCancelCause(ctx)
-	lease, err := s.acquireActiveFileLease(streamContext, cancel, grant.Namespace, hash)
+	lease, err := s.acquireActiveFileLease(streamContext, cancel, namespace, hash)
 	if err != nil {
 		cancel(err)
 		return nil, err
 	}
-	file, plan, err := s.reconstructionPlan(streamContext, grant.Namespace, hash, requested)
+	file, plan, err := s.reconstructionPlan(streamContext, namespace, hash, requested)
 	if err != nil {
 		cancel(err)
 		return nil, errors.Join(err, lease.Close())
@@ -458,9 +486,8 @@ func (s *Service) OpenFile(
 	}()
 	go func() {
 		select {
-		case <-ctx.Done():
-			_ = reader.CloseWithError(ctx.Err())
-			cancel(ctx.Err())
+		case <-streamContext.Done():
+			_ = reader.CloseWithError(context.Cause(streamContext))
 		case <-settlement.done:
 		}
 	}()
@@ -631,11 +658,11 @@ func (s *Service) streamReconstruction(
 		}()
 		close(readerDone)
 		closeErr := reader.Close()
-		if groupErr != nil {
-			return groupErr
-		}
 		if closeErr != nil {
-			return fmt.Errorf("xet CAS server: close xorb %s range: %w", group.blob.Hash, closeErr)
+			closeErr = fmt.Errorf("xet CAS server: close xorb %s range: %w", group.blob.Hash, closeErr)
+		}
+		if err := errors.Join(groupErr, closeErr); err != nil {
+			return err
 		}
 	}
 	if skip != 0 || remaining != 0 {
