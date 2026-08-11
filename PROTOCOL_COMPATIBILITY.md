@@ -40,6 +40,7 @@
 | Model domain | Hosting-neutral, case-sensitive repository keys; strict NFC paths/refs; opaque server-assigned 40-lowercase-hex commit OIDs; immutable complete snapshots; and ordinary/Xet file references. No compatible commit-OID derivation or Hub DTO claim |
 | Memory catalog | Repository-scoped immutable snapshots and files; atomic target-state-idempotent ref publication; first-publication `main`; bounded operation-bound repository/snapshot/file cursors; file continuations pinned to an immutable snapshot OID; no durable-backend or Hub-control-plane claim |
 | SQLite model catalog | The same catalog contract on a versioned pure-Go SQLite schema; WAL plus `synchronous=FULL`; context-aware immediate write serialization across independent handles; atomic snapshot/file/ref publication; restart persistence; retained-row validation; and bounded snapshot-bound keyset cursors. No PostgreSQL model-catalog or Hub-control-plane claim |
+| Ordinary content | CAS-independent SHA-256-plus-length identities; exact verified immutable uploads; idempotent memory and Linux/macOS filesystem publication; full/hash-verified and half-open range streams; cancellation and typed errors. The filesystem layout is versioned and uses same-directory temp, file-sync, hard-link, and full ancestor-directory barriers; no S3/cache, deletion, or repository authorization claim |
 | Delta upload | v2 file-chunk-hashes dirty windows with exact compact Merkle-subtree JSON and merging |
 | CAS response encoding | Bounded identity, gzip, zstd, and stacked content encoding for JSON, NDJSON, and binary bodies |
 | Credential refresh | Refresh 30 seconds before expiry, coalesce concurrent refresh, and retry exactly once after a 401 invalidation |
@@ -237,10 +238,13 @@ durable profile now pairs `FilesystemBlobStore` with `SQLiteIndexStore`:
   than silently skipping them.
 
 Strict directory durability is currently implemented only on Linux and macOS.
-Other platforms return `ErrDurabilityUnsupported` before changing the requested
-filesystem or SQLite path. The local backend assumes a filesystem with truthful
+Other platforms return `ErrDurabilityUnsupported` before changing a requested
+CAS-blob, ordinary-content, or SQLite path. A mounted filesystem that rejects
+directory sync is classified the same way. Local backends assume truthful
 `fsync`, hard-link, and advisory-lock semantics; concurrent mutation by another
-process running as the service identity is outside its threat model.
+process running as the service identity is outside their threat model. The
+ordinary-content backend deliberately permits independent processes to race
+immutable publication and therefore does not take the exclusive CAS-root lock.
 
 The separate `catalog/sqlite` backend likewise requires a trusted private
 directory and truthful local WAL, locking, and sync semantics. Its path checks
@@ -252,10 +256,14 @@ constraint, foreign-key, or database-integrity audit.
 
 Remaining production storage boundaries are:
 
-1. operator policy and grace-based cleanup for missing, corrupt, or persistently
+1. S3-compatible ordinary-content storage and the optional filesystem read
+   cache;
+2. a PostgreSQL model catalog implementing the same contract as memory and
+   SQLite;
+3. operator policy and grace-based cleanup for missing, corrupt, or persistently
    blocked recovery stages (expiration or protection deletion alone never
    authorizes object deletion);
-2. catalog reachability roots and read/maintenance epochs for destructive work;
-3. namespace-safe shard/index repair, resumable mark-and-sweep, and guarded
+4. catalog reachability roots and read/maintenance epochs for destructive work;
+5. namespace-safe shard/index repair, resumable mark-and-sweep, and guarded
    garbage collection built on the current bounded audits, global Xorb-layout
    reconciliation, and explicit root primitives.

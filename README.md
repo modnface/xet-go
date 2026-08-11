@@ -23,11 +23,23 @@ transaction for snapshot, file, and ref publication. A trusted control-plane
 adapter allocates an opaque OID before publication; the catalog does not derive
 one from its versioned internal equality fingerprint.
 
+The independent `content` contract stores ordinary files by SHA-256 and exact
+length without importing repository or CAS policy. Its memory and Linux/macOS
+filesystem implementations provide absent-or-identical immutable publication,
+full and half-open range streams, exact upload verification, full-read hash
+verification, cancellation, and typed corruption/range/backend errors. The
+filesystem backend uses private versioned keys, same-directory temporary files,
+file sync, atomic hard-link publication, and directory barriers through the
+filesystem root. Separate processes may safely race identical publication.
+
 `catalog/sqlite` requires a trusted private directory: it rejects symlink path
 components but cannot fence hostile concurrent path, WAL, or SHM replacement by
 another identity that can rename entries in that directory. Durability also
 depends on truthful local-filesystem locking and sync behavior. Callers should
 use contexts with deadlines when write-lock wait time must be bounded.
+`content/filesystem` has the same trusted-root and truthful-sync assumptions;
+it rejects observed symlinks but does not defend against hostile same-identity
+path replacement or provide object deletion.
 
 The implementation is verified against official `huggingface/xet-core` 1.6.0
 commit `de71453d952bd8b806edaa997c72313051a49050` and the checksummed official
@@ -518,6 +530,9 @@ read resolves one of those scoped records before reaching physical content.
 | `catalog` | Hosting-neutral repository catalog contract and typed errors |
 | `catalog/memory` | Transactional in-memory catalog reference semantics |
 | `catalog/sqlite` | Pure-Go durable SQLite catalog with atomic snapshot/ref publication, restart persistence, and bounded keyset pagination |
+| `content` | CAS-independent immutable ordinary-blob storage contract, identities, ranges, and typed errors |
+| `content/memory` | Concurrent ephemeral ordinary-content storage and reference semantics |
+| `content/filesystem` | Linux/macOS crash-consistent immutable ordinary-content publication and streaming |
 | `chunker` | Streaming official GearHash content-defined chunking |
 | `xethash` | Canonical hashes, BLAKE3 domains, Merkle aggregation, and compact subtrees |
 | `xorb` | Network and complete/cache xorb codecs for none, LZ4, BG4-LZ4, and production auto selection |
