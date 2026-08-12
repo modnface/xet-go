@@ -486,6 +486,11 @@ func (b *UploadBatch) flushCurrent() error {
 	for i := range object.Chunks {
 		object.Chunks[i].Data = nil
 	}
+	// Placements retain pending until the shard is finalized, but only its
+	// finalized hash is needed from this point onward. Release source payloads
+	// now so upload memory stays bounded by the active and queued xorbs.
+	pending.chunks = nil
+	pending.fileBoundaries = nil
 	b.current = &pendingXorb{}
 	select {
 	case <-b.ctx.Done():
