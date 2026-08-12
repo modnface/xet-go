@@ -39,8 +39,15 @@ type CASFileOpener interface {
 	OpenFileInNamespace(context.Context, string, xethash.Hash, *xetcas.FileRange) (*casserver.OpenedFile, error)
 }
 
-// CASFileService opens files and verifies exact file requirements in a trusted
-// repository scope without exposing raw namespaces to bucket callers.
+// CASFileCloner is the narrow trusted same-CAS clone capability used by
+// Service. Service derives both namespaces from application repository keys.
+type CASFileCloner interface {
+	CloneFileBetweenNamespaces(context.Context, string, string, xethash.Hash, uint64, *[32]byte) error
+}
+
+// CASFileService opens and verifies exact files in trusted repository scopes
+// without exposing raw namespaces to bucket callers. CloneXetFile additionally
+// requires CASFileCloner.
 type CASFileService interface {
 	CASFileOpener
 	VerifyFileInNamespace(context.Context, string, xethash.Hash, uint64, *[32]byte) error
@@ -178,6 +185,38 @@ func (service *Service) PutBlob(ctx context.Context, blob content.Blob, body io.
 	}
 	inserted, err := service.content.Put(ctx, blob, body)
 	return inserted, mapContentPublicationError(err)
+}
+
+// CloneXetFile makes one exact, durably registered source Xet file available
+// in another repository namespace of the same CAS without reading, chunking,
+// or uploading logical file or Xorb payload bytes. The caller must separately
+// authorize source repository reads and destination repository writes.
+func (service *Service) CloneXetFile(
+	ctx context.Context,
+	sourceRepo model.RepoKey,
+	destinationRepo model.RepoKey,
+	hash xethash.Hash,
+	expectedSize uint64,
+	expectedSHA256 *[32]byte,
+) error {
+	if err := validContext(ctx); err != nil {
+		return err
+	}
+	sourceNamespace, err := RepositoryNamespace(sourceRepo)
+	if err != nil {
+		return err
+	}
+	destinationNamespace, err := RepositoryNamespace(destinationRepo)
+	if err != nil {
+		return err
+	}
+	cloner, ok := service.cas.(CASFileCloner)
+	if !ok {
+		return ErrUnsupported
+	}
+	return mapCASCloneError(cloner.CloneFileBetweenNamespaces(
+		ctx, sourceNamespace, destinationNamespace, hash, expectedSize, expectedSHA256,
+	))
 }
 
 // PublishSnapshot validates a complete immutable tree, preflights every
@@ -505,6 +544,25 @@ func mapCASPublicationError(path model.FilePath, err error) error {
 		return fmt.Errorf("%w: Xet file %q: %w", ErrUnsupported, path, err)
 	default:
 		return fmt.Errorf("%w: Xet file %q: %w", ErrUnavailable, path, err)
+	}
+}
+
+func mapCASCloneError(err error) error {
+	switch {
+	case err == nil, errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
+	case errors.Is(err, casserver.ErrNotFound):
+		return fmt.Errorf("%w: source Xet file is not durably available: %w", ErrContentNotUploaded, err)
+	case errors.Is(err, casserver.ErrConflict):
+		return fmt.Errorf("%w: destination Xet metadata conflicts: %w", ErrConflict, err)
+	case errors.Is(err, casserver.ErrCorrupt):
+		return fmt.Errorf("%w: source or destination Xet metadata: %w", ErrCorrupt, err)
+	case errors.Is(err, casserver.ErrInvalid):
+		return fmt.Errorf("%w: %w", ErrInvalid, err)
+	case errors.Is(err, casserver.ErrTooLarge), errors.Is(err, casserver.ErrDurabilityUnsupported):
+		return fmt.Errorf("%w: %w", ErrUnsupported, err)
+	default:
+		return fmt.Errorf("%w: CAS clone: %w", ErrUnavailable, err)
 	}
 }
 
