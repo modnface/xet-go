@@ -128,11 +128,34 @@ type RepositoryGrant struct {
 	writeAllowed bool
 }
 
+// Principal returns the authenticated non-secret identity bound to the grant.
+func (grant RepositoryGrant) Principal() Principal { return grant.principal }
+
 func NewBroker(options BrokerOptions) (*Broker, error) {
 	if options.Authenticator == nil || options.Authorizer == nil || options.Tokens == nil {
 		return nil, fmt.Errorf("%w: authenticator, repository authorizer, and token issuer are required", ErrInvalid)
 	}
 	return &Broker{authenticator: options.Authenticator, authorizer: options.Authorizer, tokens: options.Tokens}, nil
+}
+
+// Authenticate validates one Hub credential without applying repository
+// policy. It is intended for authenticated routes such as whoami that do not
+// name a repository.
+func (broker *Broker) Authenticate(ctx context.Context, hubCredential string) (Principal, error) {
+	if err := validContext(ctx); err != nil {
+		return Principal{}, err
+	}
+	if broker == nil || broker.authenticator == nil {
+		return Principal{}, fmt.Errorf("%w: token broker is not configured", ErrUnavailable)
+	}
+	principal, err := broker.authenticator.Authenticate(ctx, hubCredential)
+	if err != nil {
+		return Principal{}, mapAuthenticationError(ctx, err)
+	}
+	if err = principal.Validate(); err != nil {
+		return Principal{}, fmt.Errorf("%w: authenticator returned an invalid principal", ErrUnavailable)
+	}
+	return principal, nil
 }
 
 // AuthorizeRepository authenticates one Hub credential and applies one
@@ -235,12 +258,9 @@ func (broker *Broker) authorizeRepository(
 			return RepositoryGrant{}, fmt.Errorf("%w: invalid repository permission", ErrInvalid)
 		}
 	}
-	principal, err := broker.authenticator.Authenticate(ctx, hubCredential)
+	principal, err := broker.Authenticate(ctx, hubCredential)
 	if err != nil {
-		return RepositoryGrant{}, mapAuthenticationError(ctx, err)
-	}
-	if err = principal.Validate(); err != nil {
-		return RepositoryGrant{}, fmt.Errorf("%w: authenticator returned an invalid principal", ErrUnavailable)
+		return RepositoryGrant{}, err
 	}
 	grant := RepositoryGrant{broker: broker, principal: principal, repository: repository}
 	for _, permission := range permissions {
@@ -248,7 +268,10 @@ func (broker *Broker) authorizeRepository(
 			Principal: principal, Repository: repository, Permission: permission,
 		})
 		if err != nil {
-			return RepositoryGrant{}, mapAuthorizationError(ctx, err)
+			// Preserve the already-authenticated non-secret identity for callers
+			// that audit concealed authorization failures. No denied permission is
+			// marked on the grant, so it cannot be narrowed into a CAS token.
+			return grant, mapAuthorizationError(ctx, err)
 		}
 		switch permission {
 		case RepositoryRead:

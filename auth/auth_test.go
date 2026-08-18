@@ -79,6 +79,10 @@ func TestBrokerAppliesAuthenticationPolicyAndScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	principal, err := broker.Authenticate(context.Background(), "hub-token")
+	if err != nil || principal.Subject != "user:alice" || len(accesses) != 0 {
+		t.Fatalf("broker authentication = %#v, %v; accesses=%#v", principal, err, accesses)
+	}
 	issued, err := broker.IssueCASToken(context.Background(), "hub-token", repository, CASRead|CASWrite, 2*time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -153,6 +157,13 @@ func TestBrokerRepositoryGrantNarrowsWithoutReauthentication(t *testing.T) {
 	if _, err := broker.IssueCASTokenForGrant(context.Background(), grant, CASWrite, 0); !errors.Is(err, ErrPermissionDenied) {
 		t.Fatalf("widen read grant to write = %v", err)
 	}
+	deniedGrant, err := broker.AuthorizeRepository(context.Background(), "hub-token", repository, RepositoryWrite)
+	if !errors.Is(err, ErrPermissionDenied) || deniedGrant.Principal().Subject != "user:grant" {
+		t.Fatalf("denied grant identity = %#v, %v", deniedGrant.Principal(), err)
+	}
+	if _, err = broker.IssueCASTokenForGrant(context.Background(), deniedGrant, CASWrite, time.Minute); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("narrow denied grant = %v", err)
+	}
 	if _, err := broker.IssueCASTokenForGrant(context.Background(), RepositoryGrant{}, CASRead, 0); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("zero grant = %v", err)
 	}
@@ -179,6 +190,9 @@ func TestBrokerRepositoryGrantNarrowsWithoutReauthentication(t *testing.T) {
 		t.Fatalf("canceled grant token = %v", err)
 	}
 	var nilBroker *Broker
+	if _, err := nilBroker.Authenticate(context.Background(), "hub-token"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("nil broker authentication = %v", err)
+	}
 	if _, err := nilBroker.AuthorizeRepository(context.Background(), "hub-token", repository, RepositoryRead); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("nil broker authorization = %v", err)
 	}
