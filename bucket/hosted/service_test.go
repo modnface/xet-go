@@ -14,6 +14,7 @@ import (
 	"github.com/jmwoliver/xet-go/catalog/memory"
 	"github.com/jmwoliver/xet-go/content"
 	contentmemory "github.com/jmwoliver/xet-go/content/memory"
+	"github.com/jmwoliver/xet-go/hfcompat"
 	"github.com/jmwoliver/xet-go/model"
 	"github.com/jmwoliver/xet-go/xetcas"
 	casserver "github.com/jmwoliver/xet-go/xetcas/server"
@@ -22,6 +23,36 @@ import (
 
 type catalogWithoutRefListing struct{ catalog.Catalog }
 type contentWithoutBlobListing struct{ content.Store }
+
+type recordingBucketDecorator struct {
+	hfcompat.BucketService
+	resolutions int
+}
+
+func (decorator *recordingBucketDecorator) ResolveRevision(ctx context.Context, repo model.RepoKey, revision model.Revision) (model.Snapshot, error) {
+	decorator.resolutions++
+	return decorator.BucketService.ResolveRevision(ctx, repo, revision)
+}
+
+type recordingPublisherDecorator struct {
+	hfcompat.SnapshotPublisher
+	calls int
+}
+
+func (decorator *recordingPublisherDecorator) PublishSnapshot(ctx context.Context, snapshot model.Snapshot, expectation catalog.RefExpectation) error {
+	decorator.calls++
+	return decorator.SnapshotPublisher.PublishSnapshot(ctx, snapshot, expectation)
+}
+
+type recordingSnapshotReader struct {
+	hfcompat.SnapshotReader
+	calls int
+}
+
+func (reader *recordingSnapshotReader) GetSnapshot(ctx context.Context, repo model.RepoKey, oid model.OID) (model.Snapshot, error) {
+	reader.calls++
+	return reader.SnapshotReader.GetSnapshot(ctx, repo, oid)
+}
 
 func TestServiceComposesTypedAndSeparateHTTPBoundaries(t *testing.T) {
 	options, manager := validOptions(t)
@@ -94,6 +125,52 @@ func TestServiceComposesTypedAndSeparateHTTPBoundaries(t *testing.T) {
 	}
 }
 
+func TestServiceComposesHostRevisionAndPublicationExtensions(t *testing.T) {
+	options, _ := validOptions(t)
+	var bucketDecorator *recordingBucketDecorator
+	var publisherDecorator *recordingPublisherDecorator
+	options.BucketDecorator = func(service hfcompat.BucketService) hfcompat.BucketService {
+		bucketDecorator = &recordingBucketDecorator{BucketService: service}
+		return bucketDecorator
+	}
+	options.PublisherDecorator = func(publisher hfcompat.SnapshotPublisher) hfcompat.SnapshotPublisher {
+		publisherDecorator = &recordingPublisherDecorator{SnapshotPublisher: publisher}
+		return publisherDecorator
+	}
+	reader := &recordingSnapshotReader{}
+	options.SnapshotReader = reader
+	service, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.SnapshotReader = service.Service
+	repo, err := model.NewRepoKey("owner", "model", model.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = service.CreateRepository(context.Background(), model.Repository{Key: repo, CreatedAt: time.Unix(1_700_000_000, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.NewBufferString("{\"key\":\"header\",\"value\":{\"summary\":\"host extensions\"}}\n" +
+		"{\"key\":\"file\",\"value\":{\"path\":\"config.json\",\"encoding\":\"base64\",\"content\":\"e30=\"}}\n")
+	request := httptest.NewRequest(http.MethodPost, "/api/models/owner/model/commit/main", body)
+	request.Header.Set("Authorization", "Bearer hub-secret")
+	response := httptest.NewRecorder()
+	service.HubHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("commit status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if bucketDecorator == nil || bucketDecorator.resolutions == 0 {
+		t.Fatalf("decorated resolutions = %#v", bucketDecorator)
+	}
+	if publisherDecorator == nil || publisherDecorator.calls != 1 {
+		t.Fatalf("decorated publications = %#v", publisherDecorator)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("snapshot reader calls = %d", reader.calls)
+	}
+}
+
 func TestNewRejectsIncoherentCapabilities(t *testing.T) {
 	valid, _ := validOptions(t)
 	tests := []struct {
@@ -114,6 +191,12 @@ func TestNewRejectsIncoherentCapabilities(t *testing.T) {
 		{"Hub URL", func(options *Options) { options.HubBaseURL = "relative" }},
 		{"CAS URL", func(options *Options) { options.CASBaseURL = "relative" }},
 		{"LFS capability key", func(options *Options) { options.LFSUploadCapabilityKey = []byte("short") }},
+		{"bucket decorator", func(options *Options) {
+			options.BucketDecorator = func(hfcompat.BucketService) hfcompat.BucketService { return nil }
+		}},
+		{"publisher decorator", func(options *Options) {
+			options.PublisherDecorator = func(hfcompat.SnapshotPublisher) hfcompat.SnapshotPublisher { return nil }
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

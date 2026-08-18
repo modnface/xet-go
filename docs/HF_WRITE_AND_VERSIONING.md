@@ -107,6 +107,11 @@ including its original timestamp. It is inferred automatically when the writer
 or bucket implements `SnapshotReader`; a publisher that persists intents before
 catalog publication should supply a reader over those intents explicitly.
 
+At the higher-level `bucket/hosted` composition boundary, use
+`BucketDecorator`, `PublisherDecorator`, and `SnapshotReader`. The decorators
+are invoked after the default `bucket.Service` exists, so a host can wrap the
+actual composed reader and publisher without a mutable forwarding proxy.
+
 No transaction can atomically enlist an arbitrary host database and the xet-go
 catalog. Embedders must use this reconciliation protocol:
 

@@ -89,7 +89,10 @@ Its constructor accepts one catalog, ordinary-content store, CAS blob/index
 bundle, repository policy, and coherent CAS token authority; it installs the
 namespace-scoped CAS authorizer rather than accepting a second policy. The
 result promotes the typed `bucket.Service` API and exposes separate
-`HubHandler` and `CASHandler` mounts. It also exposes bounded read-only CAS
+`HubHandler` and `CASHandler` mounts. Hub-facing `BucketDecorator` and
+`PublisherDecorator` functions receive the fully composed defaults, while
+`SnapshotReader` can supply durable host publication intents for exact retry.
+It also exposes bounded read-only CAS
 inventory and payload-audit pages and requires the catalog's optional,
 repository-scoped `RefLister` inventory capability. Core `bucket.Service`
 remains compatible with catalogs that omit that maintenance capability and

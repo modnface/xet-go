@@ -27,6 +27,14 @@ type CASTokens interface {
 	auth.CASTokenVerifier
 }
 
+// BucketDecorator wraps the Hub-facing revision resolution and read service.
+// The typed Service and Hub writer continue to use the composed bucket.Service.
+type BucketDecorator func(hfcompat.BucketService) hfcompat.BucketService
+
+// SnapshotPublisherDecorator wraps the composed default (or explicitly
+// supplied) publisher after bucket.Service has been constructed.
+type SnapshotPublisherDecorator func(hfcompat.SnapshotPublisher) hfcompat.SnapshotPublisher
+
 // Options is one coherent hosting capability bundle. CAS.Authorizer must be
 // nil: Service always installs the verifier-backed scoped authorizer so a
 // separately supplied CAS policy cannot drift from Hub token issuance.
@@ -39,7 +47,10 @@ type Options struct {
 	RepositoryAuthorizer auth.RepositoryAuthorizer
 	CASTokens            CASTokens
 	LFSIngester          hfcompat.XetFileIngester
+	BucketDecorator      BucketDecorator
+	SnapshotReader       hfcompat.SnapshotReader
 	SnapshotPublisher    hfcompat.SnapshotPublisher
+	PublisherDecorator   SnapshotPublisherDecorator
 	WriteAudit           hfcompat.WriteAuditSink
 
 	HubBaseURL     string
@@ -103,8 +114,29 @@ func New(options Options) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: bucket: %w", ErrInvalid, err)
 	}
+	hubBucket := hfcompat.BucketService(core)
+	if options.BucketDecorator != nil {
+		hubBucket = options.BucketDecorator(hubBucket)
+		if hubBucket == nil {
+			return nil, fmt.Errorf("%w: bucket decorator returned nil", ErrInvalid)
+		}
+	}
+	publisher := options.SnapshotPublisher
+	if publisher == nil {
+		publisher = core
+	}
+	if options.PublisherDecorator != nil {
+		publisher = options.PublisherDecorator(publisher)
+		if publisher == nil {
+			return nil, fmt.Errorf("%w: publisher decorator returned nil", ErrInvalid)
+		}
+	}
+	snapshots := options.SnapshotReader
+	if snapshots == nil {
+		snapshots = core
+	}
 	hub, err := hfcompat.New(hfcompat.Options{
-		Bucket: core, Publisher: options.SnapshotPublisher, Audit: options.WriteAudit, Broker: broker,
+		Bucket: hubBucket, Writer: core, Snapshots: snapshots, Publisher: publisher, Audit: options.WriteAudit, Broker: broker,
 		HubBaseURL: options.HubBaseURL, CASBaseURL: options.CASBaseURL,
 		CASTokenTTL: options.CASTokenTTL, MaxTreeEntries: options.MaxTreeEntries, Ingester: options.LFSIngester,
 		LargeFileThreshold: options.LargeFileThreshold, MaxPreuploadFiles: options.MaxPreuploadFiles,
