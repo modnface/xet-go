@@ -53,6 +53,10 @@ type CASFileService interface {
 	VerifyFileInNamespace(context.Context, string, xethash.Hash, uint64, *[32]byte) error
 }
 
+type casFileResolver interface {
+	ResolveFileInNamespace(context.Context, string, [32]byte, uint64) (xethash.Hash, error)
+}
+
 type Options struct {
 	Catalog catalog.Catalog
 	Content content.Store
@@ -185,6 +189,33 @@ func (service *Service) PutBlob(ctx context.Context, blob content.Blob, body io.
 	}
 	inserted, err := service.content.Put(ctx, blob, body)
 	return inserted, mapContentPublicationError(err)
+}
+
+// ResolveXetFile returns the durable Xet identity associated with an exact
+// whole-file SHA-256 and size in the namespace derived from repo. It is used by
+// trusted publication control planes after an uploader has registered a file.
+func (service *Service) ResolveXetFile(
+	ctx context.Context,
+	repo model.RepoKey,
+	sum [32]byte,
+	size uint64,
+) (xethash.Hash, error) {
+	if err := validContext(ctx); err != nil {
+		return xethash.Hash{}, err
+	}
+	namespace, err := RepositoryNamespace(repo)
+	if err != nil {
+		return xethash.Hash{}, err
+	}
+	resolver, ok := service.cas.(casFileResolver)
+	if !ok {
+		return xethash.Hash{}, ErrUnsupported
+	}
+	hash, err := resolver.ResolveFileInNamespace(ctx, namespace, sum, size)
+	if err != nil {
+		return xethash.Hash{}, mapCASPublicationError("", err)
+	}
+	return hash, nil
 }
 
 // CloneXetFile makes one exact, durably registered source Xet file available

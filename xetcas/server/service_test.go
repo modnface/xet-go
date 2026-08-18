@@ -154,6 +154,16 @@ func TestServiceUploadPublicationAndReadPlanning(t *testing.T) {
 	if got, found, err := store.ResolveSHA256(ctx, "tenant-a", *value.Files[0].SHA256, record.File.Size); err != nil || !found || got != fileHash {
 		t.Fatalf("SHA-256 association = %s, %v, %v", got, found, err)
 	}
+	if got, err := service.ResolveFileInNamespace(ctx, "tenant-a", *value.Files[0].SHA256, record.File.Size); err != nil || got != fileHash {
+		t.Fatalf("resolved durable file = %s, %v", got, err)
+	}
+	if _, err := service.ResolveFileInNamespace(ctx, "tenant-b", *value.Files[0].SHA256, record.File.Size); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-namespace file resolution = %v", err)
+	}
+	missingSum := sha256.Sum256([]byte("missing file"))
+	if _, err := service.ResolveFileInNamespace(ctx, "tenant-a", missingSum, 12); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing file resolution = %v", err)
+	}
 
 	reconstruction, err := service.ReconstructionV2(ctx, "", fileHash, &xetcas.FileRange{Start: 1, End: record.File.Size - 1})
 	if err != nil {

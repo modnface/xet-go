@@ -85,6 +85,12 @@ func TestServiceStreamsOrdinaryAndXetFiles(t *testing.T) {
 	}
 
 	xetBody, fileHash, xetSum := publishXetFixture(t, ctx, cas)
+	if got, resolveErr := service.ResolveXetFile(ctx, repo, xetSum, uint64(len(xetBody))); resolveErr != nil || got != fileHash {
+		t.Fatalf("resolve Xet file = %s, %v", got, resolveErr)
+	}
+	if _, resolveErr := service.ResolveXetFile(ctx, other, xetSum, uint64(len(xetBody))); !errors.Is(resolveErr, ErrContentNotUploaded) {
+		t.Fatalf("cross-repository Xet resolution = %v", resolveErr)
+	}
 	xetRef, err := model.NewXetFileRef(fileHash, int64(len(xetBody)), &xetSum)
 	if err != nil {
 		t.Fatal(err)

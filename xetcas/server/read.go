@@ -502,6 +502,38 @@ func (s *Service) VerifyFileInNamespace(
 	return ctx.Err()
 }
 
+// ResolveFileInNamespace returns the durable Xet identity associated with one
+// exact whole-file SHA-256 and size in a trusted repository scope. It also
+// verifies that the retained recipe and every physical dependency are
+// available before returning.
+func (s *Service) ResolveFileInNamespace(
+	ctx context.Context,
+	namespace string,
+	sum [32]byte,
+	size uint64,
+) (xethash.Hash, error) {
+	if ctx == nil {
+		return xethash.Hash{}, errors.New("xet CAS server: nil resolve-file context")
+	}
+	if err := ctx.Err(); err != nil {
+		return xethash.Hash{}, err
+	}
+	if namespace == "" {
+		return xethash.Hash{}, fmt.Errorf("%w: trusted resolution requires a namespace", ErrInvalid)
+	}
+	hash, found, err := s.index.ResolveSHA256(ctx, namespace, sum, size)
+	if err != nil {
+		return xethash.Hash{}, err
+	}
+	if !found {
+		return xethash.Hash{}, fmt.Errorf("%w: scoped SHA-256 association is unavailable", ErrNotFound)
+	}
+	if err = s.VerifyFileInNamespace(ctx, namespace, hash, size, &sum); err != nil {
+		return xethash.Hash{}, err
+	}
+	return hash, nil
+}
+
 func (s *Service) openFileInNamespace(
 	ctx context.Context,
 	namespace string,
