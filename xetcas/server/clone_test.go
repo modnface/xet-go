@@ -562,9 +562,10 @@ func (store *cloneBlobSpy) PutIfAbsent(
 	body io.Reader,
 	size int64,
 ) (bool, error) {
-	if key.Kind == BlobXorb {
+	switch key.Kind {
+	case BlobXorb:
 		store.xorbPuts.Add(1)
-	} else if key.Kind == BlobShard {
+	case BlobShard:
 		store.shardPuts.Add(1)
 	}
 	return store.BlobStore.PutIfAbsent(ctx, key, body, size)
@@ -575,9 +576,10 @@ func (store *cloneBlobSpy) Get(
 	key BlobKey,
 	wanted *xetcas.HTTPRange,
 ) (io.ReadCloser, error) {
-	if key.Kind == BlobXorb {
+	switch key.Kind {
+	case BlobXorb:
 		store.xorbGets.Add(1)
-	} else if key.Kind == BlobShard {
+	case BlobShard:
 		store.shardGets.Add(1)
 	}
 	return store.BlobStore.Get(ctx, key, wanted)
