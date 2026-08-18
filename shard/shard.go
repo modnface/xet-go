@@ -468,19 +468,8 @@ func writeFile(out *bytes.Buffer, file File) {
 		out.Write(make([]byte, 16))
 	}
 	if file.SHA256 != nil {
-		writeSHA256(out, *file.SHA256)
+		out.Write(file.SHA256[:])
 		out.Write(make([]byte, 16))
-	}
-}
-
-// MerkleDB stores the conventional SHA-256 digest as four little-endian u64
-// words. File.SHA256 remains in the conventional byte order used by sha256.Sum256
-// and Git LFS OIDs, so the wire conversion is explicit at this boundary.
-func writeSHA256(out *bytes.Buffer, sum [sha256.Size]byte) {
-	for offset := 0; offset < len(sum); offset += 8 {
-		for index := offset + 7; index >= offset; index-- {
-			_ = out.WriteByte(sum[index])
-		}
 	}
 }
 
@@ -548,11 +537,7 @@ func readFile(data []byte, pos, limit int) (File, int, error) {
 	if file.Flags&FileFlagSHA256 != 0 {
 		record := data[pos : pos+RecordSize]
 		var sum [sha256.Size]byte
-		for offset := 0; offset < len(sum); offset += 8 {
-			for index := 0; index < 8; index++ {
-				sum[offset+index] = record[offset+7-index]
-			}
-		}
+		copy(sum[:], record[:32])
 		file.SHA256 = &sum
 		if !allZero(record[32:]) {
 			return File{}, pos, &FormatError{Offset: pos + 32, Reason: "nonzero SHA-256 reserved field"}

@@ -361,7 +361,9 @@ func TestRustDifferentialShard(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(goBody, rustBody) {
-		t.Fatalf("upload shard differs byte-for-byte: Go %d bytes, Rust %d", len(goBody), len(rustBody))
+		first := firstDifference(goBody, rustBody)
+		t.Fatalf("upload shard differs byte-for-byte at %d: Go %d bytes (%x), Rust %d (%x)",
+			first, len(goBody), goBody[first:min(first+32, len(goBody))], len(rustBody), rustBody[first:min(first+32, len(rustBody))])
 	}
 	goFullBody, err := shard.EncodeFull(shard.Shard{
 		Files: []shard.File{{
@@ -378,7 +380,9 @@ func TestRustDifferentialShard(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(goFullBody, fullBody) {
-		t.Fatalf("full shard differs byte-for-byte: Go %d bytes, Rust %d", len(goFullBody), len(fullBody))
+		first := firstDifference(goFullBody, fullBody)
+		t.Fatalf("full shard differs byte-for-byte at %d: Go %d bytes (%x), Rust %d (%x)",
+			first, len(goFullBody), goFullBody[first:min(first+32, len(goFullBody))], len(fullBody), fullBody[first:min(first+32, len(fullBody))])
 	}
 	shardPath := filepath.Join(t.TempDir(), "upload.mdb")
 	if err := os.WriteFile(shardPath, goBody, 0o600); err != nil {
@@ -423,6 +427,16 @@ func TestRustDifferentialShard(t *testing.T) {
 	if decoded.Files != 0 || decoded.Xorbs != 1 {
 		t.Fatalf("Rust decoded protected shard = %+v", decoded)
 	}
+}
+
+func firstDifference(left, right []byte) int {
+	limit := min(len(left), len(right))
+	for index := 0; index < limit; index++ {
+		if left[index] != right[index] {
+			return index
+		}
+	}
+	return limit
 }
 
 func TestRustDifferentialArtifactAcceptance(t *testing.T) {

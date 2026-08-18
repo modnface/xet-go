@@ -96,7 +96,7 @@ func TestUploadRoundTripAndLayout(t *testing.T) {
 	}
 }
 
-func TestSHA256UsesOfficialMerkleDBWordOrder(t *testing.T) {
+func TestSHA256UsesConventionalWireOrder(t *testing.T) {
 	value := sampleShard(t)
 	sum := sha256.Sum256([]byte("official MerkleDB SHA-256 byte order"))
 	value.Files[0].SHA256 = &sum
@@ -107,14 +107,8 @@ func TestSHA256UsesOfficialMerkleDBWordOrder(t *testing.T) {
 	// The metadata extension follows the header, file header, one term, and
 	// one verification record in this single-file fixture.
 	offset := 4 * RecordSize
-	want := make([]byte, len(sum))
-	for word := 0; word < len(sum); word += 8 {
-		for index := 0; index < 8; index++ {
-			want[word+index] = sum[word+7-index]
-		}
-	}
-	if !bytes.Equal(data[offset:offset+len(sum)], want) {
-		t.Fatalf("wire SHA-256 = %x, want %x", data[offset:offset+len(sum)], want)
+	if !bytes.Equal(data[offset:offset+len(sum)], sum[:]) {
+		t.Fatalf("wire SHA-256 = %x, want %x", data[offset:offset+len(sum)], sum)
 	}
 	decoded, err := Decode(data)
 	if err != nil {
