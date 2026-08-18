@@ -148,7 +148,8 @@ func TestOfficialPythonClientNativeXetDownloadThenUploadSameProcess(t *testing.T
 	command.Env = append(os.Environ(), "HF_HUB_DISABLE_PROGRESS_BARS=1", "HF_ENDPOINT="+server.URL)
 	output, err := command.CombinedOutput()
 	if err != nil {
-		t.Fatalf("official Python native-Xet write: %v\n%s", err, output)
+		page, listErr := fixture.store.ListSHA256(context.Background(), nil, casserver.PageRequest{Limit: 100})
+		t.Fatalf("official Python native-Xet write: %v\n%s\nSHA associations: %#v (error %v)", err, output, page.Items, listErr)
 	}
 	if !strings.HasSuffix(string(output), "official Hub write compatibility passed\n") || writeTokens.Load() == 0 ||
 		fixture.xetFallbackRequests.Load() != 0 {
@@ -204,6 +205,7 @@ func TestOfficialPythonClientLegacyLFSFallback(t *testing.T) {
 
 type pythonCASFixture struct {
 	handler                *Service
+	store                  *casserver.MemoryStore
 	tokenRequests          atomic.Int32
 	reconstructionRequests atomic.Int32
 	storageRequests        atomic.Int32
@@ -242,7 +244,7 @@ func newPythonCASFixture(t *testing.T) *pythonCASFixture {
 	}
 
 	store := casserver.NewMemoryStore()
-	fixture := &pythonCASFixture{}
+	fixture := &pythonCASFixture{store: store}
 	storageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wantedRange := r.URL.Query().Get("range")
 		if r.Header.Get("Authorization") != "" || wantedRange == "" || r.Header.Get("Range") != "bytes="+wantedRange {

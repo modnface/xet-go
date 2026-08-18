@@ -624,7 +624,7 @@ fn main() -> ExitCode {
                 metadata: FileDataSequenceHeader::new(file_hash_value, 1u32, true, true),
                 segments: vec![segment],
                 verification: vec![verification],
-                metadata_ext: Some(FileMetadataExt::new(DataHash::from(sha_raw))),
+                metadata_ext: Some(FileMetadataExt::new(DataHash::from_be_bytes(sha_raw))),
             };
             let mut shard = MDBInMemoryShard::default();
             shard.add_xorb_block(Arc::new(xorb_info)).unwrap();

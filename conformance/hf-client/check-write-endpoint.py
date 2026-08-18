@@ -81,7 +81,7 @@ def main() -> None:
     if os.path.getsize(initial_download) == 0:
         raise AssertionError("initial Xet download was empty")
 
-    expected = (b"official-client-xet-write\x00" * 100_000) + os.urandom(31)
+    expected = (b"official-client-xet-write\x00" * 100_000) + bytes(range(31))
     with tempfile.NamedTemporaryFile() as source:
         source.write(expected)
         source.flush()
@@ -96,7 +96,7 @@ def main() -> None:
     assert_download(args, "uploaded/model.bin", expected)
 
     folder_regular = b'{"source":"official upload_folder"}\n'
-    folder_large = (b"official-client-folder-write\x00" * 60_000) + os.urandom(17)
+    folder_large = (b"official-client-folder-write\x00" * 60_000) + bytes(range(17))
     with tempfile.TemporaryDirectory() as folder:
         os.makedirs(os.path.join(folder, "nested"))
         with open(os.path.join(folder, "nested", "config.json"), "wb") as file:
