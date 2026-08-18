@@ -111,6 +111,97 @@ func TestOfficialPythonClientSnapshotDownloadUsesCAS(t *testing.T) {
 	}
 }
 
+func TestOfficialPythonClientNativeXetDownloadThenUploadSameProcess(t *testing.T) {
+	python := os.Getenv("XET_HF_CLIENT_PYTHON")
+	if python == "" {
+		t.Skip("set XET_HF_CLIENT_PYTHON to the pinned conformance Python executable")
+	}
+	if !filepath.IsAbs(python) {
+		python = filepath.Join("..", python)
+	}
+	fixture := newPythonCASFixture(t)
+	fixture.handler.large = 1 << 20
+	var writeTokens atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/xet-write-token/") {
+			writeTokens.Add(1)
+		}
+		if r.Method == http.MethodGet && (strings.HasSuffix(r.URL.Path, "/weights/model.bin") || strings.HasSuffix(r.URL.Path, "/uploaded/model.bin")) {
+			fixture.xetFallbackRequests.Add(1)
+		}
+		fixture.handler.ServeHTTP(w, r)
+	}))
+	fixture.handler.hubURL = "http://" + server.Listener.Addr().String()
+	server.Start()
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(
+		ctx,
+		python,
+		filepath.Join("..", "conformance", "hf-client", "check-write-endpoint.py"),
+		"--endpoint", server.URL,
+		"--token", "hub-token",
+		"--download-dir", t.TempDir(),
+	)
+	command.Env = append(os.Environ(), "HF_HUB_DISABLE_PROGRESS_BARS=1", "HF_ENDPOINT="+server.URL)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("official Python native-Xet write: %v\n%s", err, output)
+	}
+	if !strings.HasSuffix(string(output), "official Hub write compatibility passed\n") || writeTokens.Load() == 0 ||
+		fixture.xetFallbackRequests.Load() != 0 {
+		t.Fatalf("official Python output = %q, write tokens = %d, HTTP fallbacks = %d",
+			output, writeTokens.Load(), fixture.xetFallbackRequests.Load())
+	}
+}
+
+func TestOfficialPythonClientLegacyLFSFallback(t *testing.T) {
+	python := os.Getenv("XET_HF_CLIENT_PYTHON")
+	if python == "" {
+		t.Skip("set XET_HF_CLIENT_PYTHON to the pinned conformance Python executable")
+	}
+	if !filepath.IsAbs(python) {
+		python = filepath.Join("..", python)
+	}
+	fixture := newPythonCASFixture(t)
+	fixture.handler.large = 1 << 20
+	var batches atomic.Int32
+	var writeTokens atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".git/info/lfs/objects/batch") {
+			batches.Add(1)
+		}
+		if strings.Contains(r.URL.Path, "/xet-write-token/") {
+			writeTokens.Add(1)
+		}
+		fixture.handler.ServeHTTP(w, r)
+	}))
+	fixture.handler.hubURL = "http://" + server.Listener.Addr().String()
+	server.Start()
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(
+		ctx,
+		python,
+		filepath.Join("..", "conformance", "hf-client", "check-write-endpoint.py"),
+		"--endpoint", server.URL,
+		"--token", "hub-token",
+		"--download-dir", t.TempDir(),
+	)
+	command.Env = append(os.Environ(), "HF_HUB_DISABLE_PROGRESS_BARS=1", "HF_HUB_DISABLE_XET=1", "HF_ENDPOINT="+server.URL)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("official Python legacy-LFS write: %v\n%s", err, output)
+	}
+	if !strings.HasSuffix(string(output), "official Hub write compatibility passed\n") || batches.Load() == 0 || writeTokens.Load() != 0 {
+		t.Fatalf("official Python output = %q, LFS batches = %d, write tokens = %d", output, batches.Load(), writeTokens.Load())
+	}
+}
+
 type pythonCASFixture struct {
 	handler                *Service
 	tokenRequests          atomic.Int32
@@ -282,6 +373,19 @@ func newPythonCASFixture(t *testing.T) *pythonCASFixture {
 	handler, err := New(Options{
 		Bucket: service, Broker: broker,
 		HubBaseURL: "https://hub.invalid", CASBaseURL: casServer.URL,
+		Ingester: XetFileIngestFunc(func(ctx context.Context, got model.RepoKey, source io.Reader) (XetFileIngestResult, error) {
+			if got != repo {
+				return XetFileIngestResult{}, bucket.ErrPermissionDenied
+			}
+			result, uploadErr := client.Upload(ctx, source)
+			if uploadErr != nil {
+				return XetFileIngestResult{}, uploadErr
+			}
+			if result.File.SHA256 == nil {
+				return XetFileIngestResult{}, bucket.ErrInvariant
+			}
+			return XetFileIngestResult{Hash: result.File.Hash, Size: result.File.Size, SHA256: *result.File.SHA256}, nil
+		}),
 	})
 	if err != nil {
 		t.Fatal(err)

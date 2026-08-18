@@ -73,17 +73,16 @@ canonical repository-to-CAS scope exchange, and short-lived HMAC-SHA256 CAS
 bearer credentials. It does not define Hub HTTP routes or a hosted-provider
 token format.
 
-The top-level `hfcompat` adapter implements the pinned authenticated model-read
-subset without moving hosting concepts into `bucket`, `model`, or CAS. It
-supports model and immutable-revision metadata, recursive tree listing, Xet
-read-token exchange, file `HEAD`, full `GET`, and one byte-range `GET` for
-ordinary and Xet-backed entries. Mutable refs are pinned to an immutable OID
-before file access, every recognized repository request is authorized before
-catalog lookup, and denied repositories are concealed as absent. Its wire DTOs
-are private and use deterministic non-Git identifiers; it does not synthesize
-Git LFS metadata or claim compatible Git object IDs. Repository creation,
-preupload, commit/write routes, and hosted write-error behavior remain absent
-until pinned authenticated traffic is available.
+The top-level `hfcompat` adapter implements the pinned authenticated model read
+and write profile without moving hosting concepts into `bucket`, `model`, or
+CAS. In addition to metadata, tree, token, and range-capable resolve routes, it
+supports whoami, model-repository creation, preupload, streamed commit control,
+native Xet write-token exchange, and a capability-bound basic LFS fallback.
+Mutable refs are pinned to an immutable OID before file access, every recognized
+repository request is authorized before catalog lookup, and denied repositories
+are concealed as absent. `BucketService` decorators and delegated
+`SnapshotPublisher` implementations support host-owned versioning; see
+[docs/HF_WRITE_AND_VERSIONING.md](docs/HF_WRITE_AND_VERSIONING.md).
 
 The `bucket/hosted` package is the embeddable application composition boundary.
 Its constructor accepts one catalog, ordinary-content store, CAS blob/index
@@ -684,7 +683,7 @@ read resolves one of those scoped records before reaching physical content.
 | `content/s3` | S3-compatible conditionally immutable ordinary-content publication and verified full/range streaming |
 | `auth` | Pluggable Hub identity/policy contracts and scoped short-lived CAS bearer credentials |
 | `bucket` | Hosting-neutral repository publication/ref façade and uniform ordinary/Xet file streaming with derived CAS namespace isolation |
-| `hfcompat` | Authenticated read-only Hugging Face model-route translation over `bucket` and scoped CAS token exchange |
+| `hfcompat` | Authenticated Hugging Face model read/write translation, scoped CAS token exchange, and basic LFS fallback |
 | `chunker` | Streaming official GearHash content-defined chunking |
 | `xethash` | Canonical hashes, BLAKE3 domains, Merkle aggregation, and compact subtrees |
 | `xorb` | Network and complete/cache xorb codecs for none, LZ4, BG4-LZ4, and production auto selection |

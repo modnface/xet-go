@@ -143,14 +143,15 @@ signed URL queries, and records the client/runtime versions. It is read-side
 evidence only: hosted write-policy responses, compatible commit-OID generation,
 and write-error bodies still require an authenticated sanitized capture.
 
-The `hfcompat` black-box check runs the same pinned official client against an
-in-process authenticated Go model endpoint. Its stronger `snapshot_download`
-case first uploads LZ4 Xet data through the Go client and Go CAS, then requires
-the official `hf_xet` transport to refresh a scoped read token, request a CAS
-reconstruction, and fetch a storage capability bound to the exact object range.
-The test rejects ordinary resolve-GET fallback for the Xet file and compares
-both ordinary and reconstructed bytes. The checker asserts its installed
-client versions before sending traffic:
+The `hfcompat` black-box checks run the same pinned official client against an
+in-process authenticated Go model endpoint. Read coverage requires official
+`hf_xet` reconstruction without ordinary resolve-GET fallback. Write coverage
+performs create/re-create, preupload, transfer, commit, and byte-identical
+download through `HfApi.upload_file`, `HfApi.upload_folder`, the supported
+`ModelHubMixin.push_to_hub` profile, and `hf upload`: native Xet with no
+disabling environment variable, including download then upload in one process,
+and the basic LFS fallback with `HF_HUB_DISABLE_XET=1`. The checker asserts
+installed client versions before sending traffic:
 
 ```sh
 XET_HF_CLIENT_PYTHON="$(pwd)/.cache/hf-client/bin/python" \

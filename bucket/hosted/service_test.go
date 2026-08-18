@@ -113,6 +113,7 @@ func TestNewRejectsIncoherentCapabilities(t *testing.T) {
 		{"signer", func(options *Options) { options.CAS.Signer = nil }},
 		{"Hub URL", func(options *Options) { options.HubBaseURL = "relative" }},
 		{"CAS URL", func(options *Options) { options.CASBaseURL = "relative" }},
+		{"LFS capability key", func(options *Options) { options.LFSUploadCapabilityKey = []byte("short") }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

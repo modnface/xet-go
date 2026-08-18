@@ -12,8 +12,8 @@ if [[ "${XET_POSTGRES_INTEGRATION:-}" != "1" ]]; then
     printf 'coverage gate: PostgreSQL integration is required in CI\n' >&2
     exit 1
   fi
-  mapfile -t packages < <(go list ./... | grep -v '/xetcas/server/postgresstore$')
-  printf 'core-only coverage gate: PostgreSQL adapter excluded; set XET_POSTGRES_INTEGRATION=1 and XET_POSTGRES_DSN for the complete aggregate\n'
+  mapfile -t packages < <(go list ./... | grep -Ev '/(catalog/postgres|xetcas/server/postgresstore)$')
+  printf 'core-only coverage gate: PostgreSQL adapters excluded; set XET_POSTGRES_INTEGRATION=1 and XET_POSTGRES_DSN for the complete aggregate\n'
 fi
 go test -covermode=atomic -coverprofile="${PROFILE}" "${packages[@]}"
 

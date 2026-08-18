@@ -2,6 +2,7 @@ package hfcompat
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -13,19 +14,33 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jmwoliver/xet-go/auth"
 	"github.com/jmwoliver/xet-go/bucket"
+	"github.com/jmwoliver/xet-go/catalog"
 	"github.com/jmwoliver/xet-go/content"
 	"github.com/jmwoliver/xet-go/model"
+	"github.com/jmwoliver/xet-go/xethash"
 )
 
 const (
-	defaultTokenTTL = 15 * time.Minute
-	defaultTreeMax  = 10_000
+	defaultTokenTTL           = 15 * time.Minute
+	defaultTreeMax            = 10_000
+	defaultLargeFileThreshold = 10 << 20
+	defaultPreuploadMax       = 256
+	defaultCommitOperations   = 25_000
+	defaultCommitLineBytes    = 16 << 20
+	defaultCommitMetadata     = 1 << 30
+	defaultCommitFileSize     = 1 << 50
+	defaultLFSBatchMax        = 256
+	defaultLFSUploadTTL       = 15 * time.Minute
 )
 
+// BucketService is also the supported host revision-resolution extension
+// point. A decorator may redefine mutable and explicit-OID visibility through
+// ResolveRevision; resolve handlers pin OpenFile to the returned immutable OID.
 type BucketService interface {
 	GetRepository(context.Context, model.RepoKey) (model.Repository, error)
 	ResolveRevision(context.Context, model.RepoKey, model.Revision) (model.Snapshot, error)
@@ -33,26 +48,118 @@ type BucketService interface {
 }
 
 type AccessBroker interface {
+	Authenticate(context.Context, string) (auth.Principal, error)
 	AuthorizeRepository(context.Context, string, model.RepoKey, auth.RepositoryPermission) (auth.RepositoryGrant, error)
 	IssueCASTokenForGrant(context.Context, auth.RepositoryGrant, auth.CASPermissions, time.Duration) (auth.IssuedCASToken, error)
 }
 
+type RepositoryWriter interface {
+	CreateRepository(context.Context, model.Repository) error
+	PutBlob(context.Context, content.Blob, io.Reader) (bool, error)
+	ResolveXetFile(context.Context, model.RepoKey, [32]byte, uint64) (xethash.Hash, error)
+}
+
+// SnapshotReader retrieves a durable prepared intent or retained immutable
+// state by OID. It lets retries reuse the exact canonical snapshot after an
+// ambiguous result, including failures before catalog publication.
+type SnapshotReader interface {
+	GetSnapshot(context.Context, model.RepoKey, model.OID) (model.Snapshot, error)
+}
+
+// XetFileIngester streams one verified legacy-LFS object into the repository's
+// hosting-neutral Xet namespace. Implementations must return only after the
+// file is reconstructable. The Hub/LFS protocol remains owned by hfcompat.
+type XetFileIngester interface {
+	IngestXetFile(context.Context, model.RepoKey, io.Reader) (XetFileIngestResult, error)
+}
+
+type XetFileIngestResult struct {
+	Hash   xethash.Hash
+	Size   uint64
+	SHA256 [32]byte
+}
+
+// WriteAuditEvent is the non-secret outcome of one recognized Hub write
+// operation. StatusCode is the HTTP status returned to the caller.
+type WriteAuditEvent struct {
+	Principal     auth.Principal
+	Repository    model.RepoKey
+	Operation     string
+	StatusCode    int
+	CorrelationID string
+}
+
+// WriteAuditSink observes completed Hub write operations. Implementations must
+// return promptly; recording cannot alter a response that has already begun.
+type WriteAuditSink interface {
+	RecordHubWrite(context.Context, WriteAuditEvent)
+}
+
+// SnapshotPublisher publishes one canonical immutable snapshot. hfcompat calls
+// it exactly once per non-replayed commit after content verification.
+// Implementers may compose additional durable host work with publication.
+//
+// An ambiguous result must be retried with the same OID, canonical snapshot,
+// ref target, and old-OID expectation. Never allocate a replacement OID.
+type SnapshotPublisher interface {
+	PublishSnapshot(context.Context, model.Snapshot, catalog.RefExpectation) error
+}
+
 type Options struct {
-	Bucket         BucketService
-	Broker         AccessBroker
-	HubBaseURL     string
-	CASBaseURL     string
-	CASTokenTTL    time.Duration
-	MaxTreeEntries int
+	Bucket    BucketService
+	Writer    RepositoryWriter
+	Snapshots SnapshotReader
+	Publisher SnapshotPublisher
+	Ingester  XetFileIngester
+	Audit     WriteAuditSink
+	Broker    AccessBroker
+
+	HubBaseURL  string
+	CASBaseURL  string
+	CASTokenTTL time.Duration
+
+	MaxTreeEntries       int
+	LargeFileThreshold   int64
+	MaxPreuploadFiles    int
+	MaxCommitOperations  int
+	MaxCommitLineBytes   int
+	MaxCommitMetadata    int64
+	MaxCommitPathBytes   int
+	MaxDeclaredFileBytes int64
+	MaxLFSBatchObjects   int
+	LFSUploadTTL         time.Duration
+	// LFSUploadCapabilityKey is a shared 32-byte HMAC key. Configure the same
+	// key on every instance that may receive an upload action; nil selects an
+	// ephemeral single-instance key.
+	LFSUploadCapabilityKey []byte
 }
 
 type Service struct {
-	bucket BucketService
-	broker AccessBroker
-	hubURL string
-	casURL string
-	ttl    time.Duration
-	max    int
+	bucket       BucketService
+	writer       RepositoryWriter
+	snapshots    SnapshotReader
+	publisher    SnapshotPublisher
+	ingester     XetFileIngester
+	audit        WriteAuditSink
+	broker       AccessBroker
+	hubURL       string
+	casURL       string
+	ttl          time.Duration
+	max          int
+	large        int64
+	preuploadMax int
+	commitOps    int
+	lineBytes    int
+	metadata     int64
+	pathBytes    int
+	fileBytes    int64
+	lfsBatch     int
+	lfsTTL       time.Duration
+	lfsKey       [32]byte
+	lfsMu        sync.Mutex
+	lfsUploads   map[string]lfsUploadState
+	now          func() time.Time
+	commits      [256]sync.Mutex
 }
 
 var _ http.Handler = (*Service)(nil)
@@ -81,7 +188,71 @@ func New(o Options) (*Service, error) {
 	if o.MaxTreeEntries < 1 {
 		return nil, fmt.Errorf("hfcompat: maximum tree entries must be positive")
 	}
-	return &Service{bucket: o.Bucket, broker: o.Broker, hubURL: hub, casURL: cas, ttl: o.CASTokenTTL, max: o.MaxTreeEntries}, nil
+	if o.LargeFileThreshold == 0 {
+		o.LargeFileThreshold = defaultLargeFileThreshold
+	}
+	if o.MaxPreuploadFiles == 0 {
+		o.MaxPreuploadFiles = defaultPreuploadMax
+	}
+	if o.MaxCommitOperations == 0 {
+		o.MaxCommitOperations = defaultCommitOperations
+	}
+	if o.MaxCommitLineBytes == 0 {
+		o.MaxCommitLineBytes = defaultCommitLineBytes
+	}
+	if o.MaxCommitMetadata == 0 {
+		o.MaxCommitMetadata = defaultCommitMetadata
+	}
+	if o.MaxCommitPathBytes == 0 {
+		o.MaxCommitPathBytes = model.MaxPathBytes
+	}
+	if o.MaxDeclaredFileBytes == 0 {
+		o.MaxDeclaredFileBytes = defaultCommitFileSize
+	}
+	if o.MaxLFSBatchObjects == 0 {
+		o.MaxLFSBatchObjects = defaultLFSBatchMax
+	}
+	if o.LFSUploadTTL == 0 {
+		o.LFSUploadTTL = defaultLFSUploadTTL
+	}
+	if o.LargeFileThreshold < 1 || o.MaxPreuploadFiles < 1 || o.MaxCommitOperations < 1 || o.MaxCommitLineBytes < 1 ||
+		o.MaxCommitMetadata < int64(o.MaxCommitLineBytes) || o.MaxCommitPathBytes < 1 || o.MaxCommitPathBytes > model.MaxPathBytes ||
+		o.MaxDeclaredFileBytes < 0 || o.MaxLFSBatchObjects < 1 || o.LFSUploadTTL < time.Second || o.LFSUploadTTL%time.Second != 0 {
+		return nil, fmt.Errorf("hfcompat: invalid write admission limits")
+	}
+	if len(o.LFSUploadCapabilityKey) != 0 && len(o.LFSUploadCapabilityKey) != len(Service{}.lfsKey) {
+		return nil, fmt.Errorf("hfcompat: LFS upload capability key must be 32 bytes")
+	}
+	if o.Writer == nil {
+		o.Writer, _ = o.Bucket.(RepositoryWriter)
+	}
+	if o.Snapshots == nil {
+		o.Snapshots, _ = o.Writer.(SnapshotReader)
+	}
+	if o.Snapshots == nil {
+		o.Snapshots, _ = o.Bucket.(SnapshotReader)
+	}
+	if o.Publisher == nil && o.Writer != nil {
+		o.Publisher, _ = o.Writer.(SnapshotPublisher)
+	}
+	service := &Service{
+		bucket: o.Bucket, writer: o.Writer, snapshots: o.Snapshots, publisher: o.Publisher,
+		ingester: o.Ingester, audit: o.Audit, broker: o.Broker,
+		hubURL: hub, casURL: cas, ttl: o.CASTokenTTL, max: o.MaxTreeEntries,
+		large: o.LargeFileThreshold, preuploadMax: o.MaxPreuploadFiles,
+		commitOps: o.MaxCommitOperations, lineBytes: o.MaxCommitLineBytes, metadata: o.MaxCommitMetadata,
+		pathBytes: o.MaxCommitPathBytes, fileBytes: o.MaxDeclaredFileBytes,
+		lfsBatch: o.MaxLFSBatchObjects, lfsTTL: o.LFSUploadTTL, lfsUploads: make(map[string]lfsUploadState),
+		now: time.Now,
+	}
+	if o.Ingester != nil {
+		if len(o.LFSUploadCapabilityKey) != 0 {
+			copy(service.lfsKey[:], o.LFSUploadCapabilityKey)
+		} else if _, err := rand.Read(service.lfsKey[:]); err != nil {
+			return nil, fmt.Errorf("hfcompat: initialize LFS upload capabilities: %w", err)
+		}
+	}
+	return service, nil
 }
 
 func baseURL(raw string) (string, error) {
@@ -105,13 +276,18 @@ func baseURL(raw string) (string, error) {
 func (s *Service) Handler() http.Handler { return s }
 
 type route struct {
-	kind     string
-	repo     model.RepoKey
-	revision model.Revision
-	file     model.FilePath
+	kind       string
+	repo       model.RepoKey
+	revision   model.Revision
+	file       model.FilePath
+	lfsOID     [32]byte
+	permission auth.RepositoryPermission
+	methods    []string
 }
 
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	correlationID := requestCorrelationID(r.Header.Get("X-Request-Id"))
+	w.Header().Set("X-Request-Id", correlationID)
 	rt, recognized, err := parseRoute(r.URL.EscapedPath())
 	if !recognized {
 		http.NotFound(w, r)
@@ -121,40 +297,133 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, fmt.Errorf("%w: invalid route", errInput))
 		return
 	}
+	var auditEvent *WriteAuditEvent
+	if s.audit != nil && isWriteOperation(rt.kind) {
+		event := WriteAuditEvent{Repository: rt.repo, Operation: rt.kind, CorrelationID: correlationID}
+		auditEvent = &event
+		tracked := &auditResponseWriter{ResponseWriter: w}
+		w = tracked
+		defer func() {
+			event.StatusCode = tracked.statusCode()
+			s.audit.RecordHubWrite(context.WithoutCancel(r.Context()), event)
+		}()
+	}
+	if rt.kind == "lfs-upload" {
+		if !allowsMethod(rt.methods, r.Method) {
+			w.Header().Set("Allow", strings.Join(rt.methods, ", "))
+			s.failStatus(w, r, http.StatusMethodNotAllowed)
+			return
+		}
+		s.lfsUpload(w, r, rt, auditEvent)
+		return
+	}
 	credential, err := bearer(r.Header.Values("Authorization"))
 	if err != nil {
 		s.fail(w, r, auth.ErrUnauthenticated)
 		return
 	}
-	grant, err := s.broker.AuthorizeRepository(r.Context(), credential, rt.repo, auth.RepositoryRead)
-	if err != nil {
+	var grant auth.RepositoryGrant
+	var principal auth.Principal
+	if rt.permission == "" {
+		principal, err = s.broker.Authenticate(r.Context(), credential)
+	} else {
+		grant, err = s.broker.AuthorizeRepository(r.Context(), credential, rt.repo, rt.permission)
+		principal = grant.Principal()
 		if errors.Is(err, auth.ErrPermissionDenied) {
 			w.Header().Set("X-Error-Code", "RepoNotFound")
 		}
+	}
+	if auditEvent != nil {
+		auditEvent.Principal = principal
+	}
+	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	allowed := "GET"
-	if rt.kind == "resolve" {
-		allowed = "GET, HEAD"
-	}
-	if r.Method != http.MethodGet && (rt.kind != "resolve" || r.Method != http.MethodHead) {
-		w.Header().Set("Allow", allowed)
+	if !allowsMethod(rt.methods, r.Method) {
+		w.Header().Set("Allow", strings.Join(rt.methods, ", "))
 		s.failStatus(w, r, http.StatusMethodNotAllowed)
 		return
 	}
 	switch rt.kind {
+	case "whoami":
+		s.whoami(w, r, principal)
+	case "create":
+		s.createRepository(w, r, credential, principal, auditEvent)
+	case "preupload":
+		s.preupload(w, r, rt)
+	case "commit":
+		s.commit(w, r, rt, principal)
+	case "lfs-batch":
+		s.lfsBatchRequest(w, r, rt, principal)
 	case "model":
 		s.modelInfo(w, r, rt, "main")
 	case "revision":
 		s.modelInfo(w, r, rt, rt.revision.String())
 	case "tree":
 		s.tree(w, r, rt)
-	case "token":
-		s.token(w, r, rt, grant)
+	case "read-token":
+		s.token(w, r, rt, grant, auth.CASRead)
+	case "write-token":
+		s.token(w, r, rt, grant, auth.CASWrite)
 	case "resolve":
 		s.resolve(w, r, rt)
 	}
+}
+
+type auditResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (writer *auditResponseWriter) WriteHeader(status int) {
+	if writer.status == 0 {
+		writer.status = status
+	}
+	writer.ResponseWriter.WriteHeader(status)
+}
+
+func (writer *auditResponseWriter) Write(body []byte) (int, error) {
+	if writer.status == 0 {
+		writer.status = http.StatusOK
+	}
+	return writer.ResponseWriter.Write(body)
+}
+
+func (writer *auditResponseWriter) statusCode() int {
+	if writer.status == 0 {
+		return http.StatusOK
+	}
+	return writer.status
+}
+
+func isWriteOperation(kind string) bool {
+	switch kind {
+	case "create", "preupload", "commit", "write-token", "lfs-batch", "lfs-upload":
+		return true
+	default:
+		return false
+	}
+}
+
+func requestCorrelationID(value string) string {
+	if value != "" && len(value) <= 128 && !strings.ContainsAny(value, " \t\r\n,;") {
+		return value
+	}
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err == nil {
+		return hex.EncodeToString(random[:])
+	}
+	return "unavailable"
+}
+
+func allowsMethod(methods []string, method string) bool {
+	for _, allowed := range methods {
+		if method == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 func bearer(values []string) (string, error) {
@@ -173,6 +442,12 @@ func bearer(values []string) (string, error) {
 func parseRoute(escaped string) (route, bool, error) {
 	if escaped == "" || escaped[0] != '/' {
 		return route{}, false, nil
+	}
+	if escaped == "/api/whoami-v2" {
+		return route{kind: "whoami", methods: []string{http.MethodGet}}, true, nil
+	}
+	if escaped == "/api/repos/create" {
+		return route{kind: "create", methods: []string{http.MethodPost}}, true, nil
 	}
 	raw := strings.Split(escaped[1:], "/")
 	api := len(raw) >= 3 && raw[0] == "api" && raw[1] == "models"
@@ -194,10 +469,22 @@ func parseRoute(escaped string) (route, bool, error) {
 		case len(raw) == start+4 && raw[start+2] == "tree":
 			kind = "tree"
 		case len(raw) == start+4 && raw[start+2] == "xet-read-token":
-			kind = "token"
+			kind = "read-token"
+		case len(raw) == start+4 && raw[start+2] == "xet-write-token":
+			kind = "write-token"
+		case len(raw) == start+4 && raw[start+2] == "preupload":
+			kind = "preupload"
+		case len(raw) == start+4 && raw[start+2] == "commit":
+			kind = "commit"
 		default:
 			return route{}, false, nil
 		}
+	} else if len(raw) == 6 && strings.HasSuffix(raw[1], ".git") && raw[2] == "info" && raw[3] == "lfs" && raw[4] == "objects" && raw[5] == "batch" {
+		kind = "lfs-batch"
+		raw[1] = strings.TrimSuffix(raw[1], ".git")
+	} else if len(raw) == 7 && strings.HasSuffix(raw[1], ".git") && raw[2] == "info" && raw[3] == "lfs" && raw[4] == "objects" && raw[5] == "upload" {
+		kind = "lfs-upload"
+		raw[1] = strings.TrimSuffix(raw[1], ".git")
 	} else if len(raw) >= 5 && raw[2] == "resolve" {
 		kind = "resolve"
 	} else {
@@ -225,7 +512,36 @@ func parseRoute(escaped string) (route, bool, error) {
 	if e != nil {
 		return route{}, true, e
 	}
-	rt := route{kind: kind, repo: repo}
+	rt := route{kind: kind, repo: repo, permission: auth.RepositoryRead, methods: []string{http.MethodGet}}
+	if kind == "lfs-batch" {
+		rt.permission = auth.RepositoryWrite
+		rt.methods = []string{http.MethodPost}
+		return rt, true, nil
+	}
+	if kind == "lfs-upload" {
+		rt.permission = ""
+		rt.methods = []string{http.MethodPut}
+		decoded, decodeErr := decode(raw[6], false)
+		if decodeErr != nil {
+			return route{}, true, decodeErr
+		}
+		value, decodeErr := hex.DecodeString(decoded)
+		if decodeErr != nil || len(value) != len(rt.lfsOID) || decoded != strings.ToLower(decoded) {
+			return route{}, true, errors.New("invalid LFS object OID")
+		}
+		copy(rt.lfsOID[:], value)
+		return rt, true, nil
+	}
+	if kind == "resolve" {
+		rt.methods = []string{http.MethodGet, http.MethodHead}
+	}
+	if kind == "write-token" {
+		rt.permission = auth.RepositoryWrite
+	}
+	if kind == "preupload" || kind == "commit" {
+		rt.permission = auth.RepositoryWrite
+		rt.methods = []string{http.MethodPost}
+	}
 	if kind != "model" {
 		revIndex := start + 3
 		if !api {
@@ -384,14 +700,25 @@ func dirID(oid model.OID, p string) string {
 	return "xet-go:dir:" + oid.String() + ":" + base64.RawURLEncoding.EncodeToString([]byte(p))
 }
 
-func (s *Service) token(w http.ResponseWriter, r *http.Request, rt route, g auth.RepositoryGrant) {
-	snap, err := s.bucket.ResolveRevision(r.Context(), rt.repo, rt.revision)
-	if err != nil {
-		s.failRevision(w, r, rt.repo, err)
+func (s *Service) token(
+	w http.ResponseWriter,
+	r *http.Request,
+	rt route,
+	g auth.RepositoryGrant,
+	permissions auth.CASPermissions,
+) {
+	if permissions == auth.CASRead {
+		snap, err := s.bucket.ResolveRevision(r.Context(), rt.repo, rt.revision)
+		if err != nil {
+			s.failRevision(w, r, rt.repo, err)
+			return
+		}
+		_ = snap
+	} else if _, err := s.bucket.GetRepository(r.Context(), rt.repo); err != nil {
+		s.failNotFound(w, r, err, "RepoNotFound")
 		return
 	}
-	_ = snap
-	t, err := s.broker.IssueCASTokenForGrant(r.Context(), g, auth.CASRead, s.ttl)
+	t, err := s.broker.IssueCASTokenForGrant(r.Context(), g, permissions, s.ttl)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -671,14 +998,20 @@ func (s *Service) fail(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, auth.ErrUnauthenticated):
 		status = 401
 		w.Header().Set("WWW-Authenticate", "Bearer")
+	case errors.Is(err, errUploadCapability):
+		status = 401
 	case errors.Is(err, auth.ErrPermissionDenied), errors.Is(err, bucket.ErrNotFound):
 		status = 404
 	case errors.Is(err, errRange), errors.Is(err, bucket.ErrRangeNotSatisfiable):
 		status = 416
 	case errors.Is(err, errTreeLimit):
 		status = 413
-	case errors.Is(err, errInput), errors.Is(err, bucket.ErrInvalid), errors.Is(err, auth.ErrInvalid):
+	case errors.Is(err, errCommitTooLarge):
+		status = 413
+	case errors.Is(err, errInput), errors.Is(err, errCommitInput), errors.Is(err, bucket.ErrInvalid), errors.Is(err, auth.ErrInvalid):
 		status = 400
+	case errors.Is(err, bucket.ErrContentNotUploaded):
+		status = 422
 	case errors.Is(err, bucket.ErrUnsupported):
 		status = 501
 	case errors.Is(err, bucket.ErrConflict):

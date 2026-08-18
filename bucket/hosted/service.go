@@ -38,11 +38,25 @@ type Options struct {
 	HubAuthenticator     auth.HubAuthenticator
 	RepositoryAuthorizer auth.RepositoryAuthorizer
 	CASTokens            CASTokens
+	LFSIngester          hfcompat.XetFileIngester
+	SnapshotPublisher    hfcompat.SnapshotPublisher
+	WriteAudit           hfcompat.WriteAuditSink
 
 	HubBaseURL     string
 	CASBaseURL     string
 	CASTokenTTL    time.Duration
 	MaxTreeEntries int
+
+	LargeFileThreshold     int64
+	MaxPreuploadFiles      int
+	MaxCommitOperations    int
+	MaxCommitLineBytes     int
+	MaxCommitMetadata      int64
+	MaxCommitPathBytes     int
+	MaxDeclaredFileBytes   int64
+	MaxLFSBatchObjects     int
+	LFSUploadTTL           time.Duration
+	LFSUploadCapabilityKey []byte
 }
 
 // Service exposes the typed bucket API through its embedded Service while
@@ -90,8 +104,14 @@ func New(options Options) (*Service, error) {
 		return nil, fmt.Errorf("%w: bucket: %w", ErrInvalid, err)
 	}
 	hub, err := hfcompat.New(hfcompat.Options{
-		Bucket: core, Broker: broker, HubBaseURL: options.HubBaseURL, CASBaseURL: options.CASBaseURL,
-		CASTokenTTL: options.CASTokenTTL, MaxTreeEntries: options.MaxTreeEntries,
+		Bucket: core, Publisher: options.SnapshotPublisher, Audit: options.WriteAudit, Broker: broker,
+		HubBaseURL: options.HubBaseURL, CASBaseURL: options.CASBaseURL,
+		CASTokenTTL: options.CASTokenTTL, MaxTreeEntries: options.MaxTreeEntries, Ingester: options.LFSIngester,
+		LargeFileThreshold: options.LargeFileThreshold, MaxPreuploadFiles: options.MaxPreuploadFiles,
+		MaxCommitOperations: options.MaxCommitOperations, MaxCommitLineBytes: options.MaxCommitLineBytes,
+		MaxCommitMetadata: options.MaxCommitMetadata, MaxCommitPathBytes: options.MaxCommitPathBytes,
+		MaxDeclaredFileBytes: options.MaxDeclaredFileBytes, MaxLFSBatchObjects: options.MaxLFSBatchObjects,
+		LFSUploadTTL: options.LFSUploadTTL, LFSUploadCapabilityKey: options.LFSUploadCapabilityKey,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: Hub compatibility: %w", ErrInvalid, err)

@@ -7,11 +7,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,6 +63,21 @@ func (cas *fixtureCAS) VerifyFileInNamespace(
 		return casserver.ErrNotFound
 	}
 	return nil
+}
+
+func (cas *fixtureCAS) ResolveFileInNamespace(
+	ctx context.Context,
+	namespace string,
+	sum [32]byte,
+	size uint64,
+) (xethash.Hash, error) {
+	if err := ctx.Err(); err != nil {
+		return xethash.Hash{}, err
+	}
+	if namespace != cas.namespace || sum != cas.sum || size != uint64(len(cas.body)) {
+		return xethash.Hash{}, casserver.ErrNotFound
+	}
+	return cas.hash, nil
 }
 
 func (cas *fixtureCAS) OpenFileInNamespace(
@@ -157,7 +175,8 @@ func newHandlerFixture(t *testing.T, maximum int) handlerFixture {
 	broker, err := auth.NewBroker(auth.BrokerOptions{
 		Authenticator: auth.StaticTokenAuthenticator{Token: "hub-token", Principal: auth.Principal{Subject: "user:test"}},
 		Authorizer: auth.RepositoryAuthorizerFunc(func(_ context.Context, access auth.RepositoryAccess) error {
-			if access.Repository != repo || access.Permission != auth.RepositoryRead {
+			if access.Repository.Namespace != repo.Namespace || access.Repository.Type != model.RepoTypeModel ||
+				(access.Permission != auth.RepositoryRead && access.Permission != auth.RepositoryWrite) {
 				return auth.ErrPermissionDenied
 			}
 			return nil
@@ -179,7 +198,20 @@ func newHandlerFixture(t *testing.T, maximum int) handlerFixture {
 
 func request(t *testing.T, handler http.Handler, method, target, credential string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(method, target, nil)
+	return requestBody(t, handler, method, target, credential, nil, headers)
+}
+
+func requestBody(
+	t *testing.T,
+	handler http.Handler,
+	method string,
+	target string,
+	credential string,
+	body io.Reader,
+	headers map[string]string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, target, body)
 	if credential != "" {
 		req.Header.Set("Authorization", credential)
 	}
@@ -189,6 +221,299 @@ func request(t *testing.T, handler http.Handler, method, target, credential stri
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 	return recorder
+}
+
+func TestHandlerWhoamiCreateAndWriteToken(t *testing.T) {
+	fixture := newHandlerFixture(t, 0)
+
+	whoami := request(t, fixture.handler, http.MethodGet, "/api/whoami-v2", "Bearer hub-token", nil)
+	if whoami.Code != http.StatusOK || whoami.Body.String() != "{\"type\":\"user\",\"name\":\"user:test\"}\n" ||
+		strings.Contains(whoami.Body.String(), "hub-token") {
+		t.Fatalf("whoami = %d, %#v, %q", whoami.Code, whoami.Header(), whoami.Body.String())
+	}
+	invalidWhoami := request(t, fixture.handler, http.MethodGet, "/api/whoami-v2", "Bearer wrong", nil)
+	if invalidWhoami.Code != http.StatusUnauthorized || invalidWhoami.Header().Get("WWW-Authenticate") != "Bearer" {
+		t.Fatalf("invalid whoami = %d, %#v", invalidWhoami.Code, invalidWhoami.Header())
+	}
+	whoamiMethod := request(t, fixture.handler, http.MethodPost, "/api/whoami-v2", "Bearer hub-token", nil)
+	if whoamiMethod.Code != http.StatusMethodNotAllowed || whoamiMethod.Header().Get("Allow") != "GET" {
+		t.Fatalf("whoami method = %d, %#v", whoamiMethod.Code, whoamiMethod.Header())
+	}
+	createMethod := request(t, fixture.handler, http.MethodGet, "/api/repos/create", "Bearer hub-token", nil)
+	if createMethod.Code != http.StatusMethodNotAllowed || createMethod.Header().Get("Allow") != "POST" {
+		t.Fatalf("create method = %d, %#v", createMethod.Code, createMethod.Header())
+	}
+	unauthenticatedCreate := requestBody(t, fixture.handler, http.MethodPost, "/api/repos/create", "", strings.NewReader(`{"name":"created","organization":"owner"}`), nil)
+	if unauthenticatedCreate.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated create = %d, %#v", unauthenticatedCreate.Code, unauthenticatedCreate.Header())
+	}
+	deniedCreate := requestBody(t, fixture.handler, http.MethodPost, "/api/repos/create", "Bearer hub-token", strings.NewReader(`{"name":"created","organization":"other"}`), nil)
+	if deniedCreate.Code != http.StatusNotFound || deniedCreate.Header().Get("X-Error-Code") != "RepoNotFound" {
+		t.Fatalf("denied create = %d, %#v", deniedCreate.Code, deniedCreate.Header())
+	}
+
+	createBody := `{"name":"created","organization":"owner","type":"model","visibility":"private"}`
+	created := requestBody(t, fixture.handler, http.MethodPost, "/api/repos/create", "Bearer hub-token", strings.NewReader(createBody), nil)
+	if created.Code != http.StatusOK || created.Body.String() != "{\"url\":\"https://hub.example/root/owner/created\"}\n" {
+		t.Fatalf("create = %d, %#v, %q", created.Code, created.Header(), created.Body.String())
+	}
+	createdRepo, err := model.NewRepoKey("owner", "created", model.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := fixture.bucket.GetRepository(context.Background(), createdRepo); err != nil || got.Key != createdRepo {
+		t.Fatalf("created repository = %#v, %v", got, err)
+	}
+	replayed := requestBody(t, fixture.handler, http.MethodPost, "/api/repos/create", "Bearer hub-token", strings.NewReader(createBody), nil)
+	if replayed.Code != http.StatusConflict || replayed.Body.String() != created.Body.String() {
+		t.Fatalf("create replay = %d, %#v, %q", replayed.Code, replayed.Header(), replayed.Body.String())
+	}
+	unsupported := requestBody(t, fixture.handler, http.MethodPost, "/api/repos/create", "Bearer hub-token", strings.NewReader(`{"name":"data","organization":"owner","type":"dataset"}`), nil)
+	if unsupported.Code != http.StatusNotImplemented || unsupported.Header().Get("X-Error-Code") != "UnsupportedRepoType" {
+		t.Fatalf("unsupported create = %d, %#v", unsupported.Code, unsupported.Header())
+	}
+	invalid := requestBody(t, fixture.handler, http.MethodPost, "/api/repos/create", "Bearer hub-token", strings.NewReader(`{"name":"../bad","organization":"owner"}`), nil)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid create = %d, %q", invalid.Code, invalid.Body.String())
+	}
+
+	writeToken := request(t, fixture.handler, http.MethodGet, "/api/models/owner/model/xet-write-token/main", "Bearer hub-token", nil)
+	var token struct {
+		AccessToken string `json:"accessToken"`
+		CASURL      string `json:"casUrl"`
+		Exp         int64  `json:"exp"`
+	}
+	if writeToken.Code != http.StatusOK || json.Unmarshal(writeToken.Body.Bytes(), &token) != nil ||
+		writeToken.Header().Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("write token = %d, %#v, %q", writeToken.Code, writeToken.Header(), writeToken.Body.String())
+	}
+	claims, err := fixture.manager.VerifyCASToken(context.Background(), token.AccessToken)
+	if err != nil || claims.Permissions != auth.CASWrite || claims.Permissions.Allows(auth.CASRead) || token.CASURL != "https://cas.example/cas" {
+		t.Fatalf("write token claims = %#v, %v", claims, err)
+	}
+	authorizer := auth.CASAuthorizer{Verifier: fixture.manager}
+	if _, err = authorizer.Authorize(context.Background(), token.AccessToken, casserver.AccessRequest{Operation: casserver.OperationReadFile}); !errors.Is(err, casserver.ErrForbidden) {
+		t.Fatalf("write token read = %v", err)
+	}
+	grant, err := authorizer.Authorize(context.Background(), token.AccessToken, casserver.AccessRequest{Operation: casserver.OperationWriteShard})
+	if err != nil || grant.Namespace != fixture.cas.namespace {
+		t.Fatalf("write token scope = %#v, %v", grant, err)
+	}
+	other, err := model.NewRepoKey("other", "model", model.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherNamespace, err := auth.RepositoryNamespace(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grant.Namespace == otherNamespace {
+		t.Fatal("write token reached another repository namespace")
+	}
+}
+
+func TestWriteRouteRequiresWritePermissionBeforeMethodOrStorage(t *testing.T) {
+	repo := testRepoKey(t)
+	store := &stubBucket{getErr: bucket.ErrNotFound}
+	permissions := make([]auth.RepositoryPermission, 0, 3)
+	denied := true
+	broker := stubBroker{
+		authorize: func(_ context.Context, credential string, got model.RepoKey, permission auth.RepositoryPermission) (auth.RepositoryGrant, error) {
+			permissions = append(permissions, permission)
+			if credential != "read-only" {
+				return auth.RepositoryGrant{}, auth.ErrUnauthenticated
+			}
+			if got != repo || denied || permission != auth.RepositoryWrite {
+				return auth.RepositoryGrant{}, auth.ErrPermissionDenied
+			}
+			return auth.RepositoryGrant{}, nil
+		},
+		issue: func(context.Context, auth.RepositoryGrant, auth.CASPermissions, time.Duration) (auth.IssuedCASToken, error) {
+			return auth.IssuedCASToken{Value: "write"}, nil
+		},
+	}
+	handler, err := New(Options{Bucket: store, Broker: broker, HubBaseURL: "https://hub.example", CASBaseURL: "https://cas.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := "/api/models/owner/model/xet-write-token/main"
+	deniedResponse := request(t, handler, http.MethodGet, target, "Bearer read-only", map[string]string{"X-Request-Id": "concealed"})
+	if deniedResponse.Code != http.StatusNotFound || deniedResponse.Header().Get("X-Error-Code") != "RepoNotFound" || store.calls != 0 ||
+		len(permissions) != 1 || permissions[0] != auth.RepositoryWrite {
+		t.Fatalf("denied write = %d, %#v, calls=%d permissions=%#v", deniedResponse.Code, deniedResponse.Header(), store.calls, permissions)
+	}
+	denied = false
+	missingResponse := request(t, handler, http.MethodGet, target, "Bearer read-only", map[string]string{"X-Request-Id": "concealed"})
+	if missingResponse.Code != deniedResponse.Code || missingResponse.Body.String() != deniedResponse.Body.String() ||
+		!reflect.DeepEqual(missingResponse.Header(), deniedResponse.Header()) || store.calls != 1 {
+		t.Fatalf("concealed responses differ: denied=%#v %q missing=%#v %q", deniedResponse.Header(), deniedResponse.Body.String(), missingResponse.Header(), missingResponse.Body.String())
+	}
+	unauthenticated := request(t, handler, http.MethodGet, target, "", nil)
+	if unauthenticated.Code != http.StatusUnauthorized || store.calls != 1 {
+		t.Fatalf("unauthenticated write = %d, calls=%d", unauthenticated.Code, store.calls)
+	}
+	wrongMethod := request(t, handler, http.MethodPost, target, "Bearer read-only", nil)
+	if wrongMethod.Code != http.StatusMethodNotAllowed || wrongMethod.Header().Get("Allow") != "GET" || store.calls != 1 {
+		t.Fatalf("write method = %d, %#v, calls=%d", wrongMethod.Code, wrongMethod.Header(), store.calls)
+	}
+}
+
+func TestEveryRepositoryWriteRouteDerivesWritePermissionAndExactAllow(t *testing.T) {
+	repo := testRepoKey(t)
+	tests := []struct {
+		name        string
+		target      string
+		allowed     string
+		wrongMethod string
+	}{
+		{"write token", "/api/models/owner/model/xet-write-token/main", "GET", http.MethodPost},
+		{"preupload", "/api/models/owner/model/preupload/main", "POST", http.MethodGet},
+		{"commit", "/api/models/owner/model/commit/main", "POST", http.MethodGet},
+		{"LFS batch", "/owner/model.git/info/lfs/objects/batch", "POST", http.MethodGet},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &stubBucket{}
+			denied := true
+			permissions := make([]auth.RepositoryPermission, 0, 3)
+			broker := stubBroker{authorize: func(_ context.Context, credential string, got model.RepoKey, permission auth.RepositoryPermission) (auth.RepositoryGrant, error) {
+				permissions = append(permissions, permission)
+				if credential == "" {
+					return auth.RepositoryGrant{}, auth.ErrUnauthenticated
+				}
+				if got != repo || denied {
+					return auth.RepositoryGrant{}, auth.ErrPermissionDenied
+				}
+				return auth.RepositoryGrant{}, nil
+			}}
+			handler, err := New(Options{Bucket: store, Broker: broker, HubBaseURL: "https://hub.test", CASBaseURL: "https://cas.test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			method := test.allowed
+			concealed := request(t, handler, method, test.target, "Bearer read", map[string]string{"X-Request-Id": "same"})
+			if concealed.Code != http.StatusNotFound || concealed.Header().Get("X-Error-Code") != "RepoNotFound" ||
+				len(permissions) != 1 || permissions[0] != auth.RepositoryWrite || store.calls != 0 {
+				t.Fatalf("concealed = %d, %#v, permissions=%#v, calls=%d", concealed.Code, concealed.Header(), permissions, store.calls)
+			}
+			unauthenticated := request(t, handler, method, test.target, "", nil)
+			if unauthenticated.Code != http.StatusUnauthorized || store.calls != 0 {
+				t.Fatalf("unauthenticated = %d, calls=%d", unauthenticated.Code, store.calls)
+			}
+			denied = false
+			wrong := request(t, handler, test.wrongMethod, test.target, "Bearer read", nil)
+			if wrong.Code != http.StatusMethodNotAllowed || wrong.Header().Get("Allow") != test.allowed || store.calls != 0 {
+				t.Fatalf("wrong method = %d, %#v, calls=%d", wrong.Code, wrong.Header(), store.calls)
+			}
+		})
+	}
+}
+
+func TestEveryRepositoryWriteRouteConcealsDeniedAndMissingRepositoriesIdentically(t *testing.T) {
+	fixture := newHandlerFixture(t, 0)
+	lfsHandler, err := New(Options{
+		Bucket: fixture.bucket, Broker: fixture.handler.broker, Ingester: XetFileIngestFunc(func(context.Context, model.RepoKey, io.Reader) (XetFileIngestResult, error) {
+			return XetFileIngestResult{}, errors.New("unused")
+		}),
+		HubBaseURL: "https://hub.test", CASBaseURL: "https://cas.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name          string
+		handler       http.Handler
+		method        string
+		deniedTarget  string
+		missingTarget string
+		body          string
+		headers       map[string]string
+	}{
+		{"write token", fixture.handler, http.MethodGet, "/api/models/other/model/xet-write-token/main", "/api/models/owner/missing/xet-write-token/main", "", nil},
+		{"preupload", fixture.handler, http.MethodPost, "/api/models/other/model/preupload/main", "/api/models/owner/missing/preupload/main", `{"files":[]}`, nil},
+		{"commit", fixture.handler, http.MethodPost, "/api/models/other/model/commit/main", "/api/models/owner/missing/commit/main", "", nil},
+		{"LFS batch", lfsHandler, http.MethodPost, "/other/model.git/info/lfs/objects/batch", "/owner/missing.git/info/lfs/objects/batch", "", map[string]string{"Content-Type": lfsMediaType}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			headers := make(map[string]string, len(test.headers)+1)
+			for key, value := range test.headers {
+				headers[key] = value
+			}
+			headers["X-Request-Id"] = "concealed-write"
+			denied := requestBody(t, test.handler, test.method, test.deniedTarget, "Bearer hub-token", strings.NewReader(test.body), headers)
+			missing := requestBody(t, test.handler, test.method, test.missingTarget, "Bearer hub-token", strings.NewReader(test.body), headers)
+			if denied.Code != http.StatusNotFound || denied.Header().Get("X-Error-Code") != "RepoNotFound" ||
+				missing.Code != denied.Code || missing.Body.String() != denied.Body.String() || !reflect.DeepEqual(missing.Header(), denied.Header()) {
+				t.Fatalf("responses differ: denied=%d %#v %q; missing=%d %#v %q",
+					denied.Code, denied.Header(), denied.Body.String(), missing.Code, missing.Header(), missing.Body.String())
+			}
+		})
+	}
+}
+
+type recordingWriteAudit struct {
+	mu     sync.Mutex
+	events []WriteAuditEvent
+}
+
+func (audit *recordingWriteAudit) RecordHubWrite(_ context.Context, event WriteAuditEvent) {
+	audit.mu.Lock()
+	audit.events = append(audit.events, event)
+	audit.mu.Unlock()
+}
+
+func TestWriteAuditRecordsNonSecretOutcomes(t *testing.T) {
+	fixture := newHandlerFixture(t, 0)
+	audit := &recordingWriteAudit{}
+	fixture.handler.audit = audit
+
+	read := request(t, fixture.handler, http.MethodGet, "/api/models/owner/model", "Bearer hub-token", nil)
+	if read.Code != http.StatusOK {
+		t.Fatalf("read status = %d", read.Code)
+	}
+	writeToken := request(t, fixture.handler, http.MethodGet, "/api/models/owner/model/xet-write-token/main", "Bearer hub-token", map[string]string{"X-Request-Id": "write-token-correlation"})
+	if writeToken.Code != http.StatusOK {
+		t.Fatalf("write token status = %d", writeToken.Code)
+	}
+	denied := requestBody(t, fixture.handler, http.MethodPost, "/api/models/other/model/preupload/main", "Bearer hub-token", strings.NewReader(`{"files":[]}`), map[string]string{"X-Request-Id": "denied-correlation"})
+	if denied.Code != http.StatusNotFound {
+		t.Fatalf("denied status = %d", denied.Code)
+	}
+	created := requestBody(t, fixture.handler, http.MethodPost, "/api/repos/create", "Bearer hub-token", strings.NewReader(`{"name":"audited","organization":"owner"}`), map[string]string{"X-Request-Id": "create-correlation"})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status = %d body=%s", created.Code, created.Body.String())
+	}
+
+	audit.mu.Lock()
+	events := append([]WriteAuditEvent(nil), audit.events...)
+	audit.mu.Unlock()
+	if len(events) != 3 {
+		t.Fatalf("audit events = %#v", events)
+	}
+	if events[0].Operation != "write-token" || events[0].StatusCode != http.StatusOK ||
+		events[0].CorrelationID != "write-token-correlation" || events[0].Principal.Subject != "user:test" || events[0].Repository != fixture.repo {
+		t.Fatalf("write-token audit = %#v", events[0])
+	}
+	other, err := model.NewRepoKey("other", "model", model.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if events[1].Operation != "preupload" || events[1].StatusCode != http.StatusNotFound ||
+		events[1].CorrelationID != "denied-correlation" || events[1].Principal.Subject != "user:test" || events[1].Repository != other {
+		t.Fatalf("denied audit = %#v", events[1])
+	}
+	createdRepo, err := model.NewRepoKey("owner", "audited", model.RepoTypeModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if events[2].Operation != "create" || events[2].StatusCode != http.StatusOK ||
+		events[2].CorrelationID != "create-correlation" || events[2].Principal.Subject != "user:test" || events[2].Repository != createdRepo {
+		t.Fatalf("create audit = %#v", events[2])
+	}
+	if strings.Contains(fmt.Sprintf("%#v", events), "hub-token") {
+		t.Fatal("audit event exposed the Hub credential")
+	}
 }
 
 func testRepoKey(t *testing.T) model.RepoKey {
@@ -399,7 +724,7 @@ func TestRevisionAndTokenBackendFailuresAreClassified(t *testing.T) {
 		},
 	}
 	recorder = httptest.NewRecorder()
-	service.token(recorder, request, rt, auth.RepositoryGrant{})
+	service.token(recorder, request, rt, auth.RepositoryGrant{}, auth.CASRead)
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("token backend failure = %d, %q", recorder.Code, recorder.Body.String())
 	}
@@ -437,8 +762,16 @@ func (stub *stubBucket) OpenFile(
 }
 
 type stubBroker struct {
-	authorize func(context.Context, string, model.RepoKey, auth.RepositoryPermission) (auth.RepositoryGrant, error)
-	issue     func(context.Context, auth.RepositoryGrant, auth.CASPermissions, time.Duration) (auth.IssuedCASToken, error)
+	authenticate func(context.Context, string) (auth.Principal, error)
+	authorize    func(context.Context, string, model.RepoKey, auth.RepositoryPermission) (auth.RepositoryGrant, error)
+	issue        func(context.Context, auth.RepositoryGrant, auth.CASPermissions, time.Duration) (auth.IssuedCASToken, error)
+}
+
+func (stub stubBroker) Authenticate(ctx context.Context, credential string) (auth.Principal, error) {
+	if stub.authenticate == nil {
+		return auth.Principal{Subject: "owner"}, nil
+	}
+	return stub.authenticate(ctx, credential)
 }
 
 func (stub stubBroker) AuthorizeRepository(
@@ -541,6 +874,10 @@ func TestRouteParsingAndIdentifiers(t *testing.T) {
 		{path: "/api/models/owner/model/revision/%3F", recognized: true, wantErr: true},
 		{path: "/api/models/owner%2Fx/model", recognized: true, wantErr: true},
 		{path: "/api/models/owner/model/revision/", recognized: true, wantErr: true},
+		{path: "/owner/model.git/info/lfs/objects/upload/%ZZ", recognized: true, wantErr: true},
+		{path: "/owner/model.git/info/lfs/objects/upload/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", recognized: true, wantErr: true},
+		{path: "//model.git/info/lfs/objects/batch", recognized: true, wantErr: true},
+		{path: "/owner/.git/info/lfs/objects/batch", recognized: true, wantErr: true},
 		{path: "/owner/model/resolve/main", recognized: false},
 		{path: "/owner/model/resolve/main/", recognized: true, wantErr: true},
 		{path: "/owner/model/resolve/main/dir%2Ffile", recognized: true, wantErr: true},
@@ -657,6 +994,18 @@ func TestConstructorAndErrorMapping(t *testing.T) {
 		"short TTL":       {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", CASTokenTTL: time.Second},
 		"fractional TTL":  {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", CASTokenTTL: time.Minute + time.Nanosecond},
 		"negative max":    {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", MaxTreeEntries: -1},
+		"large threshold": {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", LargeFileThreshold: -1},
+		"preupload max":   {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", MaxPreuploadFiles: -1},
+		"operation max":   {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", MaxCommitOperations: -1},
+		"line max":        {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", MaxCommitLineBytes: -1},
+		"metadata max":    {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", MaxCommitMetadata: -1},
+		"metadata line":   {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", MaxCommitLineBytes: 2, MaxCommitMetadata: 1},
+		"path max":        {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", MaxCommitPathBytes: -1},
+		"oversized path":  {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", MaxCommitPathBytes: model.MaxPathBytes + 1},
+		"file max":        {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", MaxDeclaredFileBytes: -1},
+		"LFS batch max":   {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", MaxLFSBatchObjects: -1},
+		"LFS TTL":         {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", LFSUploadTTL: time.Second + time.Nanosecond},
+		"LFS key":         {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", LFSUploadCapabilityKey: []byte("short")},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := New(options); err == nil {
@@ -665,7 +1014,11 @@ func TestConstructorAndErrorMapping(t *testing.T) {
 		})
 	}
 	service, err := New(Options{Bucket: validBucket, Broker: validBroker, HubBaseURL: "http://hub/prefix", CASBaseURL: "https://cas/prefix"})
-	if err != nil || service.Handler() != service || service.ttl != defaultTokenTTL || service.max != defaultTreeMax {
+	if err != nil || service.Handler() != service || service.ttl != defaultTokenTTL || service.max != defaultTreeMax ||
+		service.large != defaultLargeFileThreshold || service.preuploadMax != defaultPreuploadMax ||
+		service.commitOps != defaultCommitOperations || service.lineBytes != defaultCommitLineBytes ||
+		service.metadata != defaultCommitMetadata || service.pathBytes != model.MaxPathBytes ||
+		service.fileBytes != defaultCommitFileSize || service.lfsBatch != defaultLFSBatchMax || service.lfsTTL != defaultLFSUploadTTL {
 		t.Fatalf("valid constructor = %#v, %v", service, err)
 	}
 
@@ -674,8 +1027,9 @@ func TestConstructorAndErrorMapping(t *testing.T) {
 		status int
 	}{
 		{auth.ErrUnauthenticated, 401}, {auth.ErrPermissionDenied, 404}, {bucket.ErrNotFound, 404},
-		{errRange, 416}, {bucket.ErrRangeNotSatisfiable, 416}, {errTreeLimit, 413}, {errInput, 400},
+		{errRange, 416}, {bucket.ErrRangeNotSatisfiable, 416}, {errTreeLimit, 413}, {errCommitTooLarge, 413}, {errInput, 400},
 		{bucket.ErrInvalid, 400}, {auth.ErrInvalid, 400}, {bucket.ErrUnsupported, 501}, {bucket.ErrConflict, 409},
+		{bucket.ErrContentNotUploaded, 422},
 		{bucket.ErrUnavailable, 503}, {auth.ErrUnavailable, 503}, {context.Canceled, 503}, {context.DeadlineExceeded, 504},
 		{bucket.ErrCorrupt, 500}, {bucket.ErrInvariant, 500}, {bucket.ErrUnauthenticated, 500}, {bucket.ErrPermissionDenied, 500}, {errors.New("unknown"), 500},
 	}
@@ -818,7 +1172,24 @@ func TestStreamFileSettlesBoundedDataAndExposesFailures(t *testing.T) {
 	if committed, err = streamFile(nil, stream, 0, func() {}); committed || !errors.Is(err, bucket.ErrInvariant) {
 		t.Fatalf("invalid stream arguments = %v, %v", committed, err)
 	}
+	for name, destination := range map[string]io.Writer{
+		"invalid count": writerFunc(func(value []byte) (int, error) { return len(value) + 1, nil }),
+		"no progress":   writerFunc(func([]byte) (int, error) { return 0, nil }),
+		"write failure": writerFunc(func([]byte) (int, error) { return 0, failure }),
+	} {
+		t.Run("destination "+name, func(t *testing.T) {
+			body := &scriptedStream{steps: []streamStep{{data: []byte("body"), err: io.EOF}}}
+			committed, err := streamFile(destination, body, 4, func() {})
+			if !committed || err == nil || body.closed != 1 {
+				t.Fatalf("committed=%v err=%v closes=%d", committed, err, body.closed)
+			}
+		})
+	}
 }
+
+type writerFunc func([]byte) (int, error)
+
+func (function writerFunc) Write(value []byte) (int, error) { return function(value) }
 
 func TestResolveRejectsInconsistentStreamsAndClosesBodies(t *testing.T) {
 	repo, _ := model.NewRepoKey("owner", "model", model.RepoTypeModel)
@@ -887,5 +1258,13 @@ func TestResolveRejectsInconsistentStreamsAndClosesBodies(t *testing.T) {
 	if recorder.Code != http.StatusInternalServerError || partialBody.closed != 1 ||
 		!strings.Contains(recorder.Body.String(), "Internal Server Error") {
 		t.Fatalf("first-read stream failure = %d, %q, closes=%d", recorder.Code, recorder.Body.String(), partialBody.closed)
+	}
+	store.open = func(context.Context, model.RepoKey, model.Revision, model.FilePath, bucket.OpenOptions) (*bucket.FileReader, error) {
+		return nil, bucket.ErrUnavailable
+	}
+	recorder = httptest.NewRecorder()
+	service.resolve(recorder, httptest.NewRequest(http.MethodGet, "/owner/model/resolve/main/file.bin", nil), rt)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("open backend failure = %d, %q", recorder.Code, recorder.Body.String())
 	}
 }
