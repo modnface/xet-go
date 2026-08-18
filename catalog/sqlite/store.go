@@ -713,15 +713,19 @@ func (s *Store) PublishSnapshot(ctx context.Context, snap model.Snapshot, x cata
 	if e != nil {
 		return invalid(e)
 	}
-	if e = validRef(ctx, s, c.Repo, x.Name, c.OID); e != nil {
-		return e
-	}
-	ex, has, e := copyExpected(x.OID)
-	if e != nil {
-		return e
-	}
-	if has && (c.Parent == nil || *c.Parent != ex) {
-		return invalid(errors.New("parent does not match expected ref"))
+	var ex model.OID
+	var has bool
+	if x.UpdatesRef() {
+		if e = validRef(ctx, s, c.Repo, x.Name, c.OID); e != nil {
+			return e
+		}
+		ex, has, e = copyExpected(x.OID)
+		if e != nil {
+			return e
+		}
+		if has && (c.Parent == nil || *c.Parent != ex) {
+			return invalid(errors.New("parent does not match expected ref"))
+		}
 	}
 	fp, _ := model.FingerprintSnapshot(c)
 	tx, e := s.beginWrite(ctx)
@@ -761,16 +765,21 @@ func (s *Store) PublishSnapshot(ctx context.Context, snap model.Snapshot, x cata
 			return fmt.Errorf("%w", catalog.ErrConflict)
 		}
 	}
-	cur, e := loadRefOID(ctx, tx, c.Repo, x.Name)
-	refExists := e == nil
-	if e != nil && !errors.Is(e, catalog.ErrNotFound) {
-		return e
-	}
-	if snapExists && refExists && cur == c.OID {
+	if snapExists && !x.UpdatesRef() {
 		return dbErr(ctx, tx.Commit())
 	}
-	if refExists != has || (refExists && cur != ex) {
-		return fmt.Errorf("%w", catalog.ErrConflict)
+	if x.UpdatesRef() {
+		cur, refErr := loadRefOID(ctx, tx, c.Repo, x.Name)
+		refExists := refErr == nil
+		if refErr != nil && !errors.Is(refErr, catalog.ErrNotFound) {
+			return refErr
+		}
+		if snapExists && refExists && cur == c.OID {
+			return dbErr(ctx, tx.Commit())
+		}
+		if refExists != has || (refExists && cur != ex) {
+			return fmt.Errorf("%w", catalog.ErrConflict)
+		}
 	}
 	if c.Parent != nil {
 		var n int
@@ -814,16 +823,18 @@ func (s *Store) PublishSnapshot(ctx context.Context, snap model.Snapshot, x cata
 			return e
 		}
 	}
-	_, e = tx.ExecContext(ctx, "INSERT INTO refs VALUES(?,?,?,?,?) ON CONFLICT(repo_type,namespace,name,ref_name) DO UPDATE SET oid=excluded.oid", c.Repo.Type, c.Repo.Namespace, c.Repo.Name, x.Name, c.OID[:])
-	if e != nil {
-		return dbErr(ctx, e)
-	}
-	if s.testHook != nil {
-		if e = s.testHook("after-ref"); e != nil {
-			return e
+	if x.UpdatesRef() {
+		_, e = tx.ExecContext(ctx, "INSERT INTO refs VALUES(?,?,?,?,?) ON CONFLICT(repo_type,namespace,name,ref_name) DO UPDATE SET oid=excluded.oid", c.Repo.Type, c.Repo.Namespace, c.Repo.Name, x.Name, c.OID[:])
+		if e != nil {
+			return dbErr(ctx, e)
+		}
+		if s.testHook != nil {
+			if e = s.testHook("after-ref"); e != nil {
+				return e
+			}
 		}
 	}
-	if !snapExists && snapshotCount == 0 {
+	if x.UpdatesRef() && !snapExists && snapshotCount == 0 {
 		_, e = tx.ExecContext(ctx, "INSERT INTO refs VALUES(?,?,?,?,?) ON CONFLICT(repo_type,namespace,name,ref_name) DO UPDATE SET oid=excluded.oid", c.Repo.Type, c.Repo.Namespace, c.Repo.Name, "main", c.OID[:])
 		if e != nil {
 			return dbErr(ctx, e)

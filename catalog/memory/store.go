@@ -386,15 +386,19 @@ func (store *Store) PublishSnapshot(
 	if err != nil {
 		return invalid(err)
 	}
-	if err := validateRefRequest(ctx, canonical.Repo, expectation.Name, canonical.OID); err != nil {
-		return err
-	}
-	expectedOID, expectsExisting, err := copyExpectedOID(expectation.OID)
-	if err != nil {
-		return err
-	}
-	if expectsExisting && (canonical.Parent == nil || *canonical.Parent != expectedOID) {
-		return invalid(errors.New("snapshot parent does not match expected ref"))
+	var expectedOID model.OID
+	var expectsExisting bool
+	if expectation.UpdatesRef() {
+		if err := validateRefRequest(ctx, canonical.Repo, expectation.Name, canonical.OID); err != nil {
+			return err
+		}
+		expectedOID, expectsExisting, err = copyExpectedOID(expectation.OID)
+		if err != nil {
+			return err
+		}
+		if expectsExisting && (canonical.Parent == nil || *canonical.Parent != expectedOID) {
+			return invalid(errors.New("snapshot parent does not match expected ref"))
+		}
 	}
 	fingerprint, err := model.FingerprintSnapshot(canonical)
 	if err != nil {
@@ -413,12 +417,17 @@ func (store *Store) PublishSnapshot(
 	if snapshotExists && state.fingerprints[existing.OID] != fingerprint {
 		return fmt.Errorf("catalog memory: snapshot %s: %w", canonical.OID, catalog.ErrConflict)
 	}
-	current, refExists := state.refs[expectation.Name]
-	if snapshotExists && refExists && current == canonical.OID {
+	if snapshotExists && !expectation.UpdatesRef() {
 		return nil
 	}
-	if refExists != expectsExisting || refExists && current != expectedOID {
-		return refConflict(canonical.Repo, expectation.Name)
+	if expectation.UpdatesRef() {
+		current, refExists := state.refs[expectation.Name]
+		if snapshotExists && refExists && current == canonical.OID {
+			return nil
+		}
+		if refExists != expectsExisting || refExists && current != expectedOID {
+			return refConflict(canonical.Repo, expectation.Name)
+		}
 	}
 	if canonical.Parent != nil {
 		if _, exists := state.snapshots[*canonical.Parent]; !exists {
@@ -431,9 +440,11 @@ func (store *Store) PublishSnapshot(
 		state.snapshots[canonical.OID] = canonical
 		state.fingerprints[canonical.OID] = fingerprint
 	}
-	state.refs[expectation.Name] = canonical.OID
-	if len(state.snapshots) == 1 {
-		state.refs[model.RefName("main")] = canonical.OID
+	if expectation.UpdatesRef() {
+		state.refs[expectation.Name] = canonical.OID
+		if len(state.snapshots) == 1 {
+			state.refs[model.RefName("main")] = canonical.OID
+		}
 	}
 	return nil
 }

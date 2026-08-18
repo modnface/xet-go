@@ -22,3 +22,12 @@ func TestExpectRefClonesOID(t *testing.T) {
 		t.Fatalf("absent ref expectation = %#v", absent)
 	}
 }
+
+func TestNoRefUpdateIsDistinctFromZeroValue(t *testing.T) {
+	if !(catalog.RefExpectation{}).UpdatesRef() {
+		t.Fatal("zero RefExpectation unexpectedly selects no-ref-update mode")
+	}
+	if catalog.NoRefUpdate().UpdatesRef() {
+		t.Fatal("NoRefUpdate unexpectedly updates refs")
+	}
+}

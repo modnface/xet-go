@@ -83,11 +83,14 @@ type FilePage struct {
 	SnapshotOID model.OID
 }
 
-// RefExpectation requires Name to contain OID, or to be absent when OID is
-// nil, immediately before a snapshot publication transaction.
+// RefExpectation selects the ref behavior of PublishSnapshot. Values returned
+// by ExpectRef require Name to contain OID, or to be absent when OID is nil,
+// immediately before publication. A value returned by NoRefUpdate leaves all
+// refs unchanged.
 type RefExpectation struct {
-	Name model.RefName
-	OID  *model.OID
+	Name        model.RefName
+	OID         *model.OID
+	noRefUpdate bool
 }
 
 func ExpectRef(name model.RefName, oid *model.OID) RefExpectation {
@@ -99,19 +102,33 @@ func ExpectRef(name model.RefName, oid *model.OID) RefExpectation {
 	return RefExpectation{Name: name, OID: copy}
 }
 
+// NoRefUpdate publishes an immutable snapshot without creating or updating
+// any ref. This includes the first snapshot in a repository. It is the only
+// constructor for this mode.
+func NoRefUpdate() RefExpectation {
+	return RefExpectation{noRefUpdate: true}
+}
+
+// UpdatesRef reports whether publication performs the ref compare-and-swap.
+func (x RefExpectation) UpdatesRef() bool { return !x.noRefUpdate }
+
 // Catalog stores repositories, immutable complete snapshots, and mutable
 // refs. Every lookup is repository-scoped. A trusted control-plane layer must
 // allocate the opaque OID before publication; the catalog never derives it
 // from SnapshotFingerprint. Implementations must clone mutable input and
-// output state and make PublishSnapshot atomic with its ref update. A
-// successful first publication must also create main when another target ref
-// was requested.
+// output state and make PublishSnapshot atomic with its ref update. Except in
+// NoRefUpdate mode, a successful first publication must also create main when
+// another target ref was requested.
 //
 // Ref writes are target-state idempotent: if an identical immutable snapshot
 // is already retained and the target ref already equals the requested new OID,
 // the operation succeeds even when its old-value expectation is now stale.
 // Success in that case does not prove the expectation held during this call.
 // Competing updates to different target OIDs from the same prior ref conflict.
+// NoRefUpdate publication is target-state idempotent on the immutable
+// snapshot: replaying the same OID and snapshot succeeds, while different
+// content under that OID conflicts. It still enforces repository, parent, and
+// existing-snapshot invariants and is serialized per repository.
 type Catalog interface {
 	CreateRepository(context.Context, model.Repository) error
 	GetRepository(context.Context, model.RepoKey) (model.Repository, error)

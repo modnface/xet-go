@@ -108,6 +108,46 @@ func TestIndependentHandlesSerializePublication(t *testing.T) {
 	}
 }
 
+func TestIndependentHandlesInterleaveRefAndDetachedPublication(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "catalog.db")
+	left := openTestStore(t, path)
+	right := openTestStore(t, path)
+	repo := testRepo(t, "concurrent", "detached")
+	if err := left.CreateRepository(ctx, model.Repository{Key: repo, CreatedAt: time.Unix(1, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	root := testSnapshot(t, repo, testOID(t, 13), nil, time.Unix(2, 0), "root")
+	if err := left.PublishSnapshot(ctx, root, catalog.ExpectRef("main", nil)); err != nil {
+		t.Fatal(err)
+	}
+	detached := testSnapshot(t, repo, testOID(t, 14), &root.OID, time.Unix(3, 0), "detached")
+	advanced := testSnapshot(t, repo, testOID(t, 15), &root.OID, time.Unix(3, 0), "advanced")
+	results := make(chan error, 2)
+	start := make(chan struct{})
+	go func() {
+		<-start
+		results <- left.PublishSnapshot(ctx, detached, catalog.NoRefUpdate())
+	}()
+	go func() {
+		<-start
+		results <- right.PublishSnapshot(ctx, advanced, catalog.ExpectRef("main", &root.OID))
+	}()
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("interleaved publication = %v", err)
+		}
+	}
+	main, err := left.GetRef(ctx, repo, "main")
+	if err != nil || main.OID != advanced.OID {
+		t.Fatalf("main after interleaved publication = %#v, %v", main, err)
+	}
+	if retained, err := right.GetSnapshot(ctx, repo, detached.OID); err != nil || retained.OID != detached.OID {
+		t.Fatalf("detached snapshot after interleaved publication = %#v, %v", retained, err)
+	}
+}
+
 func TestConcurrentFirstOpen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.db")
 	start := make(chan struct{})

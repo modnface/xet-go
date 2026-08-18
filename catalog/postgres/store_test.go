@@ -630,6 +630,37 @@ func testIndependentWriterSerialization(t *testing.T) {
 	if successes != 1 || conflicts != 1 {
 		t.Fatalf("publication results = %v", results)
 	}
+	main, err := first.GetRef(ctx, repo, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	detached := testSnapshot(t, repo, testOID(t, 23), &main.OID, time.Unix(0, 4), "detached")
+	advanced := testSnapshot(t, repo, testOID(t, 24), &main.OID, time.Unix(0, 4), "advanced")
+	results = make([]error, 2)
+	start = make(chan struct{})
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		<-start
+		results[0] = first.PublishSnapshot(ctx, detached, catalog.NoRefUpdate())
+	}()
+	go func() {
+		defer wait.Done()
+		<-start
+		results[1] = second.PublishSnapshot(ctx, advanced, catalog.ExpectRef("main", &main.OID))
+	}()
+	close(start)
+	wait.Wait()
+	if results[0] != nil || results[1] != nil {
+		t.Fatalf("interleaved ref and detached publication = %v", results)
+	}
+	main, err = first.GetRef(ctx, repo, "main")
+	if err != nil || main.OID != advanced.OID {
+		t.Fatalf("main after interleaved publication = %#v, %v", main, err)
+	}
+	if retained, err := second.GetSnapshot(ctx, repo, detached.OID); err != nil || retained.OID != detached.OID {
+		t.Fatalf("detached snapshot after interleaved publication = %#v, %v", retained, err)
+	}
 
 	lock, err := pool.Begin(ctx)
 	if err != nil {
@@ -639,11 +670,11 @@ func testIndependentWriterSerialization(t *testing.T) {
 	if _, err := lock.Exec(ctx, `SELECT 1 FROM `+schema+`.repositories WHERE repo_type=$1 AND namespace=$2 AND name=$3 FOR UPDATE`, args(repo)...); err != nil {
 		t.Fatal(err)
 	}
-	main, err := first.GetRef(ctx, repo, "main")
+	main, err = first.GetRef(ctx, repo, "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	blocked := testSnapshot(t, repo, testOID(t, 23), &main.OID, time.Unix(0, 4), "blocked")
+	blocked := testSnapshot(t, repo, testOID(t, 25), &main.OID, time.Unix(0, 5), "blocked")
 	deadline, cancel := context.WithTimeout(ctx, 75*time.Millisecond)
 	defer cancel()
 	if err := second.PublishSnapshot(deadline, blocked, catalog.ExpectRef("main", &main.OID)); !errors.Is(err, context.DeadlineExceeded) {

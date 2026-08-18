@@ -1024,15 +1024,19 @@ func (s *Store) PublishSnapshot(ctx context.Context, snap model.Snapshot, x cata
 	if e != nil {
 		return invalid(e)
 	}
-	if _, e = model.ParseRefName(string(x.Name)); e != nil {
-		return invalid(e)
-	}
-	want, present, e := copyExpected(x.OID)
-	if e != nil {
-		return e
-	}
-	if present && (snap.Parent == nil || *snap.Parent != want) {
-		return invalid(errors.New("parent does not match expectation"))
+	var want model.OID
+	var present bool
+	if x.UpdatesRef() {
+		if _, e = model.ParseRefName(string(x.Name)); e != nil {
+			return invalid(e)
+		}
+		want, present, e = copyExpected(x.OID)
+		if e != nil {
+			return e
+		}
+		if present && (snap.Parent == nil || *snap.Parent != want) {
+			return invalid(errors.New("parent does not match expectation"))
+		}
 	}
 	fp, e := model.FingerprintSnapshot(snap)
 	if e != nil {
@@ -1073,20 +1077,25 @@ func (s *Store) PublishSnapshot(ctx context.Context, snap model.Snapshot, x cata
 			return fmt.Errorf("immutable snapshot: %w", catalog.ErrConflict)
 		}
 	}
-	current, e := s.loadRefOID(ctx, tx, snap.Repo, x.Name)
-	refExists := e == nil
-	if e != nil && !errors.Is(e, catalog.ErrNotFound) {
-		return e
+	if exists && !x.UpdatesRef() {
+		return dbErr(ctx, tx.Commit(ctx))
 	}
-	if refExists {
-		if exists && current == snap.OID {
-			return dbErr(ctx, tx.Commit(ctx))
+	if x.UpdatesRef() {
+		current, refErr := s.loadRefOID(ctx, tx, snap.Repo, x.Name)
+		refExists := refErr == nil
+		if refErr != nil && !errors.Is(refErr, catalog.ErrNotFound) {
+			return refErr
 		}
-		if !present || current != want {
+		if refExists {
+			if exists && current == snap.OID {
+				return dbErr(ctx, tx.Commit(ctx))
+			}
+			if !present || current != want {
+				return fmt.Errorf("ref conflict: %w", catalog.ErrConflict)
+			}
+		} else if present {
 			return fmt.Errorf("ref conflict: %w", catalog.ErrConflict)
 		}
-	} else if present {
-		return fmt.Errorf("ref conflict: %w", catalog.ErrConflict)
 	}
 	var count int64
 	if e = tx.QueryRow(ctx, `SELECT count(*) FROM `+s.q("snapshots")+` WHERE repo_type=$1 AND namespace=$2 AND name=$3`, args(snap.Repo)...).Scan(&count); e != nil {
@@ -1136,11 +1145,15 @@ func (s *Store) PublishSnapshot(ctx context.Context, snap model.Snapshot, x cata
 			}
 		}
 	}
-	updated, updateErr := tx.Exec(ctx, `INSERT INTO `+s.q("refs")+` VALUES($1,$2,$3,$4,$5) ON CONFLICT(repo_type,namespace,name,ref_name) DO UPDATE SET oid=excluded.oid`, snap.Repo.Type, snap.Repo.Namespace, snap.Repo.Name, x.Name, snap.OID[:])
-	if e = expectOne(ctx, updated, updateErr, "target ref update"); e != nil {
-		return e
+	if x.UpdatesRef() {
+		updated, updateErr := tx.Exec(ctx, `INSERT INTO `+s.q("refs")+` VALUES($1,$2,$3,$4,$5) ON CONFLICT(repo_type,namespace,name,ref_name) DO UPDATE SET oid=excluded.oid`, snap.Repo.Type, snap.Repo.Namespace, snap.Repo.Name, x.Name, snap.OID[:])
+		if e = expectOne(ctx, updated, updateErr, "target ref update"); e != nil {
+			return e
+		}
 	}
-	if count == 0 {
+	if x.UpdatesRef() && count == 0 {
+		var updated pgconn.CommandTag
+		var updateErr error
 		updated, updateErr = tx.Exec(ctx, `INSERT INTO `+s.q("refs")+` VALUES($1,$2,$3,'main',$4) ON CONFLICT(repo_type,namespace,name,ref_name) DO UPDATE SET oid=excluded.oid`, snap.Repo.Type, snap.Repo.Namespace, snap.Repo.Name, snap.OID[:])
 		if e = expectOne(ctx, updated, updateErr, "initial main ref update"); e != nil {
 			return e

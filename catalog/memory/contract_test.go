@@ -77,11 +77,57 @@ func runCatalogContract(t *testing.T, factory catalogFactory) {
 	t.Run("repositories", func(t *testing.T) { testRepositories(t, factory(t)) })
 	t.Run("publication and reads", func(t *testing.T) { testPublicationAndReads(t, factory(t)) })
 	t.Run("first publication", func(t *testing.T) { testFirstPublicationCreatesMain(t, factory(t)) })
+	t.Run("publication without ref update", func(t *testing.T) { testPublicationWithoutRefUpdate(t, factory(t)) })
 	t.Run("concurrent publication", func(t *testing.T) { testConcurrentPublication(t, factory(t)) })
 	t.Run("snapshot pagination order", func(t *testing.T) { testSnapshotPaginationOrder(t, factory(t)) })
 	t.Run("ref pagination order", func(t *testing.T) { testRefPaginationOrder(t, factory(t)) })
 	t.Run("error semantics", func(t *testing.T) { testErrorSemantics(t, factory(t)) })
 	t.Run("cancellation", func(t *testing.T) { testCancellation(t, factory(t)) })
+}
+
+func testPublicationWithoutRefUpdate(t *testing.T, store contractCatalog) {
+	t.Helper()
+	ctx := context.Background()
+	repo := createRepository(t, store, "team", "detached")
+	root := snapshot(t, repo, oid(t, 41), nil, time.Unix(100, 0), "root", "a")
+	if err := store.PublishSnapshot(ctx, root, catalog.NoRefUpdate()); err != nil {
+		t.Fatalf("publish detached root: %v", err)
+	}
+	refs, err := store.ListRefs(ctx, repo, catalog.RefQuery{})
+	if err != nil || len(refs.Items) != 0 {
+		t.Fatalf("refs after detached first publication = %#v, %v", refs, err)
+	}
+	if _, err := store.GetRef(ctx, repo, "main"); !errors.Is(err, catalog.ErrNotFound) {
+		t.Fatalf("main after detached first publication = %v", err)
+	}
+	if err := store.PublishSnapshot(ctx, root, catalog.NoRefUpdate()); err != nil {
+		t.Fatalf("replay detached root: %v", err)
+	}
+	conflicting := root
+	conflicting.Message = "different"
+	if err := store.PublishSnapshot(ctx, conflicting, catalog.NoRefUpdate()); !errors.Is(err, catalog.ErrConflict) {
+		t.Fatalf("conflicting detached replay = %v", err)
+	}
+	if err := store.CompareAndSwapRef(ctx, repo, "main", nil, root.OID); err != nil {
+		t.Fatalf("create main: %v", err)
+	}
+	child := snapshot(t, repo, oid(t, 42), &root.OID, time.Unix(200, 0), "child", "b")
+	if err := store.PublishSnapshot(ctx, child, catalog.NoRefUpdate()); err != nil {
+		t.Fatalf("publish detached child: %v", err)
+	}
+	main, err := store.GetRef(ctx, repo, "main")
+	if err != nil || main.OID != root.OID {
+		t.Fatalf("main changed by detached publication = %#v, %v", main, err)
+	}
+	orphanParent := oid(t, 43)
+	orphan := snapshot(t, repo, oid(t, 44), &orphanParent, time.Unix(300, 0), "orphan")
+	if err := store.PublishSnapshot(ctx, orphan, catalog.NoRefUpdate()); !errors.Is(err, catalog.ErrNotFound) {
+		t.Fatalf("detached orphan = %v", err)
+	}
+	secondRoot := snapshot(t, repo, oid(t, 45), nil, time.Unix(400, 0), "second root")
+	if err := store.PublishSnapshot(ctx, secondRoot, catalog.NoRefUpdate()); !errors.Is(err, catalog.ErrInvalid) {
+		t.Fatalf("detached second root = %v", err)
+	}
 }
 
 func testRepositories(t *testing.T, store contractCatalog) {
