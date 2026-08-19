@@ -105,9 +105,14 @@ func (s *Service) createRepository(
 		s.fail(w, r, err)
 		return
 	}
+	bases, err := s.resolveBaseURLs(r)
+	if err != nil {
+		s.failBaseURLResolution(w, r, err)
+		return
+	}
 	result := struct {
 		URL string `json:"url"`
-	}{URL: s.hubURL + "/" + url.PathEscape(string(repo.Namespace)) + "/" + url.PathEscape(string(repo.Name))}
+	}{URL: bases.hub + "/" + url.PathEscape(string(repo.Namespace)) + "/" + url.PathEscape(string(repo.Name))}
 	err = s.writer.CreateRepository(r.Context(), model.Repository{Key: repo, CreatedAt: time.Now().UTC()})
 	if errors.Is(err, bucket.ErrConflict) {
 		s.jsonStatus(w, r, http.StatusConflict, result)
@@ -336,7 +341,7 @@ type commitOperation struct {
 	ref  model.FileRef
 }
 
-func (s *Service) commit(w http.ResponseWriter, r *http.Request, rt route, principal auth.Principal) {
+func (s *Service) commit(w http.ResponseWriter, r *http.Request, rt route, principal auth.Principal, bases baseURLs) {
 	if s.writer == nil || s.publisher == nil {
 		s.fail(w, r, bucket.ErrUnsupported)
 		return
@@ -371,7 +376,7 @@ func (s *Service) commit(w http.ResponseWriter, r *http.Request, rt route, princ
 	if parent != nil {
 		replayOID := commitOID(rt.repo, refName, principal.Subject, bodyDigest, parent.Parent)
 		if parent.OID == replayOID {
-			s.commitResponse(w, r, rt.repo, replayOID)
+			s.commitResponse(w, r, rt.repo, replayOID, bases)
 			return
 		}
 	}
@@ -435,7 +440,7 @@ func (s *Service) commit(w http.ResponseWriter, r *http.Request, rt route, princ
 	defer lock.Unlock()
 	current, currentErr := s.bucket.ResolveRevision(r.Context(), rt.repo, rt.revision)
 	if currentErr == nil && current.OID == oid {
-		s.commitResponse(w, r, rt.repo, oid)
+		s.commitResponse(w, r, rt.repo, oid, bases)
 		return
 	}
 	if currentErr != nil && !errors.Is(currentErr, bucket.ErrNotFound) {
@@ -450,7 +455,7 @@ func (s *Service) commit(w http.ResponseWriter, r *http.Request, rt route, princ
 		s.fail(w, r, err)
 		return
 	}
-	s.commitResponse(w, r, rt.repo, oid)
+	s.commitResponse(w, r, rt.repo, oid, bases)
 }
 
 func (s *Service) commitParent(ctx context.Context, rt route) (*model.Snapshot, error) {
@@ -737,8 +742,8 @@ func applyCommitOperations(parent *model.Snapshot, operations []commitOperation)
 	return result, nil
 }
 
-func (s *Service) commitResponse(w http.ResponseWriter, r *http.Request, repo model.RepoKey, oid model.OID) {
-	commitURL := s.hubURL + "/" + url.PathEscape(string(repo.Namespace)) + "/" + url.PathEscape(string(repo.Name)) + "/commit/" + oid.String()
+func (s *Service) commitResponse(w http.ResponseWriter, r *http.Request, repo model.RepoKey, oid model.OID, bases baseURLs) {
+	commitURL := bases.hub + "/" + url.PathEscape(string(repo.Namespace)) + "/" + url.PathEscape(string(repo.Name)) + "/commit/" + oid.String()
 	s.json(w, r, struct {
 		CommitURL string `json:"commitUrl"`
 		CommitOID string `json:"commitOid"`

@@ -70,7 +70,8 @@ func TestOfficialPythonClientSnapshotDownloadUsesCAS(t *testing.T) {
 		python = filepath.Join("..", python)
 	}
 	fixture := newPythonCASFixture(t)
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	const prefix = "/tenants/read"
+	hub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/xet-read-token/") {
 			fixture.tokenRequests.Add(1)
 		}
@@ -78,8 +79,9 @@ func TestOfficialPythonClientSnapshotDownloadUsesCAS(t *testing.T) {
 			fixture.xetFallbackRequests.Add(1)
 		}
 		fixture.handler.ServeHTTP(w, r)
-	}))
-	fixture.handler.hubURL = "http://" + server.Listener.Addr().String()
+	})
+	server := httptest.NewUnstartedServer(http.StripPrefix(prefix, hub))
+	fixture.hubBaseURL = "http://" + server.Listener.Addr().String() + prefix
 	server.Start()
 	defer server.Close()
 
@@ -89,7 +91,7 @@ func TestOfficialPythonClientSnapshotDownloadUsesCAS(t *testing.T) {
 		ctx,
 		python,
 		filepath.Join("..", "conformance", "hf-client", "check-read-endpoint.py"),
-		"--endpoint", server.URL,
+		"--endpoint", fixture.hubBaseURL,
 		"--token", "hub-token",
 		"--snapshot-dir", t.TempDir(),
 	)
@@ -122,7 +124,8 @@ func TestOfficialPythonClientNativeXetDownloadThenUploadSameProcess(t *testing.T
 	fixture := newPythonCASFixture(t)
 	fixture.handler.large = 1 << 20
 	var writeTokens atomic.Int32
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	const prefix = "/tenants/native"
+	hub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/xet-write-token/") {
 			writeTokens.Add(1)
 		}
@@ -130,8 +133,9 @@ func TestOfficialPythonClientNativeXetDownloadThenUploadSameProcess(t *testing.T
 			fixture.xetFallbackRequests.Add(1)
 		}
 		fixture.handler.ServeHTTP(w, r)
-	}))
-	fixture.handler.hubURL = "http://" + server.Listener.Addr().String()
+	})
+	server := httptest.NewUnstartedServer(http.StripPrefix(prefix, hub))
+	fixture.hubBaseURL = "http://" + server.Listener.Addr().String() + prefix
 	server.Start()
 	defer server.Close()
 
@@ -141,11 +145,11 @@ func TestOfficialPythonClientNativeXetDownloadThenUploadSameProcess(t *testing.T
 		ctx,
 		python,
 		filepath.Join("..", "conformance", "hf-client", "check-write-endpoint.py"),
-		"--endpoint", server.URL,
+		"--endpoint", fixture.hubBaseURL,
 		"--token", "hub-token",
 		"--download-dir", t.TempDir(),
 	)
-	command.Env = append(os.Environ(), "HF_HUB_DISABLE_PROGRESS_BARS=1", "HF_ENDPOINT="+server.URL)
+	command.Env = append(os.Environ(), "HF_HUB_DISABLE_PROGRESS_BARS=1", "HF_ENDPOINT="+fixture.hubBaseURL)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		page, listErr := fixture.store.ListSHA256(context.Background(), nil, casserver.PageRequest{Limit: 100})
@@ -170,7 +174,8 @@ func TestOfficialPythonClientLegacyLFSFallback(t *testing.T) {
 	fixture.handler.large = 1 << 20
 	var batches atomic.Int32
 	var writeTokens atomic.Int32
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	const prefix = "/tenants/legacy-lfs"
+	hub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, ".git/info/lfs/objects/batch") {
 			batches.Add(1)
 		}
@@ -178,8 +183,9 @@ func TestOfficialPythonClientLegacyLFSFallback(t *testing.T) {
 			writeTokens.Add(1)
 		}
 		fixture.handler.ServeHTTP(w, r)
-	}))
-	fixture.handler.hubURL = "http://" + server.Listener.Addr().String()
+	})
+	server := httptest.NewUnstartedServer(http.StripPrefix(prefix, hub))
+	fixture.hubBaseURL = "http://" + server.Listener.Addr().String() + prefix
 	server.Start()
 	defer server.Close()
 
@@ -189,11 +195,11 @@ func TestOfficialPythonClientLegacyLFSFallback(t *testing.T) {
 		ctx,
 		python,
 		filepath.Join("..", "conformance", "hf-client", "check-write-endpoint.py"),
-		"--endpoint", server.URL,
+		"--endpoint", fixture.hubBaseURL,
 		"--token", "hub-token",
 		"--download-dir", t.TempDir(),
 	)
-	command.Env = append(os.Environ(), "HF_HUB_DISABLE_PROGRESS_BARS=1", "HF_HUB_DISABLE_XET=1", "HF_ENDPOINT="+server.URL)
+	command.Env = append(os.Environ(), "HF_HUB_DISABLE_PROGRESS_BARS=1", "HF_HUB_DISABLE_XET=1", "HF_ENDPOINT="+fixture.hubBaseURL)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("official Python legacy-LFS write: %v\n%s", err, output)
@@ -206,6 +212,7 @@ func TestOfficialPythonClientLegacyLFSFallback(t *testing.T) {
 type pythonCASFixture struct {
 	handler                *Service
 	store                  *casserver.MemoryStore
+	hubBaseURL             string
 	tokenRequests          atomic.Int32
 	reconstructionRequests atomic.Int32
 	storageRequests        atomic.Int32
@@ -374,7 +381,9 @@ func newPythonCASFixture(t *testing.T) *pythonCASFixture {
 
 	handler, err := New(Options{
 		Bucket: service, Broker: broker,
-		HubBaseURL: "https://hub.invalid", CASBaseURL: casServer.URL,
+		BaseURLFunc: func(*http.Request) (string, string, error) {
+			return fixture.hubBaseURL, casServer.URL, nil
+		},
 		Ingester: XetFileIngestFunc(func(ctx context.Context, got model.RepoKey, source io.Reader) (XetFileIngestResult, error) {
 			if got != repo {
 				return XetFileIngestResult{}, bucket.ErrPermissionDenied

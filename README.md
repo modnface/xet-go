@@ -78,6 +78,8 @@ and write profile without moving hosting concepts into `bucket`, `model`, or
 CAS. In addition to metadata, tree, token, and range-capable resolve routes, it
 supports whoami, model-repository creation, preupload, streamed commit control,
 native Xet write-token exchange, and a capability-bound basic LFS fallback.
+Hub and CAS base URLs may be configured statically or derived and validated
+once per request for hosts with variable public path prefixes.
 Mutable refs are pinned to an immutable OID before file access, every recognized
 repository request is authorized before catalog lookup, and denied repositories
 are concealed as absent. `BucketService` decorators and delegated

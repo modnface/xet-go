@@ -15,10 +15,73 @@ write token. The commit still represents that file as `lfsFile` with its
 conventional SHA-256 and size.
 
 All returned repository, commit, token, and upload-action URLs are rooted at
-`HubBaseURL` or `CASBaseURL`, including any configured base path. When a base
-path is present, mount the corresponding handler with that prefix removed (for
-example, `http.StripPrefix("/hub", service.HubHandler())`); the handlers keep
-route parsing independent from deployment middleware.
+`HubBaseURL` or `CASBaseURL` (or the corresponding `BaseURLFunc` result),
+including any configured base path. When a static base path is present, mount
+the corresponding handler with that prefix removed (for example,
+`http.StripPrefix("/hub", service.HubHandler())`); the handlers keep route
+parsing independent from deployment middleware.
+
+For a public Hub prefix that varies per request, leave both static fields empty
+and set `BaseURLFunc`. The mounting layer must strip the same variable prefix
+that the function includes in its returned Hub base. A mismatch emits the Xet
+read-token refresh link and LFS upload action under a path that does not route;
+preventing that failure is the reason the function exists. For example, this
+mounts one service at a tenant path selected by a trusted router while keeping
+CAS at one fixed mount:
+
+```go
+type publicHubBaseKey struct{}
+
+service, err := hfcompat.New(hfcompat.Options{
+    Bucket: bucketService,
+    Broker: accessBroker,
+    BaseURLFunc: func(r *http.Request) (string, string, error) {
+        hub, ok := r.Context().Value(publicHubBaseKey{}).(string)
+        if !ok {
+            return "", "", errors.New("missing routed Hub base")
+        }
+        return hub, "https://models.example/cas", nil
+    },
+})
+if err != nil {
+    return err
+}
+
+mux.Handle("/tenants/{tenant}/{rest...}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    tenant := r.PathValue("tenant")
+    if tenant == "" || strings.Trim(tenant, "abcdefghijklmnopqrstuvwxyz0123456789-") != "" {
+        http.NotFound(w, r)
+        return
+    }
+    prefix := "/tenants/" + tenant
+    ctx := context.WithValue(r.Context(), publicHubBaseKey{}, "https://models.example"+prefix)
+    http.StripPrefix(prefix, service.Handler()).ServeHTTP(w, r.WithContext(ctx))
+}))
+```
+
+The same rule applies when the returned CAS base has a variable path: mount the
+corresponding CAS handler at that external prefix and strip it before CAS route
+parsing. `BaseURLFunc` runs on Hub requests and controls emitted URL values; it
+does not configure or mount the CAS handler itself. In the composed service,
+this means the returned CAS base and the external mount of
+`bucket/hosted.Service.CASHandler` must agree.
+
+`BaseURLFunc` is called at most once after the required authorization and before
+an absolute URL or URL-producing side effect. Routes whose repository is in the
+path resolve before dispatch; repository creation resolves after parsing and
+authorizing the body-supplied target and before creating it. Both results are
+validated before use. The library does not infer public identity from `Host`,
+`X-Forwarded-Host`, `X-Forwarded-Proto`, or other request headers. An embedder
+may use trusted proxy-derived state in its function, but owns that trust
+decision.
+
+Returned bases must also remain routable for the lifetime of URLs already sent
+to clients, not merely for the request that selected them. In particular, a
+client can follow the Xet read-token refresh link later during a long transfer
+when it needs a fresh scoped token, and follows an LFS upload action later for
+the body PUT. A request-scoped identifier, short-lived view, or rotating alias
+that expires first will break those operations; the read-token refresh is the
+less obvious failure.
 
 The pinned preupload request contains only path, size, and the first 512 bytes;
 it does **not** contain a full-file digest. Consequently preupload cannot
@@ -40,6 +103,22 @@ restart. `bucket/hosted.Options.LFSIngester` forwards the same capability for
 composed services. Multi-instance or restart-stable receivers must configure
 the same 32-byte `LFSUploadCapabilityKey`; the default ephemeral key is
 intentionally suitable only for one service instance.
+
+The `LFSUploadCapabilityKey` defines a trust domain. Share it only among
+instances that serve the same catalog, content store, and authorization policy;
+use distinct keys for instances intended to be isolated. The upload capability
+is the authorization for `lfs-upload`, which deliberately performs no separate
+repository authorization, so another instance with the same key can accept a
+capability for the same `RepoKey` without consulting its own repository
+authorizer. `XetFileIngester.IngestXetFile` receives only the context, `RepoKey`,
+and content reader—not the principal—so an embedder cannot re-authorize there.
+The bounded impact is storage and a namespace-scoped Xet record in that other
+catalog: ingest alone creates no catalog tree entry, and `commit` still requires
+`RepositoryWrite`. The base URL is intentionally not signed because one logical
+repository may legitimately be reached through several addresses. Any future
+stronger isolation should bind a separately designed trust-domain identifier,
+with an explicit capability invalidation policy, rather than bind the public
+URL.
 
 `hfcompat.Options.Audit` observes every recognized write operation after its
 HTTP outcome is known. `WriteAuditEvent` contains only the authenticated

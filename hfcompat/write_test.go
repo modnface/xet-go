@@ -502,6 +502,58 @@ func TestCommitAddDeleteXetAndReplay(t *testing.T) {
 	}
 }
 
+func TestPerRequestBaseURLsForCreateAndCommit(t *testing.T) {
+	fixture := newHandlerFixture(t, 0)
+	calls := 0
+	handler, err := New(Options{
+		Bucket: fixture.bucket,
+		Broker: fixture.handler.broker,
+		BaseURLFunc: func(r *http.Request) (string, string, error) {
+			calls++
+			prefix := r.Header.Get("X-Test-Prefix")
+			return "https://hub.test/" + prefix + "/root", "https://cas.test/" + prefix + "/root", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for index, prefix := range []string{"tenant-a", "tenant-b"} {
+		name := fmt.Sprintf("dynamic-%d", index)
+		body := fmt.Sprintf(`{"name":%q,"organization":"owner"}`, name)
+		before := calls
+		response := requestBody(t, handler, http.MethodPost, "/api/repos/create", "Bearer hub-token", strings.NewReader(body), map[string]string{"X-Test-Prefix": prefix})
+		want := fmt.Sprintf("{\"url\":\"https://hub.test/%s/root/owner/%s\"}\n", prefix, name)
+		if response.Code != http.StatusOK || response.Body.String() != want || calls != before+1 {
+			t.Fatalf("create %s = %d, %q, calls=%d", prefix, response.Code, response.Body.String(), calls-before)
+		}
+	}
+
+	body := commitBody(t,
+		commitLine("header", commitHeaderDTO{Summary: "dynamic URL", ParentCommit: fixture.snapshot.OID.String()}),
+		commitLine("file", commitFileDTO{Path: "dynamic.txt", Encoding: "base64", Content: base64.StdEncoding.EncodeToString([]byte("dynamic"))}),
+	)
+	commitOID := ""
+	for _, prefix := range []string{"tenant-a", "tenant-b"} {
+		before := calls
+		response := requestBody(t, handler, http.MethodPost, "/api/models/owner/model/commit/main", "Bearer hub-token", bytes.NewReader(body), map[string]string{"X-Test-Prefix": prefix})
+		var decoded struct {
+			CommitURL string `json:"commitUrl"`
+			CommitOID string `json:"commitOid"`
+		}
+		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &decoded) != nil || calls != before+1 {
+			t.Fatalf("commit %s = %d, %q, calls=%d", prefix, response.Code, response.Body.String(), calls-before)
+		}
+		if commitOID == "" {
+			commitOID = decoded.CommitOID
+		}
+		wantURL := "https://hub.test/" + prefix + "/root/owner/model/commit/" + commitOID
+		if decoded.CommitOID != commitOID || decoded.CommitURL != wantURL {
+			t.Fatalf("commit %s = %#v, want URL %q", prefix, decoded, wantURL)
+		}
+	}
+}
+
 func TestCommitFirstPublicationCreatesMain(t *testing.T) {
 	fixture := newHandlerFixture(t, 0)
 	repo, err := model.NewRepoKey("owner", "empty", model.RepoTypeModel)

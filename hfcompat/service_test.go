@@ -613,6 +613,169 @@ func TestHandlerPinnedReadWorkflow(t *testing.T) {
 	}
 }
 
+func TestPerRequestBaseURLsForResolveAndTokens(t *testing.T) {
+	fixture := newHandlerFixture(t, 0)
+	calls := 0
+	handler, err := New(Options{
+		Bucket: fixture.bucket,
+		Broker: fixture.handler.broker,
+		BaseURLFunc: func(r *http.Request) (string, string, error) {
+			calls++
+			prefix := r.Header.Get("X-Test-Prefix")
+			return "https://hub.test/" + prefix + "/root", "https://cas.test/" + prefix + "/root", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oid := fixture.snapshot.OID.String()
+	resolveCases := []struct {
+		method string
+		prefix string
+	}{
+		{http.MethodHead, "tenant-a"},
+		{http.MethodGet, "tenant-b"},
+	}
+	for _, test := range resolveCases {
+		before := calls
+		response := request(t, handler, test.method, "/owner/model/resolve/main/weights/model.bin", "Bearer hub-token", map[string]string{"X-Test-Prefix": test.prefix})
+		wantLink := "<https://hub.test/" + test.prefix + "/root/api/models/owner/model/xet-read-token/" + oid + ">; rel=\"xet-auth\""
+		if response.Code != http.StatusOK || response.Header().Get("Link") != wantLink || calls != before+1 {
+			t.Fatalf("%s resolve = %d, link %q, calls %d", test.method, response.Code, response.Header().Get("Link"), calls-before)
+		}
+	}
+
+	tokenCases := []struct {
+		kind   string
+		prefix string
+	}{
+		{"read", "tenant-a"},
+		{"write", "tenant-b"},
+	}
+	for _, test := range tokenCases {
+		before := calls
+		response := request(t, handler, http.MethodGet, "/api/models/owner/model/xet-"+test.kind+"-token/main", "Bearer hub-token", map[string]string{"X-Test-Prefix": test.prefix})
+		var decoded struct {
+			CASURL string `json:"casUrl"`
+		}
+		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &decoded) != nil ||
+			decoded.CASURL != "https://cas.test/"+test.prefix+"/root" || calls != before+1 {
+			t.Fatalf("%s token = %d, %#v, calls %d", test.kind, response.Code, decoded, calls-before)
+		}
+	}
+}
+
+func TestBaseURLFuncFailureIsInternalAndEmitsNoURL(t *testing.T) {
+	fixture := newHandlerFixture(t, 0)
+	tests := []struct {
+		name string
+		hub  string
+		cas  string
+		err  error
+	}{
+		{name: "userinfo", hub: "https://user@hub.test/base", cas: "https://cas.test/base"},
+		{name: "query", hub: "https://hub.test/base?q=1", cas: "https://cas.test/base"},
+		{name: "fragment", hub: "https://hub.test/base#fragment", cas: "https://cas.test/base"},
+		{name: "trailing slash", hub: "https://hub.test/base/", cas: "https://cas.test/base"},
+		{name: "dot component", hub: "https://hub.test/base/../other", cas: "https://cas.test/base"},
+		{name: "control character", hub: "https://hub.test/base\nother", cas: "https://cas.test/base"},
+		{name: "invalid CAS", hub: "https://hub.test/base", cas: "https://cas.test/base?query=1"},
+		{name: "function error", err: errors.New("secret resolver detail")},
+		{name: "classified function error", err: fmt.Errorf("secret resolver detail: %w", bucket.ErrUnavailable)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			handler, err := New(Options{
+				Bucket: fixture.bucket,
+				Broker: fixture.handler.broker,
+				BaseURLFunc: func(*http.Request) (string, string, error) {
+					calls++
+					return test.hub, test.cas, test.err
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := request(t, handler, http.MethodGet, "/owner/model/resolve/main/weights/model.bin", "Bearer hub-token", nil)
+			if response.Code != http.StatusInternalServerError || calls != 1 || response.Header().Get("Link") != "" ||
+				strings.Contains(response.Body.String(), "secret resolver detail") || strings.Contains(response.Body.String(), "hub.test") {
+				t.Fatalf("response = %d, %#v, %q, calls=%d", response.Code, response.Header(), response.Body.String(), calls)
+			}
+		})
+	}
+}
+
+func TestBaseURLFuncRunsOnlyForAuthorizedURLProducingRequests(t *testing.T) {
+	fixture := newHandlerFixture(t, 0)
+	calls := 0
+	handler, err := New(Options{
+		Bucket: fixture.bucket,
+		Broker: fixture.handler.broker,
+		BaseURLFunc: func(*http.Request) (string, string, error) {
+			calls++
+			return "https://hub.test/base", "https://cas.test/base", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		method     string
+		target     string
+		credential string
+		status     int
+	}{
+		{http.MethodGet, "/unknown", "", http.StatusNotFound},
+		{http.MethodGet, "/api/models/owner/model", "Bearer hub-token", http.StatusOK},
+		{http.MethodGet, "/owner/model/resolve/main/weights/model.bin", "", http.StatusUnauthorized},
+		{http.MethodPost, "/owner/model/resolve/main/weights/model.bin", "Bearer hub-token", http.StatusMethodNotAllowed},
+	} {
+		response := request(t, handler, test.method, test.target, test.credential, nil)
+		if response.Code != test.status {
+			t.Fatalf("%s %s = %d", test.method, test.target, response.Code)
+		}
+	}
+	deniedCreate := requestBody(t, handler, http.MethodPost, "/api/repos/create", "Bearer hub-token", strings.NewReader(`{"name":"denied","organization":"other"}`), nil)
+	if deniedCreate.Code != http.StatusNotFound || calls != 0 {
+		t.Fatalf("denied create = %d, calls=%d, body=%q", deniedCreate.Code, calls, deniedCreate.Body.String())
+	}
+	response := request(t, handler, http.MethodHead, "/owner/model/resolve/main/weights/model.bin", "Bearer hub-token", nil)
+	if response.Code != http.StatusOK || calls != 1 {
+		t.Fatalf("authorized resolve = %d, calls=%d", response.Code, calls)
+	}
+}
+
+func TestStaticBaseURLsIgnoreHostAndForwardingHeaders(t *testing.T) {
+	fixture := newHandlerFixture(t, 0)
+	req := httptest.NewRequest(http.MethodHead, "/owner/model/resolve/main/weights/model.bin", nil)
+	req.Host = "attacker.example"
+	req.Header.Set("Host", "attacker.example")
+	req.Header.Set("X-Forwarded-Host", "forwarded-attacker.example")
+	req.Header.Set("X-Forwarded-Proto", "http")
+	req.Header.Set("Authorization", "Bearer hub-token")
+	recorder := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(recorder, req)
+	want := "<https://hub.example/root/api/models/owner/model/xet-read-token/" + fixture.snapshot.OID.String() + ">; rel=\"xet-auth\""
+	if recorder.Code != http.StatusOK || recorder.Header().Get("Link") != want {
+		t.Fatalf("response = %d, link %q", recorder.Code, recorder.Header().Get("Link"))
+	}
+	tokenRequest := httptest.NewRequest(http.MethodGet, "/api/models/owner/model/xet-read-token/main", nil)
+	tokenRequest.Host = "attacker.example"
+	tokenRequest.Header.Set("X-Forwarded-Host", "forwarded-attacker.example")
+	tokenRequest.Header.Set("X-Forwarded-Proto", "http")
+	tokenRequest.Header.Set("Authorization", "Bearer hub-token")
+	tokenRecorder := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(tokenRecorder, tokenRequest)
+	var token struct {
+		CASURL string `json:"casUrl"`
+	}
+	if tokenRecorder.Code != http.StatusOK || json.Unmarshal(tokenRecorder.Body.Bytes(), &token) != nil || token.CASURL != "https://cas.example/cas" {
+		t.Fatalf("token response = %d, %#v, %q", tokenRecorder.Code, token, tokenRecorder.Body.String())
+	}
+}
+
 func TestHandlerReadFailuresAndLimits(t *testing.T) {
 	fixture := newHandlerFixture(t, 0)
 	tests := []struct {
@@ -724,7 +887,7 @@ func TestRevisionAndTokenBackendFailuresAreClassified(t *testing.T) {
 		},
 	}
 	recorder = httptest.NewRecorder()
-	service.token(recorder, request, rt, auth.RepositoryGrant{}, auth.CASRead)
+	service.token(recorder, request, rt, auth.RepositoryGrant{}, auth.CASRead, baseURLs{cas: "https://cas.test"})
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("token backend failure = %d, %q", recorder.Code, recorder.Body.String())
 	}
@@ -926,7 +1089,7 @@ func TestRouteParsingAndIdentifiers(t *testing.T) {
 		t.Fatal("distinct file refs compare equal")
 	}
 	recorder := httptest.NewRecorder()
-	setFileHeaders(recorder, &Service{hubURL: "https://hub"}, route{repo: testRepoKey(t)}, model.Snapshot{OID: oid}, model.FileEntry{Ref: xet}, int64(len(body)), nil)
+	setFileHeaders(recorder, baseURLs{hub: "https://hub"}, route{repo: testRepoKey(t)}, model.Snapshot{OID: oid}, model.FileEntry{Ref: xet}, int64(len(body)), nil)
 	if recorder.Header().Get("ETag") != strconv.Quote(hash.String()) {
 		t.Fatalf("SHA-less Xet ETag = %q", recorder.Header().Get("ETag"))
 	}
@@ -980,6 +1143,8 @@ func TestConstructorAndErrorMapping(t *testing.T) {
 	for name, options := range map[string]Options{
 		"missing bucket":  {Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas"},
 		"missing broker":  {Bucket: validBucket, HubBaseURL: "https://hub", CASBaseURL: "https://cas"},
+		"missing hub":     {Bucket: validBucket, Broker: validBroker, CASBaseURL: "https://cas"},
+		"missing CAS":     {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub"},
 		"relative hub":    {Bucket: validBucket, Broker: validBroker, HubBaseURL: "/hub", CASBaseURL: "https://cas"},
 		"FTP CAS":         {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "ftp://cas"},
 		"userinfo":        {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://user@hub", CASBaseURL: "https://cas"},
@@ -1006,12 +1171,62 @@ func TestConstructorAndErrorMapping(t *testing.T) {
 		"LFS batch max":   {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", MaxLFSBatchObjects: -1},
 		"LFS TTL":         {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", LFSUploadTTL: time.Second + time.Nanosecond},
 		"LFS key":         {Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "https://cas", LFSUploadCapabilityKey: []byte("short")},
+		"function and hub": {
+			Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub",
+			BaseURLFunc: func(*http.Request) (string, string, error) { return "https://hub", "https://cas", nil },
+		},
+		"function and CAS": {
+			Bucket: validBucket, Broker: validBroker, CASBaseURL: "https://cas",
+			BaseURLFunc: func(*http.Request) (string, string, error) { return "https://hub", "https://cas", nil },
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := New(options); err == nil {
 				t.Fatal("expected constructor error")
 			}
 		})
+	}
+	conflictOptions := Options{
+		Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub",
+		BaseURLFunc: func(*http.Request) (string, string, error) { return "https://hub", "https://cas", nil },
+	}
+	if _, err := New(conflictOptions); err == nil || err.Error() != "hfcompat: base URL function and static base URLs are mutually exclusive" {
+		t.Fatalf("base URL source conflict = %v", err)
+	}
+	for _, test := range []struct {
+		name    string
+		options Options
+		want    string
+	}{
+		{
+			name: "missing Hub", options: Options{Bucket: validBucket, Broker: validBroker, CASBaseURL: "https://cas"},
+			want: "hfcompat: hub base URL: must be an absolute HTTP(S) URL without userinfo, query, or fragment",
+		},
+		{
+			name: "missing CAS", options: Options{Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub"},
+			want: "hfcompat: CAS base URL: must be an absolute HTTP(S) URL without userinfo, query, or fragment",
+		},
+		{
+			name: "malformed Hub", options: Options{Bucket: validBucket, Broker: validBroker, HubBaseURL: "/hub", CASBaseURL: "https://cas"},
+			want: "hfcompat: hub base URL: must be an absolute HTTP(S) URL without userinfo, query, or fragment",
+		},
+		{
+			name: "malformed CAS", options: Options{Bucket: validBucket, Broker: validBroker, HubBaseURL: "https://hub", CASBaseURL: "ftp://cas"},
+			want: "hfcompat: CAS base URL: must be an absolute HTTP(S) URL without userinfo, query, or fragment",
+		},
+	} {
+		t.Run("message "+test.name, func(t *testing.T) {
+			if _, err := New(test.options); err == nil || err.Error() != test.want {
+				t.Fatalf("New error = %v, want %q", err, test.want)
+			}
+		})
+	}
+	dynamic, err := New(Options{
+		Bucket: validBucket, Broker: validBroker,
+		BaseURLFunc: func(*http.Request) (string, string, error) { return "https://hub", "https://cas", nil },
+	})
+	if err != nil || dynamic.hubURL != "" || dynamic.casURL != "" || dynamic.baseURLFunc == nil {
+		t.Fatalf("dynamic constructor = %#v, %v", dynamic, err)
 	}
 	service, err := New(Options{Bucket: validBucket, Broker: validBroker, HubBaseURL: "http://hub/prefix", CASBaseURL: "https://cas/prefix"})
 	if err != nil || service.Handler() != service || service.ttl != defaultTokenTTL || service.max != defaultTreeMax ||
@@ -1229,7 +1444,7 @@ func TestResolveRejectsInconsistentStreamsAndClosesBodies(t *testing.T) {
 			}}
 			service := &Service{bucket: store, hubURL: "https://hub"}
 			recorder := httptest.NewRecorder()
-			service.resolve(recorder, httptest.NewRequest(http.MethodGet, "/owner/model/resolve/main/file.bin", nil), rt)
+			service.resolve(recorder, httptest.NewRequest(http.MethodGet, "/owner/model/resolve/main/file.bin", nil), rt, baseURLs{hub: service.hubURL})
 			if recorder.Code != http.StatusInternalServerError {
 				t.Fatalf("status = %d, %q", recorder.Code, recorder.Body.String())
 			}
@@ -1245,7 +1460,7 @@ func TestResolveRejectsInconsistentStreamsAndClosesBodies(t *testing.T) {
 	}}
 	service := &Service{bucket: store, hubURL: "https://hub"}
 	recorder := httptest.NewRecorder()
-	service.resolve(recorder, httptest.NewRequest(http.MethodGet, "/owner/model/resolve/main/file.bin", nil), rt)
+	service.resolve(recorder, httptest.NewRequest(http.MethodGet, "/owner/model/resolve/main/file.bin", nil), rt, baseURLs{hub: service.hubURL})
 	if recorder.Code != http.StatusInternalServerError || body.closed != 1 {
 		t.Fatalf("midstream failure = %d, %q, closes=%d", recorder.Code, recorder.Body.String(), body.closed)
 	}
@@ -1254,7 +1469,7 @@ func TestResolveRejectsInconsistentStreamsAndClosesBodies(t *testing.T) {
 		return &bucket.FileReader{Entry: entry, FileSize: 4, Range: content.Range{End: 4}, Size: 4, Body: partialBody}, nil
 	}
 	recorder = httptest.NewRecorder()
-	service.resolve(recorder, httptest.NewRequest(http.MethodGet, "/owner/model/resolve/main/file.bin", nil), rt)
+	service.resolve(recorder, httptest.NewRequest(http.MethodGet, "/owner/model/resolve/main/file.bin", nil), rt, baseURLs{hub: service.hubURL})
 	if recorder.Code != http.StatusInternalServerError || partialBody.closed != 1 ||
 		!strings.Contains(recorder.Body.String(), "Internal Server Error") {
 		t.Fatalf("first-read stream failure = %d, %q, closes=%d", recorder.Code, recorder.Body.String(), partialBody.closed)
@@ -1263,7 +1478,7 @@ func TestResolveRejectsInconsistentStreamsAndClosesBodies(t *testing.T) {
 		return nil, bucket.ErrUnavailable
 	}
 	recorder = httptest.NewRecorder()
-	service.resolve(recorder, httptest.NewRequest(http.MethodGet, "/owner/model/resolve/main/file.bin", nil), rt)
+	service.resolve(recorder, httptest.NewRequest(http.MethodGet, "/owner/model/resolve/main/file.bin", nil), rt, baseURLs{hub: service.hubURL})
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("open backend failure = %d, %q", recorder.Code, recorder.Body.String())
 	}

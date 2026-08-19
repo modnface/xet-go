@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -143,6 +144,77 @@ func TestLFSBatchUploadCapabilityAndDedup(t *testing.T) {
 	)), map[string]string{"Content-Type": lfsMediaType})
 	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &decoded) != nil || decoded.Objects[0].Actions != nil {
 		t.Fatalf("deduplicated batch = %d, %s", response.Code, response.Body.String())
+	}
+}
+
+func TestPerRequestBaseURLForLFSBatchAndCrossBaseRedemption(t *testing.T) {
+	fixture := newHandlerFixture(t, 0)
+	writer := &lfsTestWriter{Service: fixture.bucket, objects: make(map[lfsObjectKey]xethash.Hash)}
+	prefixes := []string{"tenant-a", "tenant-b"}
+	calls := 0
+	handler, err := New(Options{
+		Bucket: fixture.bucket, Writer: writer, Publisher: fixture.bucket, Ingester: XetFileIngestFunc(writer.ingest),
+		Broker: fixture.handler.broker,
+		BaseURLFunc: func(*http.Request) (string, string, error) {
+			prefix := "unexpected"
+			if calls < len(prefixes) {
+				prefix = prefixes[calls]
+			}
+			calls++
+			return "https://hub.test/" + prefix + "/root", "https://cas.test/" + prefix + "/root", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bodies := [][]byte{[]byte("first dynamic LFS object"), []byte("second dynamic LFS object")}
+	objects := make([]lfsObjectDTO, len(bodies))
+	for index, body := range bodies {
+		sum := sha256.Sum256(body)
+		objects[index] = lfsObjectDTO{OID: hex.EncodeToString(sum[:]), Size: int64(len(body))}
+	}
+	first := requestBody(t, handler, http.MethodPost, "/owner/model.git/info/lfs/objects/batch", "Bearer hub-token", bytes.NewReader(lfsBatchBody(t, objects...)), map[string]string{"Content-Type": lfsMediaType})
+	var firstDecoded lfsBatchResponseDTO
+	if first.Code != http.StatusOK || json.Unmarshal(first.Body.Bytes(), &firstDecoded) != nil || len(firstDecoded.Objects) != len(objects) || calls != 1 {
+		t.Fatalf("first batch = %d, %s, calls=%d", first.Code, first.Body.String(), calls)
+	}
+	for index, object := range firstDecoded.Objects {
+		if object.Actions == nil {
+			t.Fatalf("first batch object %d has no action", index)
+		}
+		parsed, parseErr := url.Parse(object.Actions.Upload.Href)
+		wantPath := "/tenant-a/root/owner/model.git/info/lfs/objects/upload/" + objects[index].OID
+		query := parsed.Query()
+		if parseErr != nil || parsed.Scheme != "https" || parsed.Host != "hub.test" || parsed.Path != wantPath || len(query) != 5 ||
+			query.Get("size") != strconv.FormatInt(objects[index].Size, 10) || query.Get("expires") == "" || query.Get("nonce") == "" ||
+			query.Get("signature") == "" || query.Get("subject") == "" {
+			t.Fatalf("first batch href %d = %q", index, object.Actions.Upload.Href)
+		}
+	}
+
+	thirdBody := []byte("third dynamic LFS object")
+	thirdSum := sha256.Sum256(thirdBody)
+	second := requestBody(t, handler, http.MethodPost, "/owner/model.git/info/lfs/objects/batch", "Bearer hub-token", bytes.NewReader(lfsBatchBody(t,
+		lfsObjectDTO{OID: hex.EncodeToString(thirdSum[:]), Size: int64(len(thirdBody))},
+	)), map[string]string{"Content-Type": lfsMediaType})
+	var secondDecoded lfsBatchResponseDTO
+	if second.Code != http.StatusOK || json.Unmarshal(second.Body.Bytes(), &secondDecoded) != nil || len(secondDecoded.Objects) != 1 ||
+		secondDecoded.Objects[0].Actions == nil || !strings.HasPrefix(secondDecoded.Objects[0].Actions.Upload.Href, "https://hub.test/tenant-b/root/") || calls != 2 {
+		t.Fatalf("second batch = %d, %s, calls=%d", second.Code, second.Body.String(), calls)
+	}
+
+	issued, err := url.Parse(firstDecoded.Objects[0].Actions.Upload.Href)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redeemPath := "/tenant-b/root" + strings.TrimPrefix(issued.Path, "/tenant-a/root")
+	if issued.RawQuery != "" {
+		redeemPath += "?" + issued.RawQuery
+	}
+	upload := requestBody(t, http.StripPrefix("/tenant-b/root", handler), http.MethodPut, redeemPath, "", bytes.NewReader(bodies[0]), nil)
+	if upload.Code != http.StatusOK || writer.calls != 1 || calls != 2 {
+		t.Fatalf("cross-base upload = %d, writer calls=%d, base calls=%d, body=%s", upload.Code, writer.calls, calls, upload.Body.String())
 	}
 }
 

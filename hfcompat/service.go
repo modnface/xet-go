@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -114,8 +115,24 @@ type Options struct {
 	Audit     WriteAuditSink
 	Broker    AccessBroker
 
-	HubBaseURL  string
-	CASBaseURL  string
+	HubBaseURL string
+	CASBaseURL string
+	// BaseURLFunc derives the Hub and CAS base URLs for one request. It is called
+	// at most once per request, before any absolute URL is emitted, and its results
+	// are reused for every URL in that response.
+	//
+	// Both returned values must satisfy the same rules as HubBaseURL and
+	// CASBaseURL: an absolute http or https URL, no userinfo, no query, no
+	// fragment, and a canonical non-trailing path. A returned value that fails
+	// validation fails the request; it is never emitted.
+	//
+	// When BaseURLFunc is non-nil it is authoritative and HubBaseURL and
+	// CASBaseURL must be empty. When it is nil the static fields are required.
+	//
+	// Implementations must not derive a URL from request headers unless the
+	// embedder trusts its proxy layer to set them. Returned URLs must remain
+	// routable for as long as client-followed refresh and upload links are useful.
+	BaseURLFunc func(*http.Request) (hub string, cas string, err error)
 	CASTokenTTL time.Duration
 
 	MaxTreeEntries       int
@@ -144,6 +161,7 @@ type Service struct {
 	broker       AccessBroker
 	hubURL       string
 	casURL       string
+	baseURLFunc  func(*http.Request) (hub string, cas string, err error)
 	ttl          time.Duration
 	max          int
 	large        int64
@@ -168,13 +186,19 @@ func New(o Options) (*Service, error) {
 	if o.Bucket == nil || o.Broker == nil {
 		return nil, fmt.Errorf("hfcompat: bucket and broker are required")
 	}
-	hub, err := baseURL(o.HubBaseURL)
-	if err != nil {
-		return nil, fmt.Errorf("hfcompat: hub base URL: %w", err)
-	}
-	cas, err := baseURL(o.CASBaseURL)
-	if err != nil {
-		return nil, fmt.Errorf("hfcompat: CAS base URL: %w", err)
+	var hub, cas string
+	if o.BaseURLFunc == nil {
+		var err error
+		hub, err = baseURL(o.HubBaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("hfcompat: hub base URL: %w", err)
+		}
+		cas, err = baseURL(o.CASBaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("hfcompat: CAS base URL: %w", err)
+		}
+	} else if o.HubBaseURL != "" || o.CASBaseURL != "" {
+		return nil, fmt.Errorf("hfcompat: base URL function and static base URLs are mutually exclusive")
 	}
 	if o.CASTokenTTL == 0 {
 		o.CASTokenTTL = defaultTokenTTL
@@ -238,7 +262,7 @@ func New(o Options) (*Service, error) {
 	service := &Service{
 		bucket: o.Bucket, writer: o.Writer, snapshots: o.Snapshots, publisher: o.Publisher,
 		ingester: o.Ingester, audit: o.Audit, broker: o.Broker,
-		hubURL: hub, casURL: cas, ttl: o.CASTokenTTL, max: o.MaxTreeEntries,
+		hubURL: hub, casURL: cas, baseURLFunc: o.BaseURLFunc, ttl: o.CASTokenTTL, max: o.MaxTreeEntries,
 		large: o.LargeFileThreshold, preuploadMax: o.MaxPreuploadFiles,
 		commitOps: o.MaxCommitOperations, lineBytes: o.MaxCommitLineBytes, metadata: o.MaxCommitMetadata,
 		pathBytes: o.MaxCommitPathBytes, fileBytes: o.MaxDeclaredFileBytes,
@@ -274,6 +298,44 @@ func baseURL(raw string) (string, error) {
 }
 
 func (s *Service) Handler() http.Handler { return s }
+
+type baseURLs struct {
+	hub string
+	cas string
+}
+
+func (s *Service) resolveBaseURLs(r *http.Request) (baseURLs, error) {
+	if s.baseURLFunc == nil {
+		return baseURLs{hub: s.hubURL, cas: s.casURL}, nil
+	}
+	hubValue, casValue, err := s.baseURLFunc(r)
+	if err != nil {
+		return baseURLs{}, fmt.Errorf("hfcompat: derive base URLs: %w", err)
+	}
+	hub, err := baseURL(hubValue)
+	if err != nil {
+		return baseURLs{}, fmt.Errorf("hfcompat: hub base URL: %w", err)
+	}
+	cas, err := baseURL(casValue)
+	if err != nil {
+		return baseURLs{}, fmt.Errorf("hfcompat: CAS base URL: %w", err)
+	}
+	return baseURLs{hub: hub, cas: cas}, nil
+}
+
+func routeEmitsAbsoluteURL(kind string) bool {
+	switch kind {
+	case "commit", "lfs-batch", "read-token", "write-token", "resolve":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) failBaseURLResolution(w http.ResponseWriter, r *http.Request, err error) {
+	log.Printf("hfcompat: request base URL resolution failed: %v", err)
+	s.failStatus(w, r, http.StatusInternalServerError)
+}
 
 type route struct {
 	kind       string
@@ -345,6 +407,14 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.failStatus(w, r, http.StatusMethodNotAllowed)
 		return
 	}
+	var bases baseURLs
+	if routeEmitsAbsoluteURL(rt.kind) {
+		bases, err = s.resolveBaseURLs(r)
+		if err != nil {
+			s.failBaseURLResolution(w, r, err)
+			return
+		}
+	}
 	switch rt.kind {
 	case "whoami":
 		s.whoami(w, r, principal)
@@ -353,9 +423,9 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "preupload":
 		s.preupload(w, r, rt)
 	case "commit":
-		s.commit(w, r, rt, principal)
+		s.commit(w, r, rt, principal, bases)
 	case "lfs-batch":
-		s.lfsBatchRequest(w, r, rt, principal)
+		s.lfsBatchRequest(w, r, rt, principal, bases)
 	case "model":
 		s.modelInfo(w, r, rt, "main")
 	case "revision":
@@ -363,11 +433,11 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "tree":
 		s.tree(w, r, rt)
 	case "read-token":
-		s.token(w, r, rt, grant, auth.CASRead)
+		s.token(w, r, rt, grant, auth.CASRead, bases)
 	case "write-token":
-		s.token(w, r, rt, grant, auth.CASWrite)
+		s.token(w, r, rt, grant, auth.CASWrite, bases)
 	case "resolve":
-		s.resolve(w, r, rt)
+		s.resolve(w, r, rt, bases)
 	}
 }
 
@@ -706,6 +776,7 @@ func (s *Service) token(
 	rt route,
 	g auth.RepositoryGrant,
 	permissions auth.CASPermissions,
+	bases baseURLs,
 ) {
 	if permissions == auth.CASRead {
 		snap, err := s.bucket.ResolveRevision(r.Context(), rt.repo, rt.revision)
@@ -728,10 +799,10 @@ func (s *Service) token(
 		AccessToken string `json:"accessToken"`
 		CASURL      string `json:"casUrl"`
 		Exp         int64  `json:"exp"`
-	}{t.Value, s.casURL, t.ExpiresAt.Unix()})
+	}{t.Value, bases.cas, t.ExpiresAt.Unix()})
 }
 
-func (s *Service) resolve(w http.ResponseWriter, r *http.Request, rt route) {
+func (s *Service) resolve(w http.ResponseWriter, r *http.Request, rt route, bases baseURLs) {
 	snap, err := s.bucket.ResolveRevision(r.Context(), rt.repo, rt.revision)
 	if err != nil {
 		s.failRevision(w, r, rt.repo, err)
@@ -769,7 +840,7 @@ func (s *Service) resolve(w http.ResponseWriter, r *http.Request, rt route) {
 		status = http.StatusPartialContent
 	}
 	if r.Method == http.MethodHead {
-		setFileHeaders(w, s, rt, snap, entry, size, selected)
+		setFileHeaders(w, bases, rt, snap, entry, size, selected)
 		w.WriteHeader(status)
 		return
 	}
@@ -797,7 +868,7 @@ func (s *Service) resolve(w http.ResponseWriter, r *http.Request, rt route) {
 		return
 	}
 	committed, err := streamFile(w, opened.Body, opened.Size, func() {
-		setFileHeaders(w, s, rt, snap, entry, size, selected)
+		setFileHeaders(w, bases, rt, snap, entry, size, selected)
 		w.WriteHeader(status)
 	})
 	if err != nil && !committed {
@@ -898,7 +969,7 @@ func streamFile(destination io.Writer, body io.ReadCloser, size int64, commit fu
 	}
 }
 
-func setFileHeaders(w http.ResponseWriter, s *Service, rt route, snap model.Snapshot, e model.FileEntry, size int64, rg *content.Range) {
+func setFileHeaders(w http.ResponseWriter, bases baseURLs, rt route, snap model.Snapshot, e model.FileEntry, size int64, rg *content.Range) {
 	w.Header().Set("X-Repo-Commit", snap.OID.String())
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Accept-Ranges", "bytes")
@@ -918,7 +989,7 @@ func setFileHeaders(w http.ResponseWriter, s *Service, rt route, snap model.Snap
 	}
 	if h, ok := e.Ref.XetHash(); ok {
 		w.Header().Set("X-Xet-Hash", h.String())
-		link := s.hubURL + "/api/models/" + url.PathEscape(string(rt.repo.Namespace)) + "/" + url.PathEscape(string(rt.repo.Name)) + "/xet-read-token/" + snap.OID.String()
+		link := bases.hub + "/api/models/" + url.PathEscape(string(rt.repo.Namespace)) + "/" + url.PathEscape(string(rt.repo.Name)) + "/xet-read-token/" + snap.OID.String()
 		w.Header().Set("Link", "<"+link+">; rel=\"xet-auth\"")
 	}
 }

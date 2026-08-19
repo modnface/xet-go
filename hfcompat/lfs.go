@@ -69,7 +69,7 @@ type lfsUploadState struct {
 	used      bool
 }
 
-func (s *Service) lfsBatchRequest(w http.ResponseWriter, r *http.Request, rt route, principal auth.Principal) {
+func (s *Service) lfsBatchRequest(w http.ResponseWriter, r *http.Request, rt route, principal auth.Principal, bases baseURLs) {
 	if s.writer == nil || s.ingester == nil {
 		s.fail(w, r, bucket.ErrUnsupported)
 		return
@@ -132,7 +132,7 @@ func (s *Service) lfsBatchRequest(w http.ResponseWriter, r *http.Request, rt rou
 			s.fail(w, r, err)
 			return
 		}
-		href, err := s.newLFSUploadCapability(rt.repo, principal, oid, object.Size)
+		href, err := s.newLFSUploadCapability(rt.repo, principal, oid, object.Size, bases)
 		if err != nil {
 			s.fail(w, r, err)
 			return
@@ -149,6 +149,7 @@ func (s *Service) newLFSUploadCapability(
 	principal auth.Principal,
 	oid [32]byte,
 	size int64,
+	bases baseURLs,
 ) (string, error) {
 	nonceBytes := make([]byte, 18)
 	if _, err := rand.Read(nonceBytes); err != nil {
@@ -172,7 +173,7 @@ func (s *Service) newLFSUploadCapability(
 	query.Set("size", strconv.FormatInt(size, 10))
 	query.Set("signature", signature)
 	query.Set("subject", base64.RawURLEncoding.EncodeToString([]byte(principal.Subject)))
-	return s.hubURL + "/" + url.PathEscape(string(repo.Namespace)) + "/" + url.PathEscape(string(repo.Name)) +
+	return bases.hub + "/" + url.PathEscape(string(repo.Namespace)) + "/" + url.PathEscape(string(repo.Name)) +
 		".git/info/lfs/objects/upload/" + hex.EncodeToString(oid[:]) + "?" + query.Encode(), nil
 }
 
@@ -309,6 +310,8 @@ func (s *Service) finishLFSUpload(nonce string, success bool) {
 }
 
 func (s *Service) signLFSUpload(repo model.RepoKey, subject string, oid [32]byte, size, expires int64, nonce string) string {
+	// Deliberately do not bind a base URL: the same repository may be reached
+	// through multiple public addresses. RepoKey binds the logical upload target.
 	digest := hmac.New(sha256.New, s.lfsKey[:])
 	_, _ = fmt.Fprintf(digest, "xet-go-lfs-v1\x00%s\x00%s\x00%s\x00%s\x00%x\x00%d\x00%d\x00%s",
 		repo.Type, repo.Namespace, repo.Name, subject, oid, size, expires, nonce)

@@ -53,8 +53,12 @@ type Options struct {
 	PublisherDecorator   SnapshotPublisherDecorator
 	WriteAudit           hfcompat.WriteAuditSink
 
-	HubBaseURL     string
-	CASBaseURL     string
+	HubBaseURL string
+	CASBaseURL string
+	// BaseURLFunc derives the authoritative Hub and CAS base URLs for each
+	// request. It is forwarded verbatim to hfcompat; when set, both static base
+	// URL fields must be empty.
+	BaseURLFunc    func(*http.Request) (hub string, cas string, err error)
 	CASTokenTTL    time.Duration
 	MaxTreeEntries int
 
@@ -137,7 +141,7 @@ func New(options Options) (*Service, error) {
 	}
 	hub, err := hfcompat.New(hfcompat.Options{
 		Bucket: hubBucket, Writer: core, Snapshots: snapshots, Publisher: publisher, Audit: options.WriteAudit, Broker: broker,
-		HubBaseURL: options.HubBaseURL, CASBaseURL: options.CASBaseURL,
+		HubBaseURL: options.HubBaseURL, CASBaseURL: options.CASBaseURL, BaseURLFunc: options.BaseURLFunc,
 		CASTokenTTL: options.CASTokenTTL, MaxTreeEntries: options.MaxTreeEntries, Ingester: options.LFSIngester,
 		LargeFileThreshold: options.LargeFileThreshold, MaxPreuploadFiles: options.MaxPreuploadFiles,
 		MaxCommitOperations: options.MaxCommitOperations, MaxCommitLineBytes: options.MaxCommitLineBytes,

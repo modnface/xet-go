@@ -188,8 +188,18 @@ func TestNewRejectsIncoherentCapabilities(t *testing.T) {
 		{"blobs", func(options *Options) { options.CAS.Blobs = nil }},
 		{"index", func(options *Options) { options.CAS.Index = nil }},
 		{"signer", func(options *Options) { options.CAS.Signer = nil }},
+		{"missing Hub URL", func(options *Options) { options.HubBaseURL = "" }},
+		{"missing CAS URL", func(options *Options) { options.CASBaseURL = "" }},
 		{"Hub URL", func(options *Options) { options.HubBaseURL = "relative" }},
 		{"CAS URL", func(options *Options) { options.CASBaseURL = "relative" }},
+		{"base URL function and Hub URL", func(options *Options) {
+			options.CASBaseURL = ""
+			options.BaseURLFunc = func(*http.Request) (string, string, error) { return "https://hub.example", "https://cas.example", nil }
+		}},
+		{"base URL function and CAS URL", func(options *Options) {
+			options.HubBaseURL = ""
+			options.BaseURLFunc = func(*http.Request) (string, string, error) { return "https://hub.example", "https://cas.example", nil }
+		}},
 		{"LFS capability key", func(options *Options) { options.LFSUploadCapabilityKey = []byte("short") }},
 		{"bucket decorator", func(options *Options) {
 			options.BucketDecorator = func(hfcompat.BucketService) hfcompat.BucketService { return nil }
@@ -206,6 +216,28 @@ func TestNewRejectsIncoherentCapabilities(t *testing.T) {
 				t.Fatalf("New error = %v", err)
 			}
 		})
+	}
+}
+
+func TestBaseURLFuncIsForwardedToHubCompatibilityService(t *testing.T) {
+	options, _ := validOptions(t)
+	options.HubBaseURL = ""
+	options.CASBaseURL = ""
+	calls := 0
+	options.BaseURLFunc = func(*http.Request) (string, string, error) {
+		calls++
+		return "https://hub.example/tenant", "https://cas.example/tenant", nil
+	}
+	service, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/repos/create", bytes.NewBufferString(`{"name":"dynamic","organization":"owner"}`))
+	request.Header.Set("Authorization", "Bearer hub-secret")
+	response := httptest.NewRecorder()
+	service.HubHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || calls != 1 {
+		t.Fatalf("create response = %d, calls=%d, body=%s", response.Code, calls, response.Body.String())
 	}
 }
 
